@@ -1,0 +1,6 @@
+#define IDI_TRANS 101
+
+IDI_TRANS ICON "trans.ico"
+
+201 RCDATA "lucide-focus-LICENSE.txt"
+202 RCDATA "lucide-rotate-cw-LICENSE.txt"
