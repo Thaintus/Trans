@@ -20,7 +20,7 @@ use crate::ui_theme;
 pub const SCROLL_CHANGED: u32 = WM_APP + 4;
 const LAYOUT_NOTICE: u32 = WM_APP + 51;
 const CHILD_SUBCLASS: usize = 0x5452_5350;
-const CONTENT_HEIGHT: i32 = 592;
+const CONTENT_HEIGHT: i32 = 568;
 const SCROLL_LINE: i32 = 24;
 const WHEEL_STEP: i32 = 120;
 const SCROLL_GUTTER: i32 = 12;
@@ -340,7 +340,7 @@ impl PanelState {
         let dpi = self.dpi.get();
         let offset = self.applied_offset.get();
         let right = self.content_width() - 1;
-        for (top, bottom) in [(36, 244), (284, 340), (388, 462), (506, 590)] {
+        for (top, bottom) in [(36, 244), (284, 340), (388, 462), (506, 566)] {
             RoundRect(
                 dc,
                 1,

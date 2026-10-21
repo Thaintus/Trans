@@ -103,11 +103,8 @@ const ID_VERSION_TITLE: i32 = 156;
 const ID_VERSION_LABEL: i32 = 157;
 const ID_PRESETS_TITLE: i32 = 160;
 const ID_PRESETS_SAVE: i32 = 161;
-const ID_AUTHOR_LABEL: i32 = 162;
-const ID_AUTHOR_LINK: i32 = 163;
 const ID_PROJECT_LABEL: i32 = 164;
 const ID_PROJECT_LINK: i32 = 165;
-const AUTHOR_URL: &str = "https://github.com/Thaintus";
 const PROJECT_URL: &str = "https://github.com/Thaintus/Trans";
 const ID_PRESET_LABEL: i32 = 170;
 const ID_PRESET_INPUT: i32 = 180;
@@ -355,8 +352,6 @@ fn settings_body_control(id: i32) -> bool {
             | ID_VERSION_TITLE
             | ID_VERSION
             | ID_VERSION_LABEL
-            | ID_AUTHOR_LABEL
-            | ID_AUTHOR_LINK
             | ID_PROJECT_LABEL
             | ID_PROJECT_LINK
     ) || (ID_PRESET_LABEL..ID_PRESET_LABEL + 5).contains(&id)
@@ -386,7 +381,6 @@ fn control_caption(id: i32) -> Option<&'static str> {
         ID_PRESETS_TITLE => tr("预设挡位", "Presets"),
         ID_EXIT => tr("退出 Trans", "Exit Trans"),
         ID_VERSION_TITLE => tr("关于", "About"),
-        ID_AUTHOR_LABEL => tr("作者", "Author"),
         ID_PROJECT_LABEL => tr("项目", "Project"),
         ID_VERSION_LABEL => tr("版本", "Version"),
         ID_VERSION => concat!("v.", env!("CARGO_PKG_VERSION")),
@@ -1708,23 +1702,15 @@ impl App {
         self.add(
             "STATIC",
             "",
-            ID_AUTHOR_LABEL,
-            SS_LEFT | SS_CENTERIMAGE | SS_NOPREFIX,
+            ID_PROJECT_LABEL,
+            SS_LEFT | SS_ENDELLIPSIS | SS_NOPREFIX,
         )?;
         self.add(
-            "STATIC",
-            "",
-            ID_PROJECT_LABEL,
-            SS_LEFT | SS_CENTERIMAGE | SS_NOPREFIX,
+            "SysLink",
+            &format!("<a href=\"{PROJECT_URL}\">{PROJECT_URL} ↗</a>"),
+            ID_PROJECT_LINK,
+            WS_TABSTOP | LWS_TRANSPARENT | LWS_NOPREFIX,
         )?;
-        for (id, url) in [(ID_AUTHOR_LINK, AUTHOR_URL), (ID_PROJECT_LINK, PROJECT_URL)] {
-            self.add(
-                "SysLink",
-                &format!("<a href=\"{url}\">{url} ↗</a>"),
-                id,
-                WS_TABSTOP | LWS_TRANSPARENT | LWS_NOPREFIX,
-            )?;
-        }
         let mut combo_info = COMBOBOXINFO {
             cbSize: size_of::<COMBOBOXINFO>() as u32,
             ..zeroed()
@@ -1980,8 +1966,7 @@ impl App {
                     ID_VALUE | ID_TARGET | ID_SETTINGS_TITLE => fonts[1],
                     ID_SETTINGS => fonts[2],
                     ID_SELF_LABEL => fonts[3],
-                    ID_VERSION | ID_VERSION_LABEL | ID_AUTHOR_LABEL | ID_AUTHOR_LINK
-                    | ID_PROJECT_LABEL | ID_PROJECT_LINK => fonts[5],
+                    ID_VERSION | ID_VERSION_LABEL | ID_PROJECT_LABEL | ID_PROJECT_LINK => fonts[5],
                     5 | ID_CHANGED_TITLE | ID_BASIC_TITLE | ID_HOTKEY_TITLE | ID_PRESETS_TITLE
                     | ID_VERSION_TITLE => fonts[4],
                     _ => fonts[0],
@@ -2141,19 +2126,11 @@ impl App {
                 body_width - about_value_left - 12,
                 20,
             ),
-            (ID_AUTHOR_LABEL, 12, 538, about_value_left - 16, 20),
-            (
-                ID_AUTHOR_LINK,
-                about_value_left,
-                538,
-                body_width - about_value_left - 12,
-                20,
-            ),
-            (ID_PROJECT_LABEL, 12, 562, about_value_left - 16, 20),
+            (ID_PROJECT_LABEL, 12, 538, about_value_left - 16, 20),
             (
                 ID_PROJECT_LINK,
                 about_value_left,
-                562,
+                538,
                 body_width - about_value_left - 12,
                 20,
             ),
@@ -2279,8 +2256,7 @@ impl App {
                 ID_SETTINGS_TITLE..=ID_HOTKEY_ENABLED => self.settings_page,
                 ID_BASIC_TITLE | ID_PRESETS_TITLE | ID_PRESETS_SAVE | ID_LANGUAGE_LABEL
                 | ID_LANGUAGE | ID_DEFAULT_CONTAINER | ID_VERSION_TITLE | ID_VERSION
-                | ID_VERSION_LABEL | ID_AUTHOR_LABEL | ID_AUTHOR_LINK | ID_PROJECT_LABEL
-                | ID_PROJECT_LINK => self.settings_page,
+                | ID_VERSION_LABEL | ID_PROJECT_LABEL | ID_PROJECT_LINK => self.settings_page,
                 id if (ID_PRESET_LABEL..ID_PRESET_LABEL + 5).contains(&id)
                     || (ID_PRESET_INPUT..ID_PRESET_INPUT + 5).contains(&id) =>
                 {
@@ -3658,7 +3634,6 @@ impl App {
             EVENT_ABOUT_LINK if self.settings_page && !self.picking => {
                 // 仅打开本程序定义的地址，不直接使用通知携带的 URL
                 let url = match parameter as i32 {
-                    ID_AUTHOR_LINK => AUTHOR_URL,
                     ID_PROJECT_LINK => PROJECT_URL,
                     _ => return,
                 };
@@ -4319,7 +4294,7 @@ unsafe extern "system" fn window_proc(
         }
         WM_NOTIFY if lparam != 0 => {
             let header = &*(lparam as *const NMHDR);
-            if matches!(header.idFrom as i32, ID_AUTHOR_LINK | ID_PROJECT_LINK)
+            if header.idFrom == ID_PROJECT_LINK as usize
                 && matches!(header.code, NM_CLICK | NM_RETURN)
             {
                 if !state.is_null() {
@@ -4531,7 +4506,7 @@ unsafe extern "system" fn window_proc(
             let id = GetDlgCtrlID(lparam as HWND);
             let color = match id {
                 ID_VALUE => ACCENT,
-                ID_AUTHOR_LINK | ID_PROJECT_LINK => ACCENT,
+                ID_PROJECT_LINK => ACCENT,
                 id if id == ID_HOTKEY_INPUT
                     || (ID_PRESET_INPUT..ID_PRESET_INPUT + 5).contains(&id) =>
                 {
