@@ -140,7 +140,12 @@ unsafe fn win32_error(chinese: &str, english: &str) -> String {
     format!("{} {}", tr(chinese, english), GetLastError())
 }
 
-pub(crate) unsafe fn show(owner: HWND, items: &[(u32, &str)], point: POINT) -> Result<u32, String> {
+pub(crate) unsafe fn show(
+    owner: HWND,
+    items: &[(u32, &str)],
+    point: POINT,
+    disabled_commands: &[u32],
+) -> Result<u32, String> {
     if items.is_empty()
         || items.iter().any(|(command, label)| {
             *command == 0
@@ -255,8 +260,13 @@ pub(crate) unsafe fn show(owner: HWND, items: &[(u32, &str)], point: POINT) -> R
     for (position, entry) in context.entries.iter().enumerate() {
         let item = MENUITEMINFOW {
             cbSize: size_of::<MENUITEMINFOW>() as u32,
-            fMask: MIIM_FTYPE | MIIM_ID | MIIM_DATA | MIIM_STRING,
+            fMask: MIIM_FTYPE | MIIM_ID | MIIM_DATA | MIIM_STRING | MIIM_STATE,
             fType: MFT_OWNERDRAW,
+            fState: if disabled_commands.contains(&entry.command) {
+                MFS_GRAYED
+            } else {
+                MFS_ENABLED
+            },
             wID: entry.command,
             dwItemData: entry.token,
             dwTypeData: entry.text.as_ptr() as *mut u16,
@@ -308,8 +318,8 @@ pub(crate) unsafe fn draw_item(item: &DRAWITEMSTRUCT) -> bool {
     let Some(_saved) = SavedDc::new(item.hDC) else {
         return true;
     };
-    let selected = item.itemState & ODS_SELECTED != 0;
     let disabled = item.itemState & (ODS_DISABLED | ODS_GRAYED) != 0;
+    let selected = item.itemState & ODS_SELECTED != 0 && !disabled;
     let background = if selected {
         COLOR_HIGHLIGHT
     } else {

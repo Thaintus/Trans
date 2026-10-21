@@ -14,6 +14,34 @@ pub const DEFAULT_PRESET_LEVELS: [u8; 5] = [0, 25, 50, 75, 100];
 
 static NEXT_TEMP_ID: AtomicUsize = AtomicUsize::new(1);
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WindowGeometry {
+    pub x: i32,
+    pub y: i32,
+    pub width: i32,
+    pub height: i32,
+}
+
+impl WindowGeometry {
+    pub fn is_valid(self) -> bool {
+        self.width > 0
+            && self.height > 0
+            && self.x.checked_add(self.width).is_some()
+            && self.y.checked_add(self.height).is_some()
+    }
+
+    fn parse(value: &str) -> Option<Self> {
+        let mut values = value.split(',').map(|part| part.trim().parse::<i32>().ok());
+        let geometry = Self {
+            x: values.next()??,
+            y: values.next()??,
+            width: values.next()??,
+            height: values.next()??,
+        };
+        (values.next().is_none() && geometry.is_valid()).then_some(geometry)
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Settings {
     pub language: Language,
@@ -24,6 +52,7 @@ pub struct Settings {
     pub privacy_mode: bool,
     pub restore_hotkey: Option<Hotkey>,
     pub preset_levels: [u8; 5],
+    pub main_window: Option<WindowGeometry>,
 }
 
 impl Default for Settings {
@@ -37,6 +66,7 @@ impl Default for Settings {
             privacy_mode: false,
             restore_hotkey: Some(Hotkey::default()),
             preset_levels: DEFAULT_PRESET_LEVELS,
+            main_window: None,
         }
     }
 }
@@ -65,6 +95,16 @@ impl Settings {
     }
 
     pub fn save(&self) -> Result<(), String> {
+        if self
+            .main_window
+            .is_some_and(|geometry| !geometry.is_valid())
+        {
+            return Err(tr(
+                "主窗口位置或大小无效",
+                "Invalid main window position or size",
+            )
+            .into());
+        }
         if self.self_transparency > MAX_SELF_TRANSPARENCY {
             return Err(tr(
                 &format!("自身透明度必须在 0 到 {MAX_SELF_TRANSPARENCY} 之间"),
@@ -100,7 +140,7 @@ impl Settings {
             .to_owned()
         })?;
         let (temporary, mut file) = create_temporary_file(directory)?;
-        let content = format!(
+        let mut content = format!(
             "; Trans settings\nlanguage={}\ndefault_container={}\nclose_to_tray={}\nself_transparency={}\nshow_icons={}\nprivacy_mode={}\nrestore_hotkey={}\npreset_1={}\npreset_2={}\npreset_3={}\npreset_4={}\npreset_5={}\n",
             self.language.as_str(),
             self.default_container,
@@ -115,6 +155,12 @@ impl Settings {
             self.preset_levels[3],
             self.preset_levels[4],
         );
+        if let Some(geometry) = self.main_window {
+            content.push_str(&format!(
+                "main_window={},{},{},{}\n",
+                geometry.x, geometry.y, geometry.width, geometry.height
+            ));
+        }
 
         if let Err(error) = file
             .write_all(content.as_bytes())
@@ -195,6 +241,8 @@ fn parse_settings(content: &str) -> Result<Settings, String> {
             .to_owned());
         }
         match key {
+            // 位置数据损坏时仅放弃窗口布局，不丢弃用户其他设置
+            "main_window" => settings.main_window = WindowGeometry::parse(value),
             "language" => {
                 settings.language = Language::parse(value).map_err(|error| {
                     tr(
@@ -267,6 +315,7 @@ fn known_key(key: &str) -> bool {
     matches!(
         key,
         "language"
+            | "main_window"
             | "default_container"
             | "close_to_tray"
             | "self_transparency"

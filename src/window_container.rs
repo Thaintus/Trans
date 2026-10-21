@@ -1,6 +1,7 @@
 use std::cell::{Cell, RefCell};
-use std::mem::{size_of, zeroed};
+use std::mem::{size_of, size_of_val, zeroed};
 use std::ptr::null_mut;
+use std::rc::Rc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::OnceLock;
 use std::time::Instant;
@@ -9,12 +10,15 @@ use windows_sys::Win32::Foundation::{
     CloseHandle, GetLastError, SetLastError, HANDLE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM,
 };
 use windows_sys::Win32::Graphics::Dwm::{
-    DwmGetWindowAttribute, DwmSetWindowAttribute, DWMWA_EXTENDED_FRAME_BOUNDS,
-    DWMWA_TRANSITIONS_FORCEDISABLED,
+    DwmGetWindowAttribute, DwmSetWindowAttribute, DWMNCRP_DISABLED, DWMNCRP_ENABLED,
+    DWMWA_EXTENDED_FRAME_BOUNDS, DWMWA_NCRENDERING_ENABLED, DWMWA_NCRENDERING_POLICY,
+    DWMWA_TRANSITIONS_FORCEDISABLED, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_DONOTROUND,
+    DWMWCP_ROUND,
 };
 use windows_sys::Win32::Graphics::Gdi::{
-    GetMonitorInfoW, MapWindowPoints, MonitorFromRect, RedrawWindow, MONITORINFO,
-    MONITOR_DEFAULTTONEAREST, RDW_ALLCHILDREN, RDW_FRAME, RDW_INVALIDATE,
+    BeginPaint, EndPaint, FillRect, GetMonitorInfoW, GetStockObject, MapWindowPoints,
+    MonitorFromRect, RedrawWindow, SetDCBrushColor, CLR_INVALID, DC_BRUSH, HDC, MONITORINFO,
+    MONITOR_DEFAULTTONEAREST, PAINTSTRUCT, RDW_ALLCHILDREN, RDW_ERASE, RDW_FRAME, RDW_INVALIDATE,
 };
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::System::Threading::{
@@ -22,21 +26,25 @@ use windows_sys::Win32::System::Threading::{
     PROCESS_QUERY_LIMITED_INFORMATION,
 };
 use windows_sys::Win32::UI::HiDpi::{
-    AdjustWindowRectExForDpi, AreDpiAwarenessContextsEqual, GetDpiForWindow,
-    GetWindowDpiAwarenessContext, PhysicalToLogicalPointForPerMonitorDPI,
-    SetThreadDpiAwarenessContext, DPI_AWARENESS_CONTEXT,
+    AreDpiAwarenessContextsEqual, GetDpiForWindow, GetWindowDpiAwarenessContext,
+    PhysicalToLogicalPointForPerMonitorDPI, SetThreadDpiAwarenessContext, DPI_AWARENESS_CONTEXT,
 };
-use windows_sys::Win32::UI::Input::KeyboardAndMouse::SetFocus;
+use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetCapture, SetFocus};
 use windows_sys::Win32::UI::Shell::ExtractIconExW;
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
+use crate::container_frame::{self, ContainerFrame};
 use crate::localization::tr;
 use crate::taskbar::ContainerTaskbarGroup;
-use crate::window_control::WindowInfo;
+use crate::window_control::{restore_window_topmost, window_is_topmost, WindowInfo};
+use crate::window_topmost;
 
 static CONTAINER_CLASS: OnceLock<Result<(), u32>> = OnceLock::new();
 static HOST_PROPERTY: OnceLock<Vec<u16>> = OnceLock::new();
 static NEXT_HOST_NONCE: AtomicUsize = AtomicUsize::new(1);
+const WM_COMPATIBILITY_FOCUS: u32 = WM_APP + 1;
+// 仅作为宿主客户区的透明色，不参与原应用的绘制
+const COMPATIBILITY_COLOR_KEY: u32 = 0x0003_0201;
 
 pub struct ContainerAttachError {
     pub message: String,
@@ -55,6 +63,7 @@ impl From<String> for ContainerAttachError {
 pub struct WindowContainer {
     hwnd: HWND,
     state_ptr: *const ContainerState,
+    owned_state: Rc<ContainerState>,
     nonce: usize,
     thread_id: u32,
 }
@@ -69,6 +78,16 @@ struct ContainerState {
     original_owner: HWND,
     original_placement: WINDOWPLACEMENT,
     original_rect: RECT,
+    mode: HostingMode,
+    original_layered: Option<LayeredState>,
+    original_nc_rendering: Option<bool>,
+    nc_rendering_modified: Cell<bool>,
+    original_corner_preference: Option<i32>,
+    corner_preference_modified: Cell<bool>,
+    topmost_modified: Cell<bool>,
+    compatibility_layout_pending: Cell<bool>,
+    compatibility_restore_pending: Cell<bool>,
+    caption: ContainerFrame,
     frame_insets: FrameInsets,
     dpi_context: DPI_AWARENESS_CONTEXT,
     needs_restore: Cell<bool>,
@@ -86,6 +105,43 @@ struct ContainerState {
     title: RefCell<String>,
     icons: ContainerIcons,
     taskbar_group: RefCell<Option<ContainerTaskbarGroup>>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum HostingMode {
+    Embedded,
+    // 保持 GPU 根窗口为顶层窗口，宿主仅提供外框和所有者关系
+    TopLevel,
+}
+
+#[derive(Clone, Copy)]
+struct LayeredState {
+    color_key: u32,
+    alpha: u8,
+    flags: u32,
+}
+
+impl LayeredState {
+    unsafe fn capture(target: HWND) -> Result<Self, String> {
+        let mut value = Self {
+            color_key: 0,
+            alpha: 0,
+            flags: 0,
+        };
+        if GetLayeredWindowAttributes(
+            target,
+            &mut value.color_key,
+            &mut value.alpha,
+            &mut value.flags,
+        ) == 0
+        {
+            return Err(last_error(tr(
+                "无法读取窗口原始分层属性，已保留原状态",
+                "Cannot read the original layered attributes; the window was left unchanged",
+            )));
+        }
+        Ok(value)
+    }
 }
 
 #[derive(Clone, Copy, Default)]
@@ -538,8 +594,354 @@ impl ContainerState {
         set_window_long(self.target.hwnd, index, value)
     }
 
+    unsafe fn attached_to(&self, host: HWND) -> bool {
+        let child = GetWindowLongPtrW(self.target.hwnd, GWL_STYLE) as u32 & WS_CHILD != 0;
+        match self.mode {
+            HostingMode::Embedded => child && GetParent(self.target.hwnd) == host,
+            HostingMode::TopLevel => !child && GetWindow(self.target.hwnd, GW_OWNER) == host,
+        }
+    }
+
+    unsafe fn validate_host(&self, host: HWND) -> Result<(), String> {
+        let identity = HostIdentity {
+            hwnd: host,
+            state_ptr: self,
+            nonce: self.host_nonce,
+            thread_id: GetCurrentThreadId(),
+        };
+        if !identity.matches() {
+            return Err(tr(
+                "透明容器身份已变化，无法继续同步",
+                "The transparency container identity changed; synchronization was stopped",
+            )
+            .into());
+        }
+        Ok(())
+    }
+
+    unsafe fn apply_compatibility_alpha(&self, percent: u8) -> Result<(), String> {
+        self.validate()?;
+        let ex_style = read_extended_style(self.target.hwnd)?;
+        let alpha = (((100 - percent.min(100) as u32) * 255 + 50) / 100) as u8;
+        let color_key = self.original_layered.map_or(0, |value| value.color_key);
+        let flags = LWA_ALPHA
+            | self
+                .original_layered
+                .map_or(0, |value| value.flags & LWA_COLORKEY);
+        if ex_style & WS_EX_LAYERED != 0 {
+            if let Ok(current) = LayeredState::capture(self.target.hwnd) {
+                if current.alpha == alpha
+                    && current.flags == flags
+                    && current.color_key == color_key
+                {
+                    return Ok(());
+                }
+            }
+        } else {
+            // 保留 NOREDIRECTIONBITMAP，只使用直接模式已支持的根窗口透明度
+            self.set_target_long(GWL_EXSTYLE, (ex_style | WS_EX_LAYERED) as isize)?;
+        }
+        self.validate()?;
+        if SetLayeredWindowAttributes(self.target.hwnd, color_key, alpha, flags) == 0 {
+            return Err(last_error(tr(
+                "无法设置兼容容器内容透明度",
+                "Cannot set the compatibility container content opacity",
+            )));
+        }
+        Ok(())
+    }
+
+    unsafe fn set_target_nc_rendering(&self, enabled: bool) -> Result<(), String> {
+        self.validate()?;
+        let policy = if enabled {
+            DWMNCRP_ENABLED
+        } else {
+            DWMNCRP_DISABLED
+        };
+        let result = DwmSetWindowAttribute(
+            self.target.hwnd,
+            DWMWA_NCRENDERING_POLICY as u32,
+            &policy as *const _ as _,
+            size_of_val(&policy) as u32,
+        );
+        if result < 0 {
+            return Err(format!(
+                "{} (HRESULT 0x{:08X})",
+                tr(
+                    "无法更新原窗口的非客户区绘制状态",
+                    "Cannot update the original window's non-client rendering state"
+                ),
+                result as u32,
+            ));
+        }
+        self.validate()
+    }
+
+    unsafe fn suppress_target_shadow(&self) -> Result<(), String> {
+        if self.original_nc_rendering.is_none() {
+            return Ok(());
+        }
+        self.validate()?;
+        let enabled = read_nc_rendering(self.target.hwnd)?;
+        self.validate()?;
+        if enabled {
+            // 顶层目标的 DWM 阴影会覆盖宿主标题栏，先登记恢复责任再关闭
+            self.nc_rendering_modified.set(true);
+            self.set_target_nc_rendering(false)?;
+        }
+        Ok(())
+    }
+
+    unsafe fn restore_target_nc_rendering(&self) -> Result<(), String> {
+        if self.nc_rendering_modified.get() {
+            if let Some(enabled) = self.original_nc_rendering {
+                // 原策略枚举不支持读取，恢复保存的有效启用状态
+                self.set_target_nc_rendering(enabled)?;
+                self.nc_rendering_modified.set(false);
+            }
+        }
+        Ok(())
+    }
+
+    unsafe fn set_target_corner_preference(&self, preference: i32) -> Result<(), String> {
+        self.validate()?;
+        let result = DwmSetWindowAttribute(
+            self.target.hwnd,
+            DWMWA_WINDOW_CORNER_PREFERENCE as u32,
+            &preference as *const _ as _,
+            size_of_val(&preference) as u32,
+        );
+        if result < 0 {
+            return Err(format!(
+                "{} (HRESULT 0x{:08X})",
+                tr(
+                    "无法更新原窗口的圆角偏好",
+                    "Cannot update the original window's corner preference"
+                ),
+                result as u32,
+            ));
+        }
+        self.validate()
+    }
+
+    unsafe fn suppress_target_corners(&self) -> Result<(), String> {
+        if self.original_corner_preference.is_none() {
+            return Ok(());
+        }
+        self.validate()?;
+        if let Some(current) = read_corner_preference(self.target.hwnd) {
+            if current != DWMWCP_DONOTROUND {
+                // 内层圆角会在接缝处透出背景，先登记恢复责任再请求直角
+                self.corner_preference_modified.set(true);
+                self.set_target_corner_preference(DWMWCP_DONOTROUND)?;
+            }
+        }
+        self.validate()
+    }
+
+    unsafe fn restore_target_corner_preference(&self) -> Result<(), String> {
+        if self.corner_preference_modified.get() {
+            if let Some(preference) = self.original_corner_preference {
+                self.set_target_corner_preference(preference)?;
+                self.corner_preference_modified.set(false);
+            }
+        }
+        Ok(())
+    }
+
+    unsafe fn suppress_target_frame(&self) -> Result<(), String> {
+        self.validate()?;
+        let style = GetWindowLongPtrW(self.target.hwnd, GWL_STYLE) as u32;
+        let frame = WS_CAPTION | WS_THICKFRAME;
+        if style & frame == 0 {
+            return Ok(());
+        }
+        // 外框承担标题栏和缩放边缘，原窗口不再保留会透底的原生边框
+        self.set_target_long(GWL_STYLE, (style & !frame) as isize)?;
+        self.validate()?;
+        if SetWindowPos(
+            self.target.hwnd,
+            null_mut(),
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED,
+        ) == 0
+        {
+            return Err(last_error(tr(
+                "无法更新原窗口的容器边框",
+                "Cannot update the hosted window frame",
+            )));
+        }
+        self.validate()
+    }
+
+    unsafe fn initialize_container_frame(&self, host: HWND) -> Result<(), String> {
+        self.validate_host(host)?;
+        // 两种托管方式共用平面外框，窗口组织方式不决定标题栏外观
+        let policy = DWMNCRP_DISABLED;
+        let result = DwmSetWindowAttribute(
+            host,
+            DWMWA_NCRENDERING_POLICY as u32,
+            &policy as *const _ as _,
+            size_of_val(&policy) as u32,
+        );
+        if result < 0 {
+            return Err(format!(
+                "{} (HRESULT 0x{:08X})",
+                tr(
+                    "无法初始化容器平面边框",
+                    "Cannot initialize the container's flat frame"
+                ),
+                result as u32,
+            ));
+        }
+        self.validate_host(host)?;
+        // 圆角仅作系统提示，Windows 10 等不支持时沿用默认外观
+        let corner = DWMWCP_ROUND;
+        let _ = DwmSetWindowAttribute(
+            host,
+            DWMWA_WINDOW_CORNER_PREFERENCE as u32,
+            &corner as *const _ as _,
+            size_of_val(&corner) as u32,
+        );
+        self.validate_host(host)?;
+        if SetWindowPos(
+            host,
+            null_mut(),
+            0,
+            0,
+            0,
+            0,
+            SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+        ) == 0
+        {
+            return Err(last_error(tr(
+                "无法更新容器边距",
+                "Cannot update the container frame insets",
+            )));
+        }
+        self.validate_host(host)?;
+        if RedrawWindow(
+            host,
+            null_mut(),
+            null_mut(),
+            RDW_INVALIDATE | RDW_ERASE | RDW_FRAME,
+        ) == 0
+        {
+            return Err(last_error(tr(
+                "无法刷新容器外观",
+                "Cannot refresh the container frame",
+            )));
+        }
+        self.validate_host(host)
+    }
+
+    unsafe fn layout_top_level(&self, host: HWND) -> Result<(), String> {
+        self.validate_host(host)?;
+        if IsZoomed(self.target.hwnd) != 0 || self.compatibility_restore_pending.get() {
+            return Ok(());
+        }
+        let (_, client) = host_bounds(host)?;
+        let mut target: RECT = zeroed();
+        if GetWindowRect(self.target.hwnd, &mut target) == 0 {
+            return Err(last_error(tr(
+                "无法读取目标窗口位置",
+                "Cannot read the target window bounds",
+            )));
+        }
+        // 抑制目标非客户区后重新读取可见边界，不沿用进入容器前的隐藏边距
+        let insets =
+            FrameInsets::capture(self.target.hwnd, target).for_layout(self.target.hwnd, target);
+        let requested = [
+            client.left - insets.left,
+            client.top - insets.top,
+            client.right - client.left + insets.left + insets.right,
+            client.bottom - client.top + insets.top + insets.bottom,
+        ];
+        if requested[2] <= 0 || requested[3] <= 0 {
+            return Ok(());
+        }
+        self.validate()?;
+        if target.left != requested[0]
+            || target.top != requested[1]
+            || target.right - target.left != requested[2]
+            || target.bottom - target.top != requested[3]
+        {
+            if SetWindowPos(
+                self.target.hwnd,
+                null_mut(),
+                requested[0],
+                requested[1],
+                requested[2],
+                requested[3],
+                SWP_NOACTIVATE | SWP_NOZORDER,
+            ) == 0
+            {
+                return Err(last_error(tr(
+                    "无法同步兼容容器位置",
+                    "Cannot position the compatibility container content",
+                )));
+            }
+        }
+        self.layout_request.set(Some(requested));
+        self.compatibility_layout_pending.set(false);
+        self.validate_host(host)?;
+        self.validate()
+    }
+
+    unsafe fn follow_top_level(&self, host: HWND) -> Result<(), String> {
+        self.validate_host(host)?;
+        let mut target: RECT = zeroed();
+        if GetWindowRect(self.target.hwnd, &mut target) == 0 {
+            return Err(last_error(tr(
+                "无法读取目标窗口位置",
+                "Cannot read the target window bounds",
+            )));
+        }
+        let insets =
+            FrameInsets::capture(self.target.hwnd, target).for_layout(self.target.hwnd, target);
+        let visible = insets.visible_rect(target);
+        let (_, client) = host_bounds(host)?;
+        if client.left != visible.left
+            || client.top != visible.top
+            || client.right != visible.right
+            || client.bottom != visible.bottom
+        {
+            let mut frame = RECT {
+                left: 0,
+                top: 0,
+                right: (visible.right - visible.left).max(1),
+                bottom: (visible.bottom - visible.top).max(1),
+            };
+            container_frame::expand_client(&mut frame, GetDpiForWindow(host).max(96));
+            // 原窗口自行移动或限制尺寸时让外框跟随，不反复将它拉回旧位置
+            self.mirroring_target_state.set(true);
+            let moved = SetWindowPos(
+                host,
+                null_mut(),
+                visible.left + frame.left,
+                visible.top + frame.top,
+                frame.right - frame.left,
+                frame.bottom - frame.top,
+                SWP_NOACTIVATE | SWP_NOZORDER,
+            );
+            self.mirroring_target_state.set(false);
+            if moved == 0 {
+                return Err(last_error(tr(
+                    "无法同步兼容容器外框",
+                    "Cannot synchronize the compatibility container frame",
+                )));
+            }
+        }
+        self.validate_host(host)
+    }
+
     unsafe fn resize_target(&self, host: HWND) -> Result<(), String> {
         if self.restoring.get()
+            || window_topmost::is_pending(host)
+            || window_topmost::is_pending(self.target.hwnd)
             || self.mirroring_target_state.get()
             || IsIconic(host) != 0
             || IsIconic(self.target.hwnd) != 0
@@ -550,12 +952,15 @@ impl ContainerState {
         let result = (|| {
             self.validate()?;
             let _dpi_scope = DpiScope::enter(self.dpi_context)?;
-            if GetParent(self.target.hwnd) != host {
+            if !self.attached_to(host) {
                 return Err(tr(
                     "目标窗口已离开透明容器，请恢复后重新添加",
                     "The target window left its transparency container; restore and add it again",
                 )
                 .into());
+            }
+            if self.mode == HostingMode::TopLevel {
+                return self.layout_top_level(host);
             }
             let mut rect: RECT = zeroed();
             if GetClientRect(host, &mut rect) == 0 {
@@ -691,13 +1096,38 @@ impl ContainerState {
         }
         self.activation_pending.set(false);
         if GetForegroundWindow() == host {
-            SetFocus(self.target.hwnd);
+            if self.mode == HostingMode::TopLevel {
+                SetForegroundWindow(self.target.hwnd);
+            } else {
+                SetFocus(self.target.hwnd);
+            }
         }
         Ok(())
     }
 }
 
 impl WindowContainer {
+    pub fn check_render_compatibility(window: &WindowInfo) -> Result<(), String> {
+        Self::hosting_mode(window).map(|_| ())
+    }
+
+    pub fn supports_rendering(window: &WindowInfo) -> Result<bool, String> {
+        Self::check_render_compatibility(window).map(|_| true)
+    }
+
+    fn hosting_mode(window: &WindowInfo) -> Result<HostingMode, String> {
+        unsafe {
+            if read_window_class(window.hwnd)? == "Chrome_WidgetWin_1"
+                && read_extended_style(window.hwnd)? & WS_EX_NOREDIRECTIONBITMAP != 0
+            {
+                // 不再强制嵌入这一绘制组合，也不依赖特定程序名或 GPU 子窗口寿命
+                Ok(HostingMode::TopLevel)
+            } else {
+                Ok(HostingMode::Embedded)
+            }
+        }
+    }
+
     pub fn attach(
         window: &WindowInfo,
         ownership_property: &[u16],
@@ -717,16 +1147,45 @@ impl WindowContainer {
             placement.length = size_of::<WINDOWPLACEMENT>() as u32;
             let mut original_rect: RECT = zeroed();
             let nonce = NEXT_HOST_NONCE.fetch_add(1, Ordering::Relaxed);
+            let mode = Self::hosting_mode(window)?;
+            let original_ex_style = read_extended_style(window.hwnd)?;
+            let original_layered =
+                if mode == HostingMode::TopLevel && original_ex_style & WS_EX_LAYERED != 0 {
+                    Some(LayeredState::capture(window.hwnd)?)
+                } else {
+                    None
+                };
+            let original_nc_rendering = if mode == HostingMode::TopLevel {
+                Some(read_nc_rendering(window.hwnd)?)
+            } else {
+                None
+            };
+            // 能读取原值才临时调整，旧系统不支持时保留原窗口圆角
+            let original_corner_preference = if mode == HostingMode::TopLevel {
+                read_corner_preference(window.hwnd)
+            } else {
+                None
+            };
             let state = Box::new(ContainerState {
                 host_nonce: nonce,
                 target: window.clone(),
                 property: ownership_property.to_vec(),
                 token,
                 original_style: GetWindowLongPtrW(window.hwnd, GWL_STYLE) as u32,
-                original_ex_style: GetWindowLongPtrW(window.hwnd, GWL_EXSTYLE) as u32,
+                original_ex_style,
                 original_owner: GetWindow(window.hwnd, GW_OWNER),
                 original_placement: placement,
                 original_rect,
+                mode,
+                original_layered,
+                original_nc_rendering,
+                nc_rendering_modified: Cell::new(false),
+                original_corner_preference,
+                corner_preference_modified: Cell::new(false),
+                topmost_modified: Cell::new(false),
+                compatibility_layout_pending: Cell::new(true),
+                compatibility_restore_pending: Cell::new(false),
+                caption: ContainerFrame::default(),
                 frame_insets: FrameInsets::default(),
                 dpi_context: GetWindowDpiAwarenessContext(window.hwnd),
                 needs_restore: Cell::new(false),
@@ -792,7 +1251,7 @@ impl WindowContainer {
                     } else {
                         original_rect
                     });
-            // 按期望客户区补足原生标题栏和边框，不挤占内部窗口的显示尺寸
+            // 创建尺寸和非客户区布局共用边距，不挤占内部窗口的显示尺寸
             let monitor = MonitorFromRect(&host_rect, MONITOR_DEFAULTTONEAREST);
             let mut frame_rect = RECT {
                 left: 0,
@@ -800,20 +1259,7 @@ impl WindowContainer {
                 right: (host_rect.right - host_rect.left).max(160),
                 bottom: (host_rect.bottom - host_rect.top).max(100),
             };
-            if AdjustWindowRectExForDpi(
-                &mut frame_rect,
-                host_style,
-                0,
-                host_ex_style,
-                GetDpiForWindow(window.hwnd).max(96),
-            ) == 0
-            {
-                return Err(last_error(tr(
-                    "无法计算透明容器边框尺寸",
-                    "Cannot calculate the transparency container frame size",
-                ))
-                .into());
-            }
+            container_frame::expand_client(&mut frame_rect, GetDpiForWindow(window.hwnd).max(96));
             let host_width = frame_rect.right - frame_rect.left;
             let host_height = frame_rect.bottom - frame_rect.top;
             let mut monitor_info: MONITORINFO = zeroed();
@@ -832,7 +1278,7 @@ impl WindowContainer {
                 host_ex_style,
                 class_name.as_ptr(),
                 title.as_ptr(),
-                host_style | (state.original_style & WS_MAXIMIZE),
+                host_style,
                 host_rect.left,
                 host_rect.top,
                 host_width,
@@ -858,7 +1304,9 @@ impl WindowContainer {
                 .to_string()
                 .into());
             }
-            let state_ptr = Box::into_raw(state);
+            // 控制器与宿主分别持有状态，窗口消息重入销毁宿主后调用栈仍可安全收尾
+            let state: Rc<ContainerState> = Rc::from(state);
+            let state_ptr = Rc::into_raw(state.clone());
             SetLastError(0);
             let previous = SetWindowLongPtrW(host, GWLP_USERDATA, state_ptr as isize);
             let code = GetLastError();
@@ -870,7 +1318,7 @@ impl WindowContainer {
                     ),
                     code,
                 );
-                drop(Box::from_raw(state_ptr));
+                drop(Rc::from_raw(state_ptr));
                 DestroyWindow(host);
                 return Err(error.into());
             }
@@ -885,6 +1333,7 @@ impl WindowContainer {
             let mut container = Self {
                 hwnd: host,
                 state_ptr,
+                owned_state: state,
                 nonce,
                 thread_id: GetCurrentThreadId(),
             };
@@ -909,11 +1358,51 @@ impl WindowContainer {
         let state = self.state()?;
         state.validate()?;
         state.taskbar_group.replace(Some(taskbar_group));
+        // 宿主状态就绪后统一初始化外框，再进入各自的目标托管流程
+        state.initialize_container_frame(self.hwnd)?;
+        if state.mode == HostingMode::TopLevel {
+            // 透明度也可能先写入原窗口，失败时必须保留可恢复的原始快照
+            state.needs_restore.set(true);
+        }
         self.set_transparency(transparency)?;
         let state = self.state()?;
         state.validate()?;
         state.icons.apply(self.hwnd);
         state.needs_restore.set(true);
+        if state.mode == HostingMode::TopLevel {
+            state.set_target_long(GWLP_HWNDPARENT, self.hwnd as isize)?;
+            state.set_target_long(
+                GWL_EXSTYLE,
+                (read_extended_style(state.target.hwnd)? & !WS_EX_APPWINDOW) as isize,
+            )?;
+            state.validate()?;
+            if !state.attached_to(self.hwnd) {
+                return Err(tr(
+                    "目标窗口未关联兼容容器",
+                    "The target window did not join its compatibility container",
+                )
+                .into());
+            }
+            state.suppress_target_shadow()?;
+            state.suppress_target_corners()?;
+            state.suppress_target_frame()?;
+            if SetWindowPos(
+                state.target.hwnd,
+                null_mut(),
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED,
+            ) == 0
+            {
+                return Err(last_error(tr(
+                    "无法更新兼容窗口边框",
+                    "Cannot update the compatibility window frame",
+                )));
+            }
+            return self.sync();
+        }
         let child_style =
             (state.original_style & !(WS_POPUP | WS_MAXIMIZE)) | WS_CHILD | WS_CLIPSIBLINGS;
         state.set_target_long(GWL_STYLE, child_style as isize)?;
@@ -957,11 +1446,90 @@ impl WindowContainer {
                 "Cannot update the hosted window frame",
             )));
         }
+        // 自定义工作区和边距就绪后再承接原最大化状态，避免创建阶段套用系统厚边框
+        if state.original_style & WS_MAXIMIZE != 0 {
+            self.mirror_target_maximized(true)?;
+        }
         self.sync()
     }
 
-    pub fn hwnd(&self) -> HWND {
-        self.hwnd
+    pub fn hwnd(&self) -> Result<HWND, String> {
+        unsafe { self.state()? };
+        Ok(self.hwnd)
+    }
+
+    pub fn is_topmost(&self) -> Result<bool, String> {
+        unsafe {
+            let state = self.state()?;
+            state.validate()?;
+            if state.restoring.get() || !state.attached_to(self.hwnd) {
+                return Err(tr(
+                    "容器状态已变化，请先取消独立容器后重试",
+                    "The container state changed; exit the independent container and retry",
+                )
+                .into());
+            }
+            let host_topmost = window_is_topmost(self.hwnd)?;
+            let target_topmost =
+                state.mode == HostingMode::TopLevel && window_is_topmost(state.target.hwnd)?;
+            state.validate_host(self.hwnd)?;
+            state.validate()?;
+            Ok(host_topmost || target_topmost)
+        }
+    }
+
+    pub fn has_pending_topmost(&self) -> bool {
+        window_topmost::is_pending(self.hwnd)
+            || window_topmost::is_pending(self.owned_state.target.hwnd)
+    }
+
+    pub fn set_topmost(&self, enabled: bool) -> Result<bool, String> {
+        unsafe {
+            let state = self.state()?;
+            state.validate()?;
+            if state.restoring.get() || !state.attached_to(self.hwnd) {
+                return Err(tr(
+                    "容器状态已变化，请先取消独立容器后重试",
+                    "The container state changed; exit the independent container and retry",
+                )
+                .into());
+            }
+            if !state.original_owner.is_null() {
+                return Err(tr(
+                    "原窗口具有外部所属关系，无法保证独立恢复置顶状态，请选择所属窗口操作",
+                    "The original window has an external owner; select that owner so the topmost state can be restored independently",
+                ).into());
+            }
+            // 顶层目标随所有者进入同一置顶分组，恢复时还原原窗口的分组
+            state.topmost_modified.set(true);
+            let allowed = (state.mode == HostingMode::TopLevel).then_some(state.target.hwnd);
+            if !window_topmost::request(
+                self.hwnd,
+                enabled,
+                allowed,
+                window_topmost::Authority::new(&state.target, &state.property, state.token),
+            )? {
+                return Ok(false);
+            }
+            state.validate_host(self.hwnd)?;
+            state.validate()?;
+            // 原应用可能独立改变自身置顶标志，所有者联动后再核对内容窗口
+            if state.mode == HostingMode::TopLevel
+                && window_is_topmost(state.target.hwnd)? != enabled
+            {
+                if !window_topmost::request(
+                    state.target.hwnd,
+                    enabled,
+                    Some(self.hwnd),
+                    window_topmost::Authority::new(&state.target, &state.property, state.token),
+                )? {
+                    return Ok(false);
+                }
+                state.validate_host(self.hwnd)?;
+                state.validate()?;
+            }
+            Ok(true)
+        }
     }
 
     pub fn set_transparency(&mut self, transparency: u8) -> Result<(), String> {
@@ -970,11 +1538,29 @@ impl WindowContainer {
             state.validate()?;
             let percent = transparency.min(100);
             let alpha = ((100 - percent as u32) * 255 + 50) / 100;
-            if SetLayeredWindowAttributes(self.hwnd, 0, alpha as u8, LWA_ALPHA) == 0 {
-                return Err(last_error(tr(
+            if state.mode == HostingMode::TopLevel {
+                let previous = state.transparency.get();
+                if let Err(error) = state.apply_compatibility_alpha(percent) {
+                    let _ = state.apply_compatibility_alpha(previous);
+                    return Err(error);
+                }
+                state.validate_host(self.hwnd)?;
+                state.validate()?;
+            }
+            let (color_key, flags) = if state.mode == HostingMode::TopLevel {
+                (COMPATIBILITY_COLOR_KEY, LWA_ALPHA | LWA_COLORKEY)
+            } else {
+                (0, LWA_ALPHA)
+            };
+            if SetLayeredWindowAttributes(self.hwnd, color_key, alpha as u8, flags) == 0 {
+                let error = last_error(tr(
                     "无法设置容器透明度",
                     "Cannot set the container transparency",
-                )));
+                ));
+                if state.mode == HostingMode::TopLevel {
+                    let _ = state.apply_compatibility_alpha(state.transparency.get());
+                }
+                return Err(error);
             }
             state.transparency.set(percent);
             Ok(())
@@ -994,16 +1580,19 @@ impl WindowContainer {
             self.state().is_ok_and(|state| {
                 state.needs_restore.get()
                     && state.validate().is_ok()
-                    && GetParent(state.target.hwnd) == self.hwnd
-                    && GetWindowLongPtrW(state.target.hwnd, GWL_STYLE) as u32 & WS_CHILD != 0
+                    && state.attached_to(self.hwnd)
             })
         }
     }
 
     pub fn sync(&mut self) -> Result<(), String> {
         unsafe {
+            // 后台置顶尚未返回时不再从界面线程向同一目标同步发送布局消息
+            if self.has_pending_topmost() {
+                return Ok(());
+            }
             let state = self.state()?;
-            if state.mirroring_target_state.get() {
+            if state.mirroring_target_state.get() || state.resizing.get() {
                 return Ok(());
             }
             if state.host_animation_reset_pending.get() {
@@ -1017,14 +1606,15 @@ impl WindowContainer {
             if !state.needs_restore.get() || state.restoring.get() {
                 return Ok(());
             }
-            if GetParent(state.target.hwnd) != self.hwnd
-                || GetWindowLongPtrW(state.target.hwnd, GWL_STYLE) as u32 & WS_CHILD == 0
-            {
+            if !state.attached_to(self.hwnd) {
                 return Err(tr(
                     "目标窗口已脱离容器模式，请先恢复此窗口",
                     "The target left container mode; restore this window first",
                 )
                 .into());
+            }
+            if state.mode == HostingMode::TopLevel {
+                return self.sync_top_level();
             }
             let visible = GetWindowLongPtrW(state.target.hwnd, GWL_STYLE) as u32 & WS_VISIBLE != 0;
             let minimized = IsIconic(state.target.hwnd) != 0;
@@ -1084,8 +1674,87 @@ impl WindowContainer {
         }
     }
 
+    unsafe fn sync_top_level(&self) -> Result<(), String> {
+        let state = self.state()?;
+        state.validate()?;
+        let visible = GetWindowLongPtrW(state.target.hwnd, GWL_STYLE) as u32 & WS_VISIBLE != 0;
+        let minimized = IsIconic(state.target.hwnd) != 0;
+        let was_minimized = state.target_was_minimized.replace(minimized);
+        state.target_was_visible.set(visible);
+        // 所有者最小化会自动隐藏关联窗口，不能把这一隐藏反向同步为关闭宿主
+        if IsIconic(self.hwnd) != 0 {
+            if visible && !minimized && was_minimized {
+                state.compatibility_layout_pending.set(true);
+                ShowWindow(self.hwnd, SW_SHOWNOACTIVATE);
+            } else {
+                return Ok(());
+            }
+        }
+        let title = window_title(state.target.hwnd);
+        if *state.title.borrow() != title {
+            state.title.replace(title.clone());
+            SetWindowTextW(self.hwnd, wide(&title).as_ptr());
+        }
+        let state = self.state()?;
+        state.validate()?;
+        if !visible {
+            if IsWindowVisible(self.hwnd) != 0 && !state.activation_pending.get() {
+                ShowWindow(self.hwnd, SW_HIDE);
+            }
+            return Ok(());
+        }
+        if minimized {
+            state.compatibility_layout_pending.set(true);
+            if !state.target_restore_pending.get() {
+                ShowWindow(self.hwnd, SW_SHOWMINNOACTIVE);
+            }
+            return Ok(());
+        }
+        state.target_restore_pending.set(false);
+        state.apply_compatibility_alpha(state.transparency.get())?;
+        state.suppress_target_shadow()?;
+        state.suppress_target_corners()?;
+        state.suppress_target_frame()?;
+        let state = self.state()?;
+        state.validate()?;
+        if IsZoomed(state.target.hwnd) != 0 {
+            // 顶层窗口的最大化会覆盖外框，转由外框承接最大化并异步恢复内容窗口
+            if !state.compatibility_restore_pending.get() {
+                state.compatibility_layout_pending.set(true);
+                self.mirror_target_maximized(true)?;
+                let state = self.state()?;
+                state.validate()?;
+                state.compatibility_restore_pending.set(true);
+                if ShowWindowAsync(state.target.hwnd, SW_RESTORE) == 0 {
+                    state.compatibility_restore_pending.set(false);
+                    return Err(last_error(tr(
+                        "无法恢复兼容窗口布局",
+                        "Cannot restore the compatibility window layout",
+                    )));
+                }
+            }
+            return Ok(());
+        }
+        if state.compatibility_restore_pending.replace(false) {
+            state.compatibility_layout_pending.set(true);
+        }
+        if IsWindowVisible(self.hwnd) == 0 {
+            state.compatibility_layout_pending.set(true);
+            ShowWindow(self.hwnd, SW_SHOWNOACTIVATE);
+        }
+        let state = self.state()?;
+        state.validate()?;
+        if state.compatibility_layout_pending.get() || IsZoomed(self.hwnd) != 0 {
+            state.layout_request.set(None);
+            state.resize_target(self.hwnd)?;
+        } else {
+            state.follow_top_level(self.hwnd)?;
+        }
+        state.finish_activation(self.hwnd)
+    }
+
     unsafe fn mirror_target_maximized(&self, maximized: bool) -> Result<(), String> {
-        // 子窗已执行状态转换，宿主只跟随状态，不再播放第二段动画
+        // 目标已执行状态转换，宿主只跟随状态，不再播放第二段动画
         let scope = HostAnimationScope::begin(self)?;
         let mirrored: Result<(), String> = (|| {
             self.state()?.validate()?;
@@ -1136,12 +1805,19 @@ impl WindowContainer {
 
     pub fn detach(&mut self) -> Result<(), String> {
         unsafe {
-            if self.hwnd.is_null() || IsWindow(self.hwnd) == 0 {
-                self.hwnd = null_mut();
+            if self.hwnd.is_null() {
                 return Ok(());
             }
+            if self.has_pending_topmost() {
+                return Err(window_topmost::pending_message());
+            }
             let host = self.hwnd;
-            let state = self.state()?;
+            // 宿主异常关闭后目标可能已自行脱离，仍需依靠保留的快照恢复样式与位置
+            let state: &ContainerState = if IsWindow(host) != 0 {
+                self.state()?
+            } else {
+                &self.owned_state
+            };
             if state.target_identity_gone() {
                 if !GetWindow(host, GW_CHILD).is_null() {
                     return Err(tr("容器仍有子窗口，无法安全释放，请保留 Trans", "The container still has a child window and cannot be released safely; keep Trans running").into());
@@ -1159,8 +1835,9 @@ impl WindowContainer {
                 state.validate()?;
                 let _dpi_scope = DpiScope::enter(state.dpi_context)?;
                 if state.needs_restore.get() {
-                    if GetAncestor(state.target.hwnd, GA_PARENT) == host
-                        || GetParent(state.target.hwnd) == host
+                    if state.mode == HostingMode::Embedded
+                        && (GetAncestor(state.target.hwnd, GA_PARENT) == host
+                            || GetParent(state.target.hwnd) == host)
                     {
                         state.validate()?;
                         SetLastError(0);
@@ -1183,13 +1860,40 @@ impl WindowContainer {
                         }
                     }
                     state.set_target_long(GWL_STYLE, state.original_style as isize)?;
-                    state.set_target_long(GWL_EXSTYLE, state.original_ex_style as isize)?;
+                    // 置顶分组由异步请求恢复，不先伪写样式位以免误判已经完成
+                    let topmost = read_extended_style(state.target.hwnd)? & WS_EX_TOPMOST;
+                    state.set_target_long(
+                        GWL_EXSTYLE,
+                        ((state.original_ex_style & !WS_EX_TOPMOST) | topmost) as isize,
+                    )?;
                     let owner = if IsWindow(state.original_owner) != 0 {
                         state.original_owner
                     } else {
                         null_mut()
                     };
                     state.set_target_long(GWLP_HWNDPARENT, owner as isize)?;
+                    if state.mode == HostingMode::TopLevel {
+                        state.validate()?;
+                        if GetWindow(state.target.hwnd, GW_OWNER) == host {
+                            return Err(tr("目标窗口仍关联兼容容器，请保留 Trans 并重试", "The target window still belongs to the compatibility container; keep Trans running and retry").into());
+                        }
+                        if let Some(layered) = state.original_layered {
+                            if SetLayeredWindowAttributes(
+                                state.target.hwnd,
+                                layered.color_key,
+                                layered.alpha,
+                                layered.flags,
+                            ) == 0
+                            {
+                                return Err(last_error(tr(
+                                    "无法还原窗口原始分层属性",
+                                    "Cannot restore the original layered attributes",
+                                )));
+                            }
+                        }
+                        state.restore_target_nc_rendering()?;
+                        state.restore_target_corner_preference()?;
+                    }
                     state.validate()?;
                     if SetWindowPos(
                         state.target.hwnd,
@@ -1207,6 +1911,19 @@ impl WindowContainer {
                         )));
                     }
                     state.validate()?;
+                    if state.topmost_modified.get() {
+                        if !restore_window_topmost(
+                            state.target.hwnd,
+                            state.original_ex_style & WS_EX_TOPMOST != 0,
+                            &state.target,
+                            &state.property,
+                            state.token,
+                        )? {
+                            return Err(window_topmost::pending_message());
+                        }
+                        state.validate()?;
+                        state.topmost_modified.set(false);
+                    }
                     if SetWindowPlacement(state.target.hwnd, &state.original_placement) == 0 {
                         return Err(last_error(tr(
                             "无法还原窗口显示状态",
@@ -1239,6 +1956,7 @@ impl WindowContainer {
         let ptr = GetWindowLongPtrW(self.hwnd, GWLP_USERDATA) as *const ContainerState;
         if process_id != GetCurrentProcessId()
             || thread_id != self.thread_id
+            || GetCurrentThreadId() != self.thread_id
             || GetPropW(self.hwnd, host_property().as_ptr()) as usize != self.nonce
             || ptr != self.state_ptr
             || GetWindowLongPtrW(self.hwnd, GWLP_WNDPROC) != container_proc as *const () as isize
@@ -1267,7 +1985,19 @@ impl WindowContainer {
     }
 
     unsafe fn destroy_empty_host(&mut self) -> Result<(), String> {
+        if IsWindow(self.hwnd) == 0 {
+            self.hwnd = null_mut();
+            return Ok(());
+        }
         self.state()?;
+        let state = &self.owned_state;
+        if IsWindow(state.target.hwnd) != 0
+            && (GetParent(state.target.hwnd) == self.hwnd
+                || GetWindow(state.target.hwnd, GW_OWNER) == self.hwnd
+                || GetAncestor(state.target.hwnd, GA_PARENT) == self.hwnd)
+        {
+            return Err(tr("目标窗口仍关联容器，无法安全释放，请保留 Trans", "The target window still belongs to the container; keep Trans running because it cannot be released safely").into());
+        }
         if !GetWindow(self.hwnd, GW_CHILD).is_null() {
             return Err(tr("容器仍有子窗口，无法安全释放，请保留 Trans", "The container still has a child window and cannot be released safely; keep Trans running").into());
         }
@@ -1296,11 +2026,18 @@ unsafe extern "system" fn container_proc(
     lparam: LPARAM,
 ) -> LRESULT {
     // 标题栏、边框命中及系统移动缩放统一交给 Windows 原生处理
-    let ptr = GetWindowLongPtrW(host, GWLP_USERDATA) as *mut ContainerState;
+    let ptr = GetWindowLongPtrW(host, GWLP_USERDATA) as *const ContainerState;
+    // 每次回调单独保活，嵌套 WM_NCDESTROY 只释放宿主持有的引用
+    let state = if ptr.is_null() {
+        None
+    } else {
+        Rc::increment_strong_count(ptr);
+        Some(Rc::from_raw(ptr))
+    };
     if message == WM_DESTROY {
         // 先结束 RefCell 借用，再清理可能引发 COM 重入的窗口属性
-        let group = ptr
-            .as_ref()
+        let group = state
+            .as_deref()
             .and_then(|state| state.taskbar_group.borrow_mut().take());
         drop(group);
         return DefWindowProcW(host, message, wparam, lparam);
@@ -1308,21 +2045,38 @@ unsafe extern "system" fn container_proc(
     if message == WM_NCDESTROY {
         SetWindowLongPtrW(host, GWLP_USERDATA, 0);
         RemovePropW(host, host_property().as_ptr());
-        let mut state = if ptr.is_null() {
-            None
-        } else {
-            Some(Box::from_raw(ptr))
-        };
+        let host_state = (!ptr.is_null()).then(|| Rc::from_raw(ptr));
         let group = state
-            .as_mut()
-            .and_then(|state| state.taskbar_group.get_mut().take());
+            .as_deref()
+            .and_then(|state| state.taskbar_group.borrow_mut().take());
         drop(group);
         let result = DefWindowProcW(host, message, wparam, lparam);
-        drop(state);
+        drop(host_state);
         return result;
     }
-    if let Some(state) = ptr.as_ref() {
+    if let Some(state) = state.as_deref() {
+        if let Some(result) = state.caption.process(host, message, wparam, lparam) {
+            if state.mode == HostingMode::TopLevel
+                && matches!(message, WM_LBUTTONUP | WM_CANCELMODE | WM_CAPTURECHANGED)
+            {
+                // 按钮系统命令先入队，鼠标操作结束后再交还原窗口输入
+                PostMessageW(host, WM_COMPATIBILITY_FOCUS, 0, 0);
+            }
+            return result;
+        }
         match message {
+            WM_ERASEBKGND if state.mode == HostingMode::TopLevel => {
+                return fill_compatibility_client(host, wparam as HDC) as LRESULT;
+            }
+            WM_PAINT if state.mode == HostingMode::TopLevel => {
+                let mut paint: PAINTSTRUCT = zeroed();
+                let dc = BeginPaint(host, &mut paint);
+                if !dc.is_null() {
+                    fill_compatibility_client(host, dc);
+                }
+                EndPaint(host, &paint);
+                return 0;
+            }
             WM_CLOSE => {
                 state.activation_pending.set(false);
                 state.target_restore_pending.set(false);
@@ -1350,8 +2104,12 @@ unsafe extern "system" fn container_proc(
                     && !state.mirroring_target_state.get()
                     && state.needs_restore.get()
                     && state.validate().is_ok()
-                    && GetParent(state.target.hwnd) == host =>
+                    && state.attached_to(host) =>
             {
+                if state.mode == HostingMode::TopLevel {
+                    state.compatibility_layout_pending.set(true);
+                }
+                RedrawWindow(host, null_mut(), null_mut(), RDW_INVALIDATE | RDW_FRAME);
                 // 宿主负责收起动画，不再异步收起子窗或伪造它的历史状态
                 if wparam == SIZE_MINIMIZED as usize {
                     state.activation_pending.set(false);
@@ -1370,8 +2128,47 @@ unsafe extern "system" fn container_proc(
                     }
                 }
             }
+            WM_MOVE
+                if state.mode == HostingMode::TopLevel
+                    && !state.restoring.get()
+                    && !state.mirroring_target_state.get()
+                    && !state.resizing.get()
+                    && state.needs_restore.get()
+                    && state.validate().is_ok()
+                    && state.attached_to(host) =>
+            {
+                state.compatibility_layout_pending.set(true);
+                let _ = state.resize_target(host);
+            }
+            WM_EXITSIZEMOVE | WM_EXITMENULOOP if state.mode == HostingMode::TopLevel => {
+                PostMessageW(host, WM_COMPATIBILITY_FOCUS, 0, 0);
+            }
+            WM_COMPATIBILITY_FOCUS if state.mode == HostingMode::TopLevel => {
+                if !state.restoring.get()
+                    && state.validate().is_ok()
+                    && state.attached_to(host)
+                    && GetForegroundWindow() == host
+                    && GetCapture() != host
+                    && IsWindowVisible(state.target.hwnd) != 0
+                    && IsIconic(state.target.hwnd) == 0
+                {
+                    let mut info: GUITHREADINFO = zeroed();
+                    info.cbSize = size_of::<GUITHREADINFO>() as u32;
+                    // 不在原生拖动和系统菜单循环中切走前台，结束拖动后再交还输入
+                    if GetGUIThreadInfo(GetCurrentThreadId(), &mut info) != 0
+                        && info.flags & (GUI_INMOVESIZE | GUI_INMENUMODE | GUI_SYSTEMMENUMODE) == 0
+                    {
+                        SetForegroundWindow(state.target.hwnd);
+                    }
+                }
+                return 0;
+            }
             WM_SETFOCUS if !state.restoring.get() && state.validate().is_ok() => {
-                if IsIconic(state.target.hwnd) == 0 && IsWindowVisible(state.target.hwnd) != 0 {
+                if state.mode == HostingMode::TopLevel {
+                    PostMessageW(host, WM_COMPATIBILITY_FOCUS, 0, 0);
+                } else if IsIconic(state.target.hwnd) == 0
+                    && IsWindowVisible(state.target.hwnd) != 0
+                {
                     SetFocus(state.target.hwnd);
                 }
                 return 0;
@@ -1380,6 +2177,109 @@ unsafe extern "system" fn container_proc(
         }
     }
     DefWindowProcW(host, message, wparam, lparam)
+}
+
+unsafe fn read_nc_rendering(target: HWND) -> Result<bool, String> {
+    let mut enabled = 0i32;
+    let result = DwmGetWindowAttribute(
+        target,
+        DWMWA_NCRENDERING_ENABLED as u32,
+        &mut enabled as *mut i32 as _,
+        size_of_val(&enabled) as u32,
+    );
+    if result < 0 {
+        return Err(format!(
+            "{} (HRESULT 0x{:08X})",
+            tr(
+                "无法读取窗口的非客户区绘制状态",
+                "Cannot read the window's non-client rendering state"
+            ),
+            result as u32,
+        ));
+    }
+    Ok(enabled != 0)
+}
+
+unsafe fn read_corner_preference(target: HWND) -> Option<i32> {
+    let mut preference = 0i32;
+    let result = DwmGetWindowAttribute(
+        target,
+        DWMWA_WINDOW_CORNER_PREFERENCE as u32,
+        &mut preference as *mut i32 as _,
+        size_of_val(&preference) as u32,
+    );
+    (result >= 0).then_some(preference)
+}
+
+unsafe fn fill_compatibility_client(host: HWND, dc: HDC) -> bool {
+    if dc.is_null() {
+        return false;
+    }
+    let mut client: RECT = zeroed();
+    if GetClientRect(host, &mut client) == 0 {
+        return false;
+    }
+    let brush = GetStockObject(DC_BRUSH);
+    if brush.is_null() {
+        return false;
+    }
+    let previous = SetDCBrushColor(dc, COMPATIBILITY_COLOR_KEY);
+    if previous == CLR_INVALID {
+        return false;
+    }
+    // 客户区始终透明留空，不在原窗口下面重复铺设带 alpha 的色带
+    let filled = FillRect(dc, &client, brush) != 0;
+    SetDCBrushColor(dc, previous);
+    filled
+}
+
+unsafe fn host_bounds(host: HWND) -> Result<(RECT, RECT), String> {
+    let mut window: RECT = zeroed();
+    let mut client: RECT = zeroed();
+    if GetWindowRect(host, &mut window) == 0 || GetClientRect(host, &mut client) == 0 {
+        return Err(last_error(tr(
+            "无法读取兼容容器边界",
+            "Cannot read the compatibility container bounds",
+        )));
+    }
+    SetLastError(0);
+    if MapWindowPoints(host, null_mut(), &mut client as *mut RECT as *mut POINT, 2) == 0
+        && GetLastError() != 0
+    {
+        return Err(last_error(tr(
+            "无法换算兼容容器坐标",
+            "Cannot map the compatibility container coordinates",
+        )));
+    }
+    Ok((window, client))
+}
+
+unsafe fn read_window_class(hwnd: HWND) -> Result<String, String> {
+    let mut class = [0u16; 256];
+    let length = GetClassNameW(hwnd, class.as_mut_ptr(), class.len() as i32);
+    if length == 0 {
+        return Err(last_error(tr(
+            "无法检查窗口类别，已保留原状态",
+            "Cannot check the window class; the window was left unchanged",
+        )));
+    }
+    Ok(String::from_utf16_lossy(&class[..length as usize]))
+}
+
+unsafe fn read_extended_style(hwnd: HWND) -> Result<u32, String> {
+    SetLastError(0);
+    let style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+    let error = GetLastError();
+    if style == 0 && error != 0 {
+        return Err(error_with_code(
+            tr(
+                "无法检查窗口绘制样式，已保留原状态",
+                "Cannot check the rendering style; the window was left unchanged",
+            ),
+            error,
+        ));
+    }
+    Ok(style as u32)
 }
 
 unsafe fn set_window_long(hwnd: HWND, index: i32, value: isize) -> Result<(), String> {

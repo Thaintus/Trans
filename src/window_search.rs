@@ -17,6 +17,9 @@ pub fn filter_windows(
         .filter(|window| window.process_id != self_process_id)
         .filter(|window| !tracked.contains(&identity(window)))
         .filter(|window| {
+            if terms.is_empty() {
+                return true;
+            }
             let title = window.title.to_lowercase();
             let process_id = window.process_id.to_string();
             terms

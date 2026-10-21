@@ -5,6 +5,8 @@ mod app;
 #[cfg(windows)]
 mod compact_menu;
 #[cfg(windows)]
+mod container_frame;
+#[cfg(windows)]
 mod hotkey;
 #[cfg(windows)]
 mod list_scrollbar;
@@ -32,6 +34,8 @@ mod window_control;
 mod window_events;
 #[cfg(windows)]
 mod window_search;
+#[cfg(windows)]
+mod window_topmost;
 
 #[cfg(windows)]
 fn main() {

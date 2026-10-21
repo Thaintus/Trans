@@ -32,6 +32,10 @@ pub fn set_language(language: Language) {
     LANGUAGE.with(|current| current.set(language));
 }
 
+pub(crate) fn current_language() -> Language {
+    LANGUAGE.with(Cell::get)
+}
+
 pub fn tr<'a>(chinese: &'a str, english: &'a str) -> &'a str {
     LANGUAGE.with(|current| match current.get() {
         Language::Chinese => chinese,

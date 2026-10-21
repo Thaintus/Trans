@@ -447,33 +447,38 @@ impl SettingsPanel {
         self.state.hwnd.get()
     }
 
-    pub unsafe fn set_bounds(&self, bounds: [i32; 4], dpi: u32) {
-        if self.hwnd().is_null() {
-            return;
+    pub unsafe fn set_bounds(&self, bounds: [i32; 4], dpi: u32) -> bool {
+        let hwnd = self.hwnd();
+        if hwnd.is_null() || IsWindow(hwnd) == 0 {
+            return false;
         }
         let dpi_changed = self.state.set_dpi(dpi);
         if dpi_changed {
             self.state.end_drag();
         }
-        if self.state.bounds.get() != Some(bounds) {
+        let positioned = if self.state.bounds.get() == Some(bounds) {
+            true
+        } else {
             let [x, y, width, height] = bounds;
-            if SetWindowPos(
-                self.hwnd(),
+            let positioned = SetWindowPos(
+                hwnd,
                 null_mut(),
                 x,
                 y,
                 width.max(0),
                 height.max(0),
                 SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOREDRAW | SWP_NOCOPYBITS,
-            ) != 0
-            {
+            ) != 0;
+            if positioned {
                 self.state.bounds.set(Some(bounds));
             }
-        }
+            positioned
+        };
         self.state.sync_metrics();
         if dpi_changed {
             self.state.request_layout();
         }
+        positioned
     }
 
     pub unsafe fn client_width(&self) -> i32 {

@@ -1,5 +1,5 @@
 use std::cell::{Cell, RefCell};
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::marker::PhantomData;
 use std::mem::{size_of, zeroed};
 use std::ptr::{null, null_mut};
@@ -48,7 +48,7 @@ const HOTKEY_TEXT_SUBCLASS: usize = 0x5452_534b;
 const COMPACT_CHECKBOX_SUBCLASS: usize = 0x5452_5354;
 
 thread_local! {
-    static HIDDEN_WINDOWS: RefCell<HashSet<usize>> = RefCell::new(HashSet::new());
+    static WINDOW_BADGES: RefCell<HashMap<usize, WindowBadges>> = RefCell::new(HashMap::new());
     static GDIPLUS_READY: Cell<bool> = const { Cell::new(false) };
 }
 
@@ -159,13 +159,29 @@ impl Drop for GdiPlusBrush {
     }
 }
 
-pub fn set_hidden_windows(windows: impl IntoIterator<Item = usize>) {
-    let windows = windows.into_iter().collect();
-    HIDDEN_WINDOWS.with(|hidden| *hidden.borrow_mut() = windows);
+#[derive(Clone, Copy, Default)]
+pub struct WindowBadges {
+    pub hidden: bool,
+    pub topmost: bool,
+    pub container: bool,
 }
 
-fn hidden_window(window: usize) -> bool {
-    HIDDEN_WINDOWS.with(|hidden| hidden.borrow().contains(&window))
+impl WindowBadges {
+    fn any(self) -> bool {
+        self.hidden || self.topmost || self.container
+    }
+}
+
+pub fn set_window_badges(windows: impl IntoIterator<Item = (usize, WindowBadges)>) {
+    let windows = windows
+        .into_iter()
+        .filter(|(_, badges)| badges.any())
+        .collect();
+    WINDOW_BADGES.with(|badges| *badges.borrow_mut() = windows);
+}
+
+fn window_badges(window: usize) -> WindowBadges {
+    WINDOW_BADGES.with(|badges| badges.borrow().get(&window).copied().unwrap_or_default())
 }
 
 #[derive(Clone, Copy)]
@@ -1690,6 +1706,18 @@ unsafe fn icon_path_antialiased(
     color: COLORREF,
     build: impl FnOnce(*mut gdip::GpPath, f32, f32, f32) -> bool,
 ) -> bool {
+    let scale = 18.0 * dpi.max(96) as f32 / (96.0 * 24.0);
+    scaled_icon_path_antialiased(hdc, rect, color, scale, 2.0 * scale, build)
+}
+
+unsafe fn scaled_icon_path_antialiased(
+    hdc: HDC,
+    rect: RECT,
+    color: COLORREF,
+    scale: f32,
+    stroke: f32,
+    build: impl FnOnce(*mut gdip::GpPath, f32, f32, f32) -> bool,
+) -> bool {
     if !GDIPLUS_READY.with(Cell::get) {
         return false;
     }
@@ -1720,8 +1748,7 @@ unsafe fn icon_path_antialiased(
     };
     let cx = (corners[0].x as f32 + corners[1].x as f32) / 2.0;
     let cy = (corners[0].y as f32 + corners[1].y as f32) / 2.0;
-    let scale = 18.0 * dpi.max(96) as f32 / (96.0 * 24.0);
-    let Some(pen) = GdiPlusPen::new(color, 2.0 * scale) else {
+    let Some(pen) = GdiPlusPen::new(color, stroke) else {
         return false;
     };
     gdip::GdipSetPageUnit(graphics.0, gdip::UnitPixel) == gdip::Ok
@@ -2271,17 +2298,119 @@ pub unsafe fn draw_trackbar(draw: &NMCUSTOMDRAW, compact: bool) -> LRESULT {
     }
 }
 
-unsafe fn draw_list_name(draw: &NMLVCUSTOMDRAW, hidden: bool) -> bool {
+const LIST_BADGE_SIDE: i32 = 11;
+
+#[derive(Clone, Copy)]
+enum ListBadgeIcon {
+    Hidden,
+    Topmost,
+    Container,
+}
+
+impl ListBadgeIcon {
+    // 所有角标共用十二单位画布，轮廓留出描边和抗锯齿所需边距
+    fn lines(self) -> &'static [&'static [(f32, f32)]] {
+        match self {
+            Self::Hidden => &[&[(3.1, 8.9), (8.9, 3.1)]],
+            Self::Topmost => &[
+                &[
+                    (3.5, 1.7),
+                    (8.5, 1.7),
+                    (7.5, 3.2),
+                    (7.5, 5.0),
+                    (9.0, 7.0),
+                    (3.0, 7.0),
+                    (4.5, 5.0),
+                    (4.5, 3.2),
+                    (3.5, 1.7),
+                ],
+                &[(6.0, 7.0), (6.0, 10.3)],
+            ],
+            Self::Container => &[
+                &[(4.5, 3.3), (4.5, 1.7), (10.3, 1.7), (10.3, 7.5), (8.7, 7.5)],
+                &[(1.7, 4.5), (7.5, 4.5), (7.5, 10.3), (1.7, 10.3), (1.7, 4.5)],
+            ],
+        }
+    }
+}
+
+unsafe fn list_badge_icon(dc: HDC, rect: RECT, color: COLORREF, icon: ListBadgeIcon) {
+    let scale = (rect.right - rect.left) as f32 / 12.0;
+    if scaled_icon_path_antialiased(
+        dc,
+        rect,
+        color,
+        scale,
+        1.25 * scale,
+        |path, cx, cy, scale| {
+            let point = |(x, y): (f32, f32)| (cx + (x - 6.0) * scale, cy + (y - 6.0) * scale);
+            for line in icon.lines() {
+                if gdip::GdipStartPathFigure(path) != gdip::Ok {
+                    return false;
+                }
+                for segment in line.windows(2) {
+                    let (x1, y1) = point(segment[0]);
+                    let (x2, y2) = point(segment[1]);
+                    if gdip::GdipAddPathLine(path, x1, y1, x2, y2) != gdip::Ok {
+                        return false;
+                    }
+                }
+            }
+            if matches!(icon, ListBadgeIcon::Hidden)
+                && (gdip::GdipStartPathFigure(path) != gdip::Ok
+                    || gdip::GdipAddPathEllipse(
+                        path,
+                        cx - 4.1 * scale,
+                        cy - 4.1 * scale,
+                        8.2 * scale,
+                        8.2 * scale,
+                    ) != gdip::Ok)
+            {
+                return false;
+            }
+            true
+        },
+    ) {
+        return;
+    }
+    // GDI+ 不可用时沿用同一浮点轮廓，保持符号含义和比例
+    let Some(saved) = SavedDc::new(dc) else {
+        return;
+    };
+    let pen = CreatePen(PS_SOLID, (1.25 * scale).round().max(1.0) as i32, color);
+    if pen.is_null() {
+        return;
+    }
+    SelectObject(dc, pen);
+    SelectObject(dc, GetStockObject(NULL_BRUSH));
+    let point = |(x, y): (f32, f32)| POINT {
+        x: (rect.left as f32 + x * scale).round() as i32,
+        y: (rect.top as f32 + y * scale).round() as i32,
+    };
+    for line in icon.lines() {
+        let start = point(line[0]);
+        MoveToEx(dc, start.x, start.y, null_mut());
+        for &position in &line[1..] {
+            let end = point(position);
+            LineTo(dc, end.x, end.y);
+        }
+    }
+    if matches!(icon, ListBadgeIcon::Hidden) {
+        let first = point((1.9, 1.9));
+        let last = point((10.1, 10.1));
+        Ellipse(dc, first.x, first.y, last.x, last.y);
+    }
+    drop(saved);
+    DeleteObject(pen);
+}
+
+unsafe fn draw_list_name(draw: &NMLVCUSTOMDRAW, badges: WindowBadges) -> bool {
     let list = draw.nmcd.hdr.hwndFrom;
     let row = draw.nmcd.dwItemSpec;
     let dc = draw.nmcd.hdc;
     let images = SendMessageW(list, LVM_GETIMAGELIST, LVSIL_SMALL as usize, 0) as HIMAGELIST;
     let mut bounds = RECT {
         left: LVIR_BOUNDS as i32,
-        ..zeroed()
-    };
-    let mut label = RECT {
-        left: LVIR_LABEL as i32,
         ..zeroed()
     };
     let column_width = SendMessageW(list, LVM_GETCOLUMNWIDTH, 0, 0) as i32;
@@ -2292,13 +2421,6 @@ unsafe fn draw_list_name(draw: &NMLVCUSTOMDRAW, hidden: bool) -> bool {
             row,
             &mut bounds as *mut RECT as LPARAM,
         ) == 0
-        || (images != 0
-            && SendMessageW(
-                list,
-                LVM_GETITEMRECT,
-                row,
-                &mut label as *mut RECT as LPARAM,
-            ) == 0)
     {
         return false;
     }
@@ -2381,43 +2503,43 @@ unsafe fn draw_list_name(draw: &NMLVCUSTOMDRAW, hidden: bool) -> bool {
             }
         }
     }
-    if images != 0 && item.iImage >= 0 {
-        let mut icon = RECT {
-            left: LVIR_ICON as i32,
-            ..zeroed()
-        };
-        let mut icon_width = 0;
-        let mut icon_height = 0;
-        if SendMessageW(list, LVM_GETITEMRECT, row, &mut icon as *mut RECT as LPARAM) != 0
-            && ImageList_GetIconSize(images, &mut icon_width, &mut icon_height) != 0
-        {
-            ImageList_Draw(
-                images,
-                item.iImage,
-                dc,
-                icon.left,
-                cell.top + (cell.bottom - cell.top - icon_height) / 2,
-                ILD_TRANSPARENT
-                    | if item.state & LVIS_CUT != 0 {
-                        ILD_BLEND50
-                    } else {
-                        0
-                    },
-            );
-        }
-    }
     let dpi = GetDpiForWindow(list).max(96);
-    let badge_size = if hidden { pixels(7, dpi) } else { 0 };
-    let gap = if hidden { pixels(2, dpi) } else { 0 };
-    // 解除图片列表后不沿用原生标签的图标占位宽度
+    let mut icon_width = 0;
+    let mut icon_height = 0;
+    let has_icon = images != 0
+        && item.iImage >= 0
+        && ImageList_GetIconSize(images, &mut icon_width, &mut icon_height) != 0;
+    if has_icon {
+        ImageList_Draw(
+            images,
+            item.iImage,
+            dc,
+            cell.left + pixels(4, dpi),
+            cell.top + (cell.bottom - cell.top - icon_height) / 2,
+            ILD_TRANSPARENT
+                | if item.state & LVIS_CUT != 0 {
+                    ILD_BLEND50
+                } else {
+                    0
+                },
+        );
+    }
+    let gap = pixels(2, dpi);
+    let side = pixels(LIST_BADGE_SIDE, dpi).min((cell.bottom - cell.top).max(1));
+    let badge_width = [badges.topmost, badges.container, badges.hidden]
+        .into_iter()
+        .filter(|enabled| *enabled)
+        .count() as i32
+        * (side + gap);
+    // 关闭应用图标时不保留图标宽度
     let text_left = cell.left + pixels(4, dpi);
     let mut content = RECT {
-        left: if images != 0 {
-            label.left.max(text_left)
+        left: if has_icon {
+            text_left + icon_width + pixels(4, dpi)
         } else {
             text_left
         },
-        right: cell.right - pixels(4, dpi) - badge_size - gap,
+        right: cell.right - pixels(4, dpi) - badge_width,
         ..cell
     };
     if content.right <= content.left {
@@ -2437,7 +2559,7 @@ unsafe fn draw_list_name(draw: &NMLVCUSTOMDRAW, hidden: bool) -> bool {
     {
         return false;
     }
-    if !hidden {
+    if !badges.any() {
         return true;
     }
     let shown_length = text.iter().position(|value| *value == 0).unwrap_or(1024);
@@ -2445,42 +2567,35 @@ unsafe fn draw_list_name(draw: &NMLVCUSTOMDRAW, hidden: bool) -> bool {
     if GetTextExtentPoint32W(dc, text.as_ptr(), shown_length as i32, &mut extent) == 0 {
         return false;
     }
-    // 角标紧贴实际显示名称的末端，并略高于文字基线
-    let left = (content.left + extent.cx + gap).min(cell.right - pixels(4, dpi) - badge_size);
-    let top = ((cell.top + cell.bottom) / 2 - pixels(9, dpi)).max(cell.top + pixels(1, dpi));
-    let pen = CreatePen(PS_SOLID, pixels(1, dpi).max(1), foreground);
-    if !pen.is_null() {
-        SelectObject(dc, pen);
-    } else {
-        SelectObject(dc, GetStockObject(DC_PEN));
-        SetDCPenColor(dc, foreground);
-    }
-    SelectObject(dc, GetStockObject(NULL_BRUSH));
-    Ellipse(dc, left, top, left + badge_size, top + badge_size);
-    MoveToEx(
-        dc,
-        left + pixels(2, dpi),
-        top + badge_size - pixels(2, dpi),
-        null_mut(),
-    );
-    LineTo(dc, left + badge_size - pixels(2, dpi), top + pixels(2, dpi));
-    // 先恢复 DC 再释放选入的画笔
-    drop(_saved);
-    if !pen.is_null() {
-        DeleteObject(pen);
+    // 状态符号紧贴名称末端横向排列，关闭的状态不占位
+    let mut left =
+        (content.left + extent.cx + gap).min(cell.right - pixels(4, dpi) - badge_width + gap);
+    let top = cell.top + (cell.bottom - cell.top - side) / 2;
+    for (enabled, icon) in [
+        (badges.topmost, ListBadgeIcon::Topmost),
+        (badges.container, ListBadgeIcon::Container),
+        (badges.hidden, ListBadgeIcon::Hidden),
+    ] {
+        if enabled {
+            list_badge_icon(
+                dc,
+                RECT {
+                    left,
+                    top,
+                    right: left + side,
+                    bottom: top + side,
+                },
+                foreground,
+                icon,
+            );
+            left += side + gap;
+        }
     }
     true
 }
 
 pub unsafe fn draw_list(draw: &mut NMLVCUSTOMDRAW) -> LRESULT {
-    let hidden = hidden_window(draw.nmcd.lItemlParam as usize);
-    let custom_name = hidden
-        || SendMessageW(
-            draw.nmcd.hdr.hwndFrom,
-            LVM_GETIMAGELIST,
-            LVSIL_SMALL as usize,
-            0,
-        ) == 0;
+    let badges = window_badges(draw.nmcd.lItemlParam as usize);
     match draw.nmcd.dwDrawStage {
         CDDS_PREPAINT => CDRF_NOTIFYITEMDRAW as LRESULT,
         CDDS_ITEMPREPAINT => {
@@ -2490,11 +2605,7 @@ pub unsafe fn draw_list(draw: &mut NMLVCUSTOMDRAW) -> LRESULT {
                 draw.nmcd.dwItemSpec,
                 LVIS_SELECTED as LPARAM,
             ) as u32;
-            let notify_subitems = if custom_name {
-                CDRF_NOTIFYSUBITEMDRAW
-            } else {
-                0
-            };
+            let notify_subitems = CDRF_NOTIFYSUBITEMDRAW;
             if state & LVIS_SELECTED != 0 {
                 return notify_subitems as LRESULT;
             }
@@ -2502,8 +2613,8 @@ pub unsafe fn draw_list(draw: &mut NMLVCUSTOMDRAW) -> LRESULT {
             draw.clrTextBk = SURFACE;
             (CDRF_NEWFONT | notify_subitems) as LRESULT
         }
-        stage if stage == CDDS_ITEMPREPAINT | CDDS_SUBITEM && custom_name && draw.iSubItem == 0 => {
-            if draw_list_name(draw, hidden) {
+        stage if stage == CDDS_ITEMPREPAINT | CDDS_SUBITEM && draw.iSubItem == 0 => {
+            if draw_list_name(draw, badges) {
                 CDRF_SKIPDEFAULT as LRESULT
             } else {
                 CDRF_DODEFAULT as LRESULT

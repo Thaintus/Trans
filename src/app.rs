@@ -23,7 +23,7 @@ use crate::hotkey::Hotkey;
 use crate::localization::{set_language, tr, Language};
 use crate::picker_overlay::PickerOverlay;
 use crate::presentation::{IconList, PrivacyNames};
-use crate::settings::{Settings, MAX_SELF_TRANSPARENCY};
+use crate::settings::{Settings, WindowGeometry, MAX_SELF_TRANSPARENCY};
 use crate::settings_panel::SettingsPanel;
 use crate::tray::{self, TrayIcon};
 use crate::ui_theme::{self, ButtonStyle, ACCENT, MUTED, TEXT};
@@ -63,6 +63,7 @@ const EVENT_SETTINGS_SCROLL: usize = 25;
 const EVENT_LANGUAGE_CHANGE: usize = 26;
 const EVENT_TARGET_ACTIVITY: usize = 27;
 const EVENT_ESCAPE: usize = 28;
+const EVENT_TOPMOST_COMPLETED: usize = 29;
 const HOTKEY_RESTORE: i32 = 1;
 const TIMER_TARGET_ACTIVITY: usize = 2;
 const ICON_RESOURCE: usize = 101;
@@ -109,6 +110,8 @@ const MENU_HIDE_TASKBAR: u32 = 205;
 const MENU_SHOW_TASKBAR: u32 = 206;
 const MENU_ENABLE_CONTAINER: u32 = 207;
 const MENU_DISABLE_CONTAINER: u32 = 208;
+const MENU_TOPMOST_WINDOW: u32 = 209;
+const MENU_CANCEL_TOPMOST: u32 = 210;
 // windows-sys 未导出该别名，Windows SDK 将 TBM_GETPOS 定义为 WM_USER
 const TBM_GETPOS: u32 = WM_USER;
 const WIDTH: i32 = 340;
@@ -434,6 +437,73 @@ fn same_window(left: &WindowInfo, right: &WindowInfo) -> bool {
         && left.thread_id == right.thread_id
 }
 
+unsafe fn main_window_geometry(hwnd: HWND) -> Option<WindowGeometry> {
+    // 最小化的屏幕坐标不是正常布局，保留此前正常状态的快照
+    if IsIconic(hwnd) != 0 || IsZoomed(hwnd) != 0 {
+        return None;
+    }
+    let mut rect: RECT = zeroed();
+    if GetWindowRect(hwnd, &mut rect) == 0 {
+        return None;
+    }
+    let geometry = WindowGeometry {
+        x: rect.left,
+        y: rect.top,
+        width: rect.right.checked_sub(rect.left)?,
+        height: rect.bottom.checked_sub(rect.top)?,
+    };
+    geometry.is_valid().then_some(geometry)
+}
+
+unsafe fn fit_main_window_geometry(
+    geometry: WindowGeometry,
+    min_width: i32,
+    min_height: i32,
+) -> Option<WindowGeometry> {
+    if !geometry.is_valid() {
+        return None;
+    }
+    let rect = RECT {
+        left: geometry.x,
+        top: geometry.y,
+        right: geometry.x + geometry.width,
+        bottom: geometry.y + geometry.height,
+    };
+    let monitor = MonitorFromRect(&rect, MONITOR_DEFAULTTONEAREST);
+    let mut info: MONITORINFO = zeroed();
+    info.cbSize = size_of::<MONITORINFO>() as u32;
+    if GetMonitorInfoW(monitor, &mut info) == 0 {
+        return None;
+    }
+    let work = info.rcWork;
+    let work_width = work.right.checked_sub(work.left)?.max(1);
+    let work_height = work.bottom.checked_sub(work.top)?.max(1);
+    let width = geometry.width.max(min_width).min(work_width);
+    let height = geometry.height.max(min_height).min(work_height);
+    // 有可操作标题栏时保持原坐标，允许原本就有的少量边缘越界
+    let visible_width = width.min(64);
+    let visible_caption = height.min(32);
+    let caption_reachable = i64::from(geometry.x) + i64::from(width)
+        >= i64::from(work.left) + i64::from(visible_width)
+        && i64::from(geometry.x) <= i64::from(work.right) - i64::from(visible_width)
+        && geometry.y >= work.top
+        && i64::from(geometry.y) + i64::from(visible_caption) <= i64::from(work.bottom);
+    let (x, y) = if caption_reachable && width == geometry.width && height == geometry.height {
+        (geometry.x, geometry.y)
+    } else {
+        (
+            geometry.x.clamp(work.left, work.right - width),
+            geometry.y.clamp(work.top, work.bottom - height),
+        )
+    };
+    Some(WindowGeometry {
+        x,
+        y,
+        width,
+        height,
+    })
+}
+
 fn screen_point(value: usize) -> POINT {
     POINT {
         x: value as u16 as i16 as i32,
@@ -484,6 +554,8 @@ enum PopupRequest {
         window: WindowInfo,
         taskbar_hidden: bool,
         container_mode: bool,
+        container_available: bool,
+        topmost: Option<bool>,
         point: POINT,
     },
     Tray {
@@ -505,6 +577,7 @@ unsafe fn show_popup(hwnd: HWND, request: &PopupRequest) -> Result<u32, String> 
             point,
             taskbar_hidden,
             container_mode,
+            topmost,
             ..
         } => (
             vec![
@@ -518,6 +591,11 @@ unsafe fn show_popup(hwnd: HWND, request: &PopupRequest) -> Result<u32, String> 
                         MENU_ENABLE_CONTAINER,
                         tr("启用独立容器", "Enable container"),
                     )
+                },
+                if *topmost == Some(true) {
+                    (MENU_CANCEL_TOPMOST, tr("取消置顶", "Cancel always on top"))
+                } else {
+                    (MENU_TOPMOST_WINDOW, tr("置顶窗口", "Keep window on top"))
                 },
                 if *taskbar_hidden {
                     (MENU_SHOW_TASKBAR, tr("取消隐藏", "Unhide"))
@@ -539,8 +617,20 @@ unsafe fn show_popup(hwnd: HWND, request: &PopupRequest) -> Result<u32, String> 
             *point,
         ),
     };
-    if matches!(request, PopupRequest::Window { .. }) {
-        return compact_menu::show(hwnd, &items, point);
+    if let PopupRequest::Window {
+        container_available,
+        topmost,
+        ..
+    } = request
+    {
+        let mut disabled = Vec::new();
+        if !*container_available {
+            disabled.push(MENU_ENABLE_CONTAINER);
+        }
+        if topmost.is_none() {
+            disabled.extend([MENU_TOPMOST_WINDOW, MENU_CANCEL_TOPMOST]);
+        }
+        return compact_menu::show(hwnd, &items, point, &disabled);
     }
     let menu = CreatePopupMenu();
     if menu.is_null() {
@@ -948,15 +1038,17 @@ pub fn run() -> Result<(), String> {
             bottom: pixel(HEIGHT, dpi),
         };
         AdjustWindowRectExForDpi(&mut rect, style, 0, WS_EX_CONTROLPARENT, dpi);
+        let saved_geometry = state.borrow().settings.main_window;
+        let geometry = saved_geometry.and_then(|saved| fit_main_window_geometry(saved, 1, 1));
         let hwnd = CreateWindowExW(
             WS_EX_CONTROLPARENT,
             name.as_ptr(),
             wide("Trans").as_ptr(),
             style,
-            CW_USEDEFAULT,
-            CW_USEDEFAULT,
-            rect.right - rect.left,
-            rect.bottom - rect.top,
+            geometry.map_or(CW_USEDEFAULT, |saved| saved.x),
+            geometry.map_or(CW_USEDEFAULT, |saved| saved.y),
+            geometry.map_or(rect.right - rect.left, |saved| saved.width),
+            geometry.map_or(rect.bottom - rect.top, |saved| saved.height),
             null_mut(),
             null_mut(),
             instance,
@@ -978,6 +1070,32 @@ pub fn run() -> Result<(), String> {
                     )
                 }));
         }
+        if let Some(saved) = geometry {
+            // 创建在目标显示器后按其实际 DPI 校验最小尺寸，再显示窗口
+            let dpi = GetDpiForWindow(hwnd).max(96);
+            let mut minimum = RECT {
+                right: pixel(MIN_WIDTH, dpi),
+                bottom: minimum_client_height(hwnd, dpi),
+                ..zeroed()
+            };
+            AdjustWindowRectExForDpi(&mut minimum, style, 0, WS_EX_CONTROLPARENT, dpi);
+            if let Some(saved) = fit_main_window_geometry(
+                saved,
+                minimum.right - minimum.left,
+                minimum.bottom - minimum.top,
+            ) {
+                SetWindowPos(
+                    hwnd,
+                    null_mut(),
+                    saved.x,
+                    saved.y,
+                    saved.width,
+                    saved.height,
+                    SWP_NOZORDER | SWP_NOACTIVATE,
+                );
+            }
+        }
+        state.borrow_mut().remember_main_window_geometry();
         ShowWindow(hwnd, SW_SHOW);
         UpdateWindow(hwnd);
 
@@ -1175,6 +1293,7 @@ struct App {
     initialization_error: Option<String>,
     pending_error: Option<String>,
     settings: Settings,
+    last_main_window: Option<WindowGeometry>,
     settings_page: bool,
     settings_panel: Option<SettingsPanel>,
     self_transparency: u8,
@@ -1183,6 +1302,7 @@ struct App {
     taskbar_created: u32,
     pending_menu: Option<PopupRequest>,
     popup_open: bool,
+    exit_pending: bool,
     exiting: bool,
     last_taskbar_error: Option<String>,
 }
@@ -1228,6 +1348,7 @@ impl App {
             last_percent: 0,
             initialization_error: None,
             pending_error: None,
+            last_main_window: settings.main_window,
             settings,
             settings_page: false,
             settings_panel: None,
@@ -1237,6 +1358,7 @@ impl App {
             taskbar_created: 0,
             pending_menu: None,
             popup_open: false,
+            exit_pending: false,
             exiting: false,
             last_taskbar_error: None,
         }
@@ -1307,6 +1429,7 @@ impl App {
 
     unsafe fn initialize(&mut self, hwnd: HWND) -> Result<(), String> {
         self.hwnd = hwnd;
+        crate::window_topmost::configure(hwnd, APP_EVENT, EVENT_TOPMOST_COMPLETED);
         self.add(
             "BUTTON",
             "置顶",
@@ -1842,7 +1965,7 @@ impl App {
         let width = (rect.right * 96 / dpi as i32).max(MIN_WIDTH);
         let height = (rect.bottom * 96 / dpi as i32).max(MIN_MAIN_BODY_HEIGHT);
         let panel = self.settings_panel.as_ref().unwrap();
-        panel.set_bounds(
+        let panel_positioned = panel.set_bounds(
             [
                 pixel(12, dpi),
                 pixel(52, dpi),
@@ -1995,7 +2118,7 @@ impl App {
         if body_positioned {
             panel.commit_layout(scroll_offset);
         }
-        if root_positioned && body_positioned {
+        if panel_positioned && root_positioned && body_positioned {
             for (hwnd, bounds) in positions {
                 if let Some(control) = self
                     .controls
@@ -2213,9 +2336,17 @@ impl App {
         Ok(())
     }
 
-    fn save_current_settings(&mut self) -> Result<(), String> {
+    unsafe fn remember_main_window_geometry(&mut self) {
+        if let Some(geometry) = main_window_geometry(self.hwnd) {
+            self.last_main_window = Some(geometry);
+        }
+    }
+
+    unsafe fn save_current_settings(&mut self) -> Result<(), String> {
+        self.remember_main_window_geometry();
         let mut settings = self.settings.clone();
         settings.self_transparency = self.self_transparency;
+        settings.main_window = self.last_main_window;
         settings.save()?;
         self.settings = settings;
         Ok(())
@@ -2601,11 +2732,15 @@ impl App {
     }
 
     unsafe fn close(&mut self, exit: bool) {
+        self.exit_pending = false;
         if self.exiting {
             return;
         }
         self.cancel_picker();
-        if self.settings.self_transparency != self.self_transparency {
+        self.remember_main_window_geometry();
+        if self.settings.self_transparency != self.self_transparency
+            || self.settings.main_window != self.last_main_window
+        {
             if let Err(error) = self.save_current_settings() {
                 // 配置写入失败不能阻止用户通过明确的退出入口关闭应用
                 if !exit && self.settings.close_to_tray {
@@ -2637,12 +2772,20 @@ impl App {
             self.exiting = true;
             post(self.hwnd, EVENT_DESTROY, 0);
         } else {
+            self.exit_pending = crate::window_topmost::has_pending_requests();
             self.show_window(false);
         }
     }
 
     unsafe fn queue_menu(&mut self, request: PopupRequest) {
         if self.popup_open || self.pending_menu.is_some() || self.exiting {
+            return;
+        }
+        for error in self.controller.finish_topmost_requests() {
+            self.report_error(&error);
+        }
+        if self.exit_pending && !crate::window_topmost::has_pending_requests() {
+            self.close(true);
             return;
         }
         self.pending_menu = Some(request);
@@ -2710,11 +2853,19 @@ impl App {
             return;
         }
         if let Some(row) = self.changed_windows.get(index as usize) {
+            let container_mode = self.controller.is_container_mode(&row.window);
+            let container_available = container_mode
+                || self
+                    .controller
+                    .can_enable_container(&row.window)
+                    .unwrap_or(false);
             // 弹出菜单前保存完整窗口身份，刷新和行索引变化不能改变操作目标
             self.queue_menu(PopupRequest::Window {
                 window: row.window.clone(),
                 taskbar_hidden: self.controller.is_taskbar_hidden(&row.window),
-                container_mode: self.controller.is_container_mode(&row.window),
+                container_mode,
+                container_available,
+                topmost: self.controller.is_topmost(&row.window).ok(),
                 point,
             });
         }
@@ -2760,6 +2911,18 @@ impl App {
                 }
                 self.refresh_changed_list(false);
                 self.select(selected, false);
+            }
+            (PopupRequest::Window { window, .. }, command)
+                if command == MENU_TOPMOST_WINDOW || command == MENU_CANCEL_TOPMOST =>
+            {
+                if let Err(error) = self
+                    .controller
+                    .set_topmost(&window, command == MENU_TOPMOST_WINDOW)
+                {
+                    self.report_error(&error);
+                }
+                self.refresh_changed_list(false);
+                self.update_enabled();
             }
             (PopupRequest::Window { window, .. }, command)
                 if command == MENU_HIDE_TASKBAR || command == MENU_SHOW_TASKBAR =>
@@ -2983,12 +3146,15 @@ impl App {
                     && left.transparency == right.transparency
                     && left.taskbar_hidden == right.taskbar_hidden
                     && left.container_mode == right.container_mode
+                    && left.topmost == right.topmost
             });
         if !force && unchanged && !self.changed_list_dirty {
             return;
         }
         let mut rebuild = force || self.changed_list_dirty || !same_order;
         let list = self.control(ID_CHANGED_LIST);
+        let top = SendMessageW(list, LVM_GETTOPINDEX, 0, 0).max(0) as usize;
+        let top_window = self.changed_windows.get(top).map(|row| row.window.clone());
         if !self.settings.show_icons || force || self.changed_list_dirty {
             SendMessageW(list, LVM_SETIMAGELIST, LVSIL_SMALL as usize, 0);
             self.icons = None;
@@ -3008,16 +3174,18 @@ impl App {
                 Err(error) => self.report_error(&error),
             }
         }
-        let top = SendMessageW(list, LVM_GETTOPINDEX, 0, 0).max(0) as usize;
-        let top_window = self.changed_windows.get(top).map(|row| row.window.clone());
         self.changed_windows = rows;
         self.changed_list_dirty = false;
-        ui_theme::set_hidden_windows(
-            self.changed_windows
-                .iter()
-                .filter(|row| row.taskbar_hidden)
-                .map(|row| row.window.hwnd as usize),
-        );
+        ui_theme::set_window_badges(self.changed_windows.iter().map(|row| {
+            (
+                row.window.hwnd as usize,
+                ui_theme::WindowBadges {
+                    hidden: row.taskbar_hidden,
+                    topmost: row.topmost,
+                    container: row.container_mode,
+                },
+            )
+        }));
         // 只暂停可见列表，WM_SETREDRAW(TRUE) 会使隐藏的设置页列表重新可见
         let suspend_redraw = GetWindowLongPtrW(list, GWL_STYLE) as u32 & WS_VISIBLE != 0;
         if suspend_redraw {
@@ -3247,7 +3415,17 @@ impl App {
             };
             if watched.is_ok() && newly_added && self.settings.default_container {
                 // 仅首次登记时尝试，失败和手动取消后重新选中都不会自动重试
-                if let Err(error) = self.controller.set_container_mode(&window, true) {
+                let enabled = self
+                    .controller
+                    .can_enable_container(&window)
+                    .and_then(|supported| {
+                        if supported {
+                            self.controller.set_container_mode(&window, true)
+                        } else {
+                            Ok(())
+                        }
+                    });
+                if let Err(error) = enabled {
                     self.report_error(&format!(
                         "{}\n{error}",
                         tr(
@@ -3332,7 +3510,9 @@ impl App {
         if failures.is_empty() {
             true
         } else {
-            self.report_error(&failures.join("\n\n"));
+            if !crate::window_topmost::has_pending_requests() {
+                self.report_error(&failures.join("\n\n"));
+            }
             false
         }
     }
@@ -3364,6 +3544,16 @@ impl App {
     unsafe fn event(&mut self, event: usize, parameter: isize) {
         if self.exiting {
             return;
+        }
+        // 完成通知即使被消息队列延迟，也可在下一次用户事件中收敛恢复状态
+        if event != EVENT_TOPMOST_COMPLETED {
+            for error in self.controller.finish_topmost_requests() {
+                self.report_error(&error);
+            }
+            if self.exit_pending && !crate::window_topmost::has_pending_requests() {
+                self.close(true);
+                return;
+            }
         }
         match event {
             EVENT_LAYOUT => {
@@ -3463,6 +3653,16 @@ impl App {
             }
             EVENT_WINDOW_REFRESH => self.refresh_managed_windows(),
             EVENT_TARGET_ACTIVITY => self.process_target_activity(),
+            EVENT_TOPMOST_COMPLETED => {
+                for error in self.controller.finish_topmost_requests() {
+                    self.report_error(&error);
+                }
+                self.refresh_changed_list_display(false);
+                self.update_enabled();
+                if self.exit_pending && !crate::window_topmost::has_pending_requests() {
+                    self.close(true);
+                }
+            }
             EVENT_CHANGED_SELECT
                 if parameter as usize == interaction_version()
                     && !self.picking
@@ -3651,7 +3851,7 @@ impl Drop for App {
             self.picker_tooltip = None;
             self.refresh_tooltip = None;
             self.settings_panel = None;
-            ui_theme::set_hidden_windows(std::iter::empty());
+            ui_theme::set_window_badges(std::iter::empty());
             PICK_FINISH.with(|pending| {
                 pending.borrow_mut().take();
             });
@@ -3899,6 +4099,10 @@ unsafe extern "system" fn window_proc(
         WM_CLOSE => {
             post(hwnd, EVENT_CLOSE, 0);
             return 0;
+        }
+        WM_QUERYENDSESSION => {
+            // 查询时尚未确认结束会话，取消关机不能清除已管理的窗口状态
+            return 1;
         }
         WM_SYSCOMMAND if wparam as u32 & 0xfff0 == SC_MAXIMIZE => {
             return 0;
@@ -4301,13 +4505,16 @@ unsafe extern "system" fn window_proc(
                     post(hwnd, EVENT_TRAY_READD, 0);
                     return 0;
                 }
-                WM_QUERYENDSESSION => {
-                    app.controller.restore_all();
-                    return 1;
-                }
                 WM_ENDSESSION if wparam != 0 => {
+                    let _ = app.save_current_settings();
+                    app.window_events = None;
+                    KillTimer(hwnd, TIMER_TARGET_ACTIVITY);
+                    app.exiting = true;
                     app.controller.restore_all();
                     return 0;
+                }
+                WM_WINDOWPOSCHANGED => {
+                    app.remember_main_window_geometry();
                 }
                 _ => {}
             }
