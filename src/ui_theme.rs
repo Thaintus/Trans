@@ -4,8 +4,6 @@ use std::marker::PhantomData;
 use std::mem::{size_of, zeroed};
 use std::ptr::{null, null_mut};
 
-use crate::localization::tr;
-
 use windows_sys::Win32::Foundation::*;
 use windows_sys::Win32::Graphics::Gdi::*;
 use windows_sys::Win32::Graphics::GdiPlus as gdip;
@@ -784,18 +782,14 @@ unsafe extern "system" fn hotkey_text_proc(
 ) -> LRESULT {
     match message {
         WM_GETTEXTLENGTH if SendMessageW(hwnd, HKM_GETHOTKEY, 0, 0) == 0 => {
-            return tr("无", "None").encode_utf16().count() as isize;
+            return 0;
         }
         WM_GETTEXT if SendMessageW(hwnd, HKM_GETHOTKEY, 0, 0) == 0 => {
             if wparam == 0 || lparam == 0 {
                 return 0;
             }
-            let text: Vec<u16> = tr("无", "None").encode_utf16().collect();
-            let copied = text.len().min(wparam - 1);
-            let destination = lparam as *mut u16;
-            std::ptr::copy_nonoverlapping(text.as_ptr(), destination, copied);
-            *destination.add(copied) = 0;
-            return copied as isize;
+            *(lparam as *mut u16) = 0;
+            return 0;
         }
         WM_PAINT if SendMessageW(hwnd, HKM_GETHOTKEY, 0, 0) == 0 => {
             let mut paint: PAINTSTRUCT = zeroed();
@@ -847,34 +841,14 @@ unsafe fn paint_empty_hotkey(hwnd: HWND, dc: HDC, update_caret: bool) {
     let Some(_saved) = SavedDc::new(dc) else {
         return;
     };
-    // 空值说明由应用语言决定，组合键内容与输入行为仍由原生控件管理
+    // 空值只绘制背景，组合键内容与输入行为仍由原生控件管理
     fill(dc, &rect, SURFACE);
     font_for(dc, hwnd);
-    SetBkMode(dc, TRANSPARENT as i32);
-    SetTextColor(
-        dc,
-        if IsWindowEnabled(hwnd) == 0 {
-            DISABLED_TEXT
-        } else {
-            TEXT
-        },
-    );
-    let text: Vec<u16> = tr("无", "None").encode_utf16().collect();
-    DrawTextW(
-        dc,
-        text.as_ptr(),
-        text.len() as i32,
-        &mut rect,
-        DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
-    );
     if update_caret && GetFocus() == hwnd && IsWindowEnabled(hwnd) != 0 {
-        let mut extent: SIZE = zeroed();
-        if GetTextExtentPoint32W(dc, text.as_ptr(), text.len() as i32, &mut extent) != 0 {
+        let mut metrics: TEXTMETRICW = zeroed();
+        if GetTextMetricsW(dc, &mut metrics) != 0 {
             // 只调整原生光标的位置，保留其创建、闪烁与键盘更新机制
-            SetCaretPos(
-                extent.cx.min((rect.right - 1).max(0)),
-                ((rect.bottom - extent.cy) / 2).max(0),
-            );
+            SetCaretPos(rect.left, ((rect.bottom - metrics.tmHeight) / 2).max(0));
         }
     }
 }
@@ -2301,14 +2275,15 @@ pub unsafe fn draw_trackbar(draw: &NMCUSTOMDRAW, compact: bool) -> LRESULT {
 const LIST_BADGE_SIDE: i32 = 11;
 
 #[derive(Clone, Copy)]
-enum ListBadgeIcon {
+pub(crate) enum WindowActionIcon {
     Hidden,
     Topmost,
     Container,
+    Remove,
 }
 
-impl ListBadgeIcon {
-    // 所有角标共用十二单位画布，轮廓留出描边和抗锯齿所需边距
+impl WindowActionIcon {
+    // 状态标记与菜单图标共用十二单位画布，轮廓留出描边和抗锯齿所需边距
     fn lines(self) -> &'static [&'static [(f32, f32)]] {
         match self {
             Self::Hidden => &[&[(3.1, 8.9), (8.9, 3.1)]],
@@ -2330,11 +2305,17 @@ impl ListBadgeIcon {
                 &[(4.5, 3.3), (4.5, 1.7), (10.3, 1.7), (10.3, 7.5), (8.7, 7.5)],
                 &[(1.7, 4.5), (7.5, 4.5), (7.5, 10.3), (1.7, 10.3), (1.7, 4.5)],
             ],
+            Self::Remove => &[&[(3.0, 3.0), (9.0, 9.0)], &[(9.0, 3.0), (3.0, 9.0)]],
         }
     }
 }
 
-unsafe fn list_badge_icon(dc: HDC, rect: RECT, color: COLORREF, icon: ListBadgeIcon) {
+pub(crate) unsafe fn draw_window_action_icon(
+    dc: HDC,
+    rect: RECT,
+    color: COLORREF,
+    icon: WindowActionIcon,
+) {
     let scale = (rect.right - rect.left) as f32 / 12.0;
     if scaled_icon_path_antialiased(
         dc,
@@ -2356,7 +2337,7 @@ unsafe fn list_badge_icon(dc: HDC, rect: RECT, color: COLORREF, icon: ListBadgeI
                     }
                 }
             }
-            if matches!(icon, ListBadgeIcon::Hidden)
+            if matches!(icon, WindowActionIcon::Hidden)
                 && (gdip::GdipStartPathFigure(path) != gdip::Ok
                     || gdip::GdipAddPathEllipse(
                         path,
@@ -2395,7 +2376,7 @@ unsafe fn list_badge_icon(dc: HDC, rect: RECT, color: COLORREF, icon: ListBadgeI
             LineTo(dc, end.x, end.y);
         }
     }
-    if matches!(icon, ListBadgeIcon::Hidden) {
+    if matches!(icon, WindowActionIcon::Hidden) {
         let first = point((1.9, 1.9));
         let last = point((10.1, 10.1));
         Ellipse(dc, first.x, first.y, last.x, last.y);
@@ -2572,12 +2553,12 @@ unsafe fn draw_list_name(draw: &NMLVCUSTOMDRAW, badges: WindowBadges) -> bool {
         (content.left + extent.cx + gap).min(cell.right - pixels(4, dpi) - badge_width + gap);
     let top = cell.top + (cell.bottom - cell.top - side) / 2;
     for (enabled, icon) in [
-        (badges.topmost, ListBadgeIcon::Topmost),
-        (badges.container, ListBadgeIcon::Container),
-        (badges.hidden, ListBadgeIcon::Hidden),
+        (badges.topmost, WindowActionIcon::Topmost),
+        (badges.container, WindowActionIcon::Container),
+        (badges.hidden, WindowActionIcon::Hidden),
     ] {
         if enabled {
-            list_badge_icon(
+            draw_window_action_icon(
                 dc,
                 RECT {
                     left,

@@ -14,7 +14,7 @@ use windows_sys::Win32::UI::Controls::*;
 use windows_sys::Win32::UI::HiDpi::*;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::*;
 use windows_sys::Win32::UI::Shell::{
-    DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass, NINF_KEY, NIN_SELECT,
+    DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass, ShellExecuteW, NINF_KEY, NIN_SELECT,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
@@ -64,6 +64,7 @@ const EVENT_LANGUAGE_CHANGE: usize = 26;
 const EVENT_TARGET_ACTIVITY: usize = 27;
 const EVENT_ESCAPE: usize = 28;
 const EVENT_TOPMOST_COMPLETED: usize = 29;
+const EVENT_ABOUT_LINK: usize = 30;
 const HOTKEY_RESTORE: i32 = 1;
 const TIMER_TARGET_ACTIVITY: usize = 2;
 const ICON_RESOURCE: usize = 101;
@@ -97,8 +98,17 @@ const ID_BASIC_TITLE: i32 = 151;
 const ID_LANGUAGE_LABEL: i32 = 152;
 const ID_LANGUAGE: i32 = 153;
 const ID_DEFAULT_CONTAINER: i32 = 154;
+const ID_VERSION: i32 = 155;
+const ID_VERSION_TITLE: i32 = 156;
+const ID_VERSION_LABEL: i32 = 157;
 const ID_PRESETS_TITLE: i32 = 160;
 const ID_PRESETS_SAVE: i32 = 161;
+const ID_AUTHOR_LABEL: i32 = 162;
+const ID_AUTHOR_LINK: i32 = 163;
+const ID_PROJECT_LABEL: i32 = 164;
+const ID_PROJECT_LINK: i32 = 165;
+const AUTHOR_URL: &str = "https://github.com/Thaintus";
+const PROJECT_URL: &str = "https://github.com/Thaintus/Trans";
 const ID_PRESET_LABEL: i32 = 170;
 const ID_PRESET_INPUT: i32 = 180;
 const MENU_RESTORE_WINDOW: u32 = 200;
@@ -342,6 +352,13 @@ fn settings_body_control(id: i32) -> bool {
             | ID_HOTKEY_ENABLED
             | ID_PRESETS_TITLE
             | ID_PRESETS_SAVE
+            | ID_VERSION_TITLE
+            | ID_VERSION
+            | ID_VERSION_LABEL
+            | ID_AUTHOR_LABEL
+            | ID_AUTHOR_LINK
+            | ID_PROJECT_LABEL
+            | ID_PROJECT_LINK
     ) || (ID_PRESET_LABEL..ID_PRESET_LABEL + 5).contains(&id)
         || (ID_PRESET_INPUT..ID_PRESET_INPUT + 5).contains(&id)
 }
@@ -368,6 +385,11 @@ fn control_caption(id: i32) -> Option<&'static str> {
         ID_HOTKEY_SAVE | ID_PRESETS_SAVE => tr("保存", "Save"),
         ID_PRESETS_TITLE => tr("预设挡位", "Presets"),
         ID_EXIT => tr("退出 Trans", "Exit Trans"),
+        ID_VERSION_TITLE => tr("关于", "About"),
+        ID_AUTHOR_LABEL => tr("作者", "Author"),
+        ID_PROJECT_LABEL => tr("项目", "Project"),
+        ID_VERSION_LABEL => tr("版本", "Version"),
+        ID_VERSION => concat!("v.", env!("CARGO_PKG_VERSION")),
         _ => return None,
     })
 }
@@ -630,7 +652,17 @@ unsafe fn show_popup(hwnd: HWND, request: &PopupRequest) -> Result<u32, String> 
         if topmost.is_none() {
             disabled.extend([MENU_TOPMOST_WINDOW, MENU_CANCEL_TOPMOST]);
         }
-        return compact_menu::show(hwnd, &items, point, &disabled);
+        use ui_theme::WindowActionIcon;
+        let icons = [
+            (MENU_ENABLE_CONTAINER, WindowActionIcon::Container),
+            (MENU_DISABLE_CONTAINER, WindowActionIcon::Container),
+            (MENU_TOPMOST_WINDOW, WindowActionIcon::Topmost),
+            (MENU_CANCEL_TOPMOST, WindowActionIcon::Topmost),
+            (MENU_HIDE_TASKBAR, WindowActionIcon::Hidden),
+            (MENU_SHOW_TASKBAR, WindowActionIcon::Hidden),
+            (MENU_RESTORE_WINDOW, WindowActionIcon::Remove),
+        ];
+        return compact_menu::show(hwnd, &items, point, &disabled, &icons);
     }
     let menu = CreatePopupMenu();
     if menu.is_null() {
@@ -985,7 +1017,11 @@ pub fn run() -> Result<(), String> {
 
         let controls = INITCOMMONCONTROLSEX {
             dwSize: size_of::<INITCOMMONCONTROLSEX>() as u32,
-            dwICC: ICC_BAR_CLASSES | ICC_STANDARD_CLASSES | ICC_LISTVIEW_CLASSES | ICC_HOTKEY_CLASS,
+            dwICC: ICC_BAR_CLASSES
+                | ICC_STANDARD_CLASSES
+                | ICC_LISTVIEW_CLASSES
+                | ICC_HOTKEY_CLASS
+                | ICC_LINK_CLASS,
         };
         if InitCommonControlsEx(&controls) == 0 {
             return Err(tr(
@@ -1656,6 +1692,39 @@ impl App {
             ID_EXIT,
             WS_TABSTOP | BS_OWNERDRAW as u32,
         )?;
+        self.add("STATIC", "", ID_VERSION_TITLE, SS_LEFT)?;
+        self.add(
+            "STATIC",
+            "",
+            ID_VERSION_LABEL,
+            SS_LEFT | SS_CENTERIMAGE | SS_NOPREFIX,
+        )?;
+        self.add(
+            "STATIC",
+            "",
+            ID_VERSION,
+            SS_LEFT | SS_CENTERIMAGE | SS_NOPREFIX,
+        )?;
+        self.add(
+            "STATIC",
+            "",
+            ID_AUTHOR_LABEL,
+            SS_LEFT | SS_CENTERIMAGE | SS_NOPREFIX,
+        )?;
+        self.add(
+            "STATIC",
+            "",
+            ID_PROJECT_LABEL,
+            SS_LEFT | SS_CENTERIMAGE | SS_NOPREFIX,
+        )?;
+        for (id, url) in [(ID_AUTHOR_LINK, AUTHOR_URL), (ID_PROJECT_LINK, PROJECT_URL)] {
+            self.add(
+                "SysLink",
+                &format!("<a href=\"{url}\">{url} ↗</a>"),
+                id,
+                WS_TABSTOP | LWS_TRANSPARENT | LWS_NOPREFIX,
+            )?;
+        }
         let mut combo_info = COMBOBOXINFO {
             cbSize: size_of::<COMBOBOXINFO>() as u32,
             ..zeroed()
@@ -1887,6 +1956,7 @@ impl App {
                 (16, FW_NORMAL, "Segoe UI Symbol"),
                 (9, FW_NORMAL, "Microsoft YaHei UI"),
                 (11, FW_SEMIBOLD, "Microsoft YaHei UI"),
+                (11, FW_NORMAL, "Microsoft YaHei UI"),
             ] {
                 fonts.push(CreateFontW(
                     -pixel(height, dpi),
@@ -1910,9 +1980,10 @@ impl App {
                     ID_VALUE | ID_TARGET | ID_SETTINGS_TITLE => fonts[1],
                     ID_SETTINGS => fonts[2],
                     ID_SELF_LABEL => fonts[3],
-                    5 | ID_CHANGED_TITLE | ID_BASIC_TITLE | ID_HOTKEY_TITLE | ID_PRESETS_TITLE => {
-                        fonts[4]
-                    }
+                    ID_VERSION | ID_VERSION_LABEL | ID_AUTHOR_LABEL | ID_AUTHOR_LINK
+                    | ID_PROJECT_LABEL | ID_PROJECT_LINK => fonts[5],
+                    5 | ID_CHANGED_TITLE | ID_BASIC_TITLE | ID_HOTKEY_TITLE | ID_PRESETS_TITLE
+                    | ID_VERSION_TITLE => fonts[4],
                     _ => fonts[0],
                 };
                 let font = if font.is_null() {
@@ -1977,6 +2048,7 @@ impl App {
         let body_width = panel.client_width() * 96 / dpi as i32;
         let scroll_offset = panel.scroll_offset();
         let english = self.settings.language == Language::English;
+        let about_value_left = if english { 60 } else { 46 };
         let topmost_width = if english { 72 } else { 44 };
         let hotkey_label_width = if english { 78 } else { 56 };
         let hotkey_input_left = hotkey_label_width + 18;
@@ -2060,6 +2132,31 @@ impl App {
                 28,
             ),
             (ID_EXIT, width - 98, height - 37, 86, 32),
+            (ID_VERSION_TITLE, 0, 478, body_width, 20),
+            (ID_VERSION_LABEL, 12, 514, about_value_left - 16, 20),
+            (
+                ID_VERSION,
+                about_value_left,
+                514,
+                body_width - about_value_left - 12,
+                20,
+            ),
+            (ID_AUTHOR_LABEL, 12, 538, about_value_left - 16, 20),
+            (
+                ID_AUTHOR_LINK,
+                about_value_left,
+                538,
+                body_width - about_value_left - 12,
+                20,
+            ),
+            (ID_PROJECT_LABEL, 12, 562, about_value_left - 16, 20),
+            (
+                ID_PROJECT_LINK,
+                about_value_left,
+                562,
+                body_width - about_value_left - 12,
+                20,
+            ),
             (ID_CHANGED_TITLE, 12, 196, width - 24, 18),
             (ID_CHANGED_LIST, list_x, list_y, list_width, list_height),
         ];
@@ -2181,7 +2278,9 @@ impl App {
                 ID_SELF_LABEL | ID_SELF_SLIDER => !self.settings_page,
                 ID_SETTINGS_TITLE..=ID_HOTKEY_ENABLED => self.settings_page,
                 ID_BASIC_TITLE | ID_PRESETS_TITLE | ID_PRESETS_SAVE | ID_LANGUAGE_LABEL
-                | ID_LANGUAGE | ID_DEFAULT_CONTAINER => self.settings_page,
+                | ID_LANGUAGE | ID_DEFAULT_CONTAINER | ID_VERSION_TITLE | ID_VERSION
+                | ID_VERSION_LABEL | ID_AUTHOR_LABEL | ID_AUTHOR_LINK | ID_PROJECT_LABEL
+                | ID_PROJECT_LINK => self.settings_page,
                 id if (ID_PRESET_LABEL..ID_PRESET_LABEL + 5).contains(&id)
                     || (ID_PRESET_INPUT..ID_PRESET_INPUT + 5).contains(&id) =>
                 {
@@ -3556,6 +3655,31 @@ impl App {
             }
         }
         match event {
+            EVENT_ABOUT_LINK if self.settings_page && !self.picking => {
+                // 仅打开本程序定义的地址，不直接使用通知携带的 URL
+                let url = match parameter as i32 {
+                    ID_AUTHOR_LINK => AUTHOR_URL,
+                    ID_PROJECT_LINK => PROJECT_URL,
+                    _ => return,
+                };
+                let result = ShellExecuteW(
+                    self.hwnd,
+                    wide("open").as_ptr(),
+                    wide(url).as_ptr(),
+                    null(),
+                    null(),
+                    SW_SHOWNORMAL,
+                ) as isize;
+                if result <= 32 {
+                    self.report_error(&format!(
+                        "{} {result}",
+                        tr(
+                            "无法打开链接，系统错误码",
+                            "Cannot open the link; system error"
+                        )
+                    ));
+                }
+            }
             EVENT_LAYOUT => {
                 LAYOUT_PENDING.with(|pending| pending.set(false));
                 self.layout();
@@ -4195,6 +4319,22 @@ unsafe extern "system" fn window_proc(
         }
         WM_NOTIFY if lparam != 0 => {
             let header = &*(lparam as *const NMHDR);
+            if matches!(header.idFrom as i32, ID_AUTHOR_LINK | ID_PROJECT_LINK)
+                && matches!(header.code, NM_CLICK | NM_RETURN)
+            {
+                if !state.is_null() {
+                    if let Ok(app) = (*state).try_borrow() {
+                        let link = &*(lparam as *const NMLINK);
+                        if header.hwndFrom == app.control(header.idFrom as i32)
+                            && app.settings_page
+                            && link.item.iLink == 0
+                        {
+                            post(hwnd, EVENT_ABOUT_LINK, header.idFrom as isize);
+                        }
+                    }
+                }
+                return 0;
+            }
             if header.code == NM_CUSTOMDRAW {
                 match header.idFrom as i32 {
                     ID_SLIDER | ID_SELF_SLIDER => {
@@ -4391,6 +4531,7 @@ unsafe extern "system" fn window_proc(
             let id = GetDlgCtrlID(lparam as HWND);
             let color = match id {
                 ID_VALUE => ACCENT,
+                ID_AUTHOR_LINK | ID_PROJECT_LINK => ACCENT,
                 id if id == ID_HOTKEY_INPUT
                     || (ID_PRESET_INPUT..ID_PRESET_INPUT + 5).contains(&id) =>
                 {
@@ -4401,7 +4542,7 @@ unsafe extern "system" fn window_proc(
                     }
                 }
                 ID_TARGET | ID_CHANGED_TITLE | ID_SETTINGS_TITLE | ID_BASIC_TITLE
-                | ID_HOTKEY_TITLE | ID_PRESETS_TITLE => TEXT,
+                | ID_HOTKEY_TITLE | ID_PRESETS_TITLE | ID_VERSION_TITLE => TEXT,
                 _ => MUTED,
             };
             SetTextColor(hdc, color);

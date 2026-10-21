@@ -4,6 +4,7 @@ use std::ptr::null;
 use std::rc::Rc;
 
 use crate::localization::tr;
+use crate::ui_theme::{self, WindowActionIcon};
 
 use windows_sys::Win32::Foundation::*;
 use windows_sys::Win32::Graphics::Gdi::*;
@@ -68,6 +69,7 @@ struct MenuEntry {
     command: u32,
     text: Vec<u16>,
     text_length: i32,
+    icon: Option<WindowActionIcon>,
 }
 
 struct MenuContext {
@@ -77,6 +79,8 @@ struct MenuContext {
     width: u32,
     height: u32,
     padding: i32,
+    icon_size: i32,
+    icon_slot_width: i32,
 }
 
 struct ActiveMenu(Rc<MenuContext>);
@@ -145,6 +149,7 @@ pub(crate) unsafe fn show(
     items: &[(u32, &str)],
     point: POINT,
     disabled_commands: &[u32],
+    icons: &[(u32, WindowActionIcon)],
 ) -> Result<u32, String> {
     if items.is_empty()
         || items.iter().any(|(command, label)| {
@@ -242,18 +247,30 @@ pub(crate) unsafe fn show(
             command,
             text,
             text_length: length,
+            icon: icons
+                .iter()
+                .find(|(id, _)| *id == command)
+                .map(|(_, icon)| *icon),
         });
     }
     drop(saved);
     drop(dc);
     let padding = pixels(8, dpi);
+    let icon_size = pixels(16, dpi);
+    let icon_slot_width = if entries.iter().any(|entry| entry.icon.is_some()) {
+        icon_size + pixels(6, dpi)
+    } else {
+        0
+    };
     let context = Rc::new(MenuContext {
         menu,
         font,
         entries,
-        width: (text_width + 2 * padding) as u32,
-        height: (text_metrics.tmHeight + 2 * pixels(4, dpi)) as u32,
+        width: (text_width + 2 * padding + icon_slot_width) as u32,
+        height: (text_metrics.tmHeight.max(icon_size) + 2 * pixels(4, dpi)) as u32,
         padding,
+        icon_size,
+        icon_slot_width,
     });
     // 在 Win32 回调之前登记，在原生菜单循环完全退出后再释放字体和文本
     let _active = ActiveMenu::new(Rc::clone(&context));
@@ -337,8 +354,23 @@ pub(crate) unsafe fn draw_item(item: &DRAWITEMSTRUCT) -> bool {
     SetBkMode(item.hDC, TRANSPARENT as i32);
     SetTextColor(item.hDC, GetSysColor(foreground));
     let entry = &context.entries[index];
+    if let Some(icon) = entry.icon {
+        let left = item.rcItem.left + context.padding;
+        let top = item.rcItem.top + (item.rcItem.bottom - item.rcItem.top - context.icon_size) / 2;
+        ui_theme::draw_window_action_icon(
+            item.hDC,
+            RECT {
+                left,
+                top,
+                right: left + context.icon_size,
+                bottom: top + context.icon_size,
+            },
+            GetSysColor(foreground),
+            icon,
+        );
+    }
     let mut text_rect = item.rcItem;
-    text_rect.left += context.padding;
+    text_rect.left += context.padding + context.icon_slot_width;
     text_rect.right -= context.padding;
     DrawTextW(
         item.hDC,
