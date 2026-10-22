@@ -201,6 +201,14 @@ pub(crate) unsafe fn show(
             "Cannot read the menu font; Windows error",
         ));
     }
+    // 菜单字号略小于系统默认值，保留字体选择与 DPI 缩放
+    metrics.lfMenuFont.lfHeight = match metrics.lfMenuFont.lfHeight {
+        0 => -pixels(11, dpi),
+        height if height < 0 => ((height * 11 - 6) / 12).min(-1),
+        height => ((height * 11 + 6) / 12).max(1),
+    };
+    metrics.lfMenuFont.lfWidth = 0;
+    metrics.lfMenuFont.lfQuality = CLEARTYPE_QUALITY;
     let raw_font = CreateFontIndirectW(&metrics.lfMenuFont);
     if raw_font.is_null() {
         return Err(tr("无法创建菜单字体", "Cannot create the menu font").into());
@@ -255,8 +263,8 @@ pub(crate) unsafe fn show(
     }
     drop(saved);
     drop(dc);
-    let padding = pixels(8, dpi);
-    let icon_size = pixels(16, dpi);
+    let padding = pixels(7, dpi);
+    let icon_size = pixels(14, dpi);
     let icon_slot_width = if entries.iter().any(|entry| entry.icon.is_some()) {
         icon_size + pixels(6, dpi)
     } else {

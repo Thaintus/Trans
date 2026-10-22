@@ -611,7 +611,7 @@ unsafe fn show_popup(hwnd: HWND, request: &PopupRequest) -> Result<u32, String> 
                 if *topmost == Some(true) {
                     (MENU_CANCEL_TOPMOST, tr("取消置顶", "Cancel always on top"))
                 } else {
-                    (MENU_TOPMOST_WINDOW, tr("置顶窗口", "Keep window on top"))
+                    (MENU_TOPMOST_WINDOW, tr("置顶", "Keep window on top"))
                 },
                 if *taskbar_hidden {
                     (MENU_SHOW_TASKBAR, tr("取消隐藏", "Unhide"))
