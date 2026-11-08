@@ -13,7 +13,6 @@ use windows_sys::Win32::Graphics::Dwm::{
     DwmGetWindowAttribute, DwmSetWindowAttribute, DWMNCRP_DISABLED, DWMNCRP_ENABLED,
     DWMWA_EXTENDED_FRAME_BOUNDS, DWMWA_NCRENDERING_ENABLED, DWMWA_NCRENDERING_POLICY,
     DWMWA_TRANSITIONS_FORCEDISABLED, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_DONOTROUND,
-    DWMWCP_ROUND,
 };
 use windows_sys::Win32::Graphics::Gdi::{
     BeginPaint, EndPaint, FillRect, GetMonitorInfoW, GetStockObject, MapWindowPoints,
@@ -75,7 +74,7 @@ struct ContainerState {
     token: usize,
     original_style: u32,
     original_ex_style: u32,
-    original_owner: HWND,
+    original_owner: Option<OwnerIdentity>,
     original_placement: WINDOWPLACEMENT,
     original_rect: RECT,
     mode: HostingMode,
@@ -107,10 +106,95 @@ struct ContainerState {
     taskbar_group: RefCell<Option<ContainerTaskbarGroup>>,
 }
 
+struct OwnerIdentity {
+    hwnd: HWND,
+    process_id: u32,
+    thread_id: u32,
+    property: Vec<u16>,
+    token: usize,
+}
+
+impl OwnerIdentity {
+    unsafe fn capture(target: HWND, nonce: usize) -> Result<Option<Self>, String> {
+        let owner = read_owner(target)?;
+        if owner.is_null() {
+            return Ok(None);
+        }
+        let mut process_id = 0;
+        let thread_id = GetWindowThreadProcessId(owner, &mut process_id);
+        if thread_id == 0 || process_id == 0 {
+            return Err(last_error(tr(
+                "无法核对原所属窗口身份，已取消嵌入",
+                "Cannot verify the original owner identity; embedding was cancelled",
+            )));
+        }
+        // 每个容器使用独立标记，共用所属窗口时不能覆盖彼此的身份
+        let property = wide(&format!(
+            "Trans.Container.Owner.{}.{}",
+            GetCurrentProcessId(),
+            nonce
+        ));
+        if !GetPropW(owner, property.as_ptr()).is_null() {
+            return Err(tr(
+                "原所属窗口的身份标记已被占用，已取消嵌入",
+                "The original owner identity marker is already in use; embedding was cancelled",
+            )
+            .into());
+        }
+        if SetPropW(owner, property.as_ptr(), nonce as HANDLE) == 0 {
+            return Err(last_error(tr(
+                "无法标记原所属窗口身份，已取消嵌入",
+                "Cannot mark the original owner identity; embedding was cancelled",
+            )));
+        }
+        let identity = Self {
+            hwnd: owner,
+            process_id,
+            thread_id,
+            property,
+            token: nonce,
+        };
+        if !identity.matches() || read_owner(target)? != owner {
+            return Err(tr(
+                "原所属窗口已变化，已取消嵌入",
+                "The original owner changed; embedding was cancelled",
+            )
+            .into());
+        }
+        Ok(Some(identity))
+    }
+
+    unsafe fn matches(&self) -> bool {
+        let mut process_id = 0;
+        let thread_id = GetWindowThreadProcessId(self.hwnd, &mut process_id);
+        thread_id == self.thread_id
+            && process_id == self.process_id
+            && GetPropW(self.hwnd, self.property.as_ptr()) as usize == self.token
+    }
+
+    unsafe fn restorable_hwnd(&self) -> HWND {
+        if self.matches() {
+            self.hwnd
+        } else {
+            null_mut()
+        }
+    }
+}
+
+impl Drop for OwnerIdentity {
+    fn drop(&mut self) {
+        unsafe {
+            if self.matches() {
+                RemovePropW(self.hwnd, self.property.as_ptr());
+            }
+        }
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum HostingMode {
     Embedded,
-    // 保持 GPU 根窗口为顶层窗口，宿主仅提供外框和所有者关系
+    // 菜单窗口和 GPU 根窗口保留顶层身份，宿主仅提供外框和所有者关系
     TopLevel,
 }
 
@@ -594,6 +678,25 @@ impl ContainerState {
         set_window_long(self.target.hwnd, index, value)
     }
 
+    unsafe fn validate_original_owner(&self) -> Result<(), String> {
+        self.validate()?;
+        let current = read_owner(self.target.hwnd)?;
+        let unchanged = self
+            .original_owner
+            .as_ref()
+            .map_or(current.is_null(), |owner| {
+                current == owner.hwnd && owner.matches()
+            });
+        if !unchanged {
+            return Err(tr(
+                "原所属窗口已变化，已取消嵌入",
+                "The original owner changed; embedding was cancelled",
+            )
+            .into());
+        }
+        Ok(())
+    }
+
     unsafe fn attached_to(&self, host: HWND) -> bool {
         let child = GetWindowLongPtrW(self.target.hwnd, GWL_STYLE) as u32 & WS_CHILD != 0;
         match self.mode {
@@ -798,14 +901,7 @@ impl ContainerState {
             ));
         }
         self.validate_host(host)?;
-        // 圆角仅作系统提示，Windows 10 等不支持时沿用默认外观
-        let corner = DWMWCP_ROUND;
-        let _ = DwmSetWindowAttribute(
-            host,
-            DWMWA_WINDOW_CORNER_PREFERENCE as u32,
-            &corner as *const _ as _,
-            size_of_val(&corner) as u32,
-        );
+        container_frame::apply_window_corners(host);
         self.validate_host(host)?;
         if SetWindowPos(
             host,
@@ -864,12 +960,11 @@ impl ContainerState {
             return Ok(());
         }
         self.validate()?;
-        if target.left != requested[0]
+        if (target.left != requested[0]
             || target.top != requested[1]
             || target.right - target.left != requested[2]
-            || target.bottom - target.top != requested[3]
-        {
-            if SetWindowPos(
+            || target.bottom - target.top != requested[3])
+            && SetWindowPos(
                 self.target.hwnd,
                 null_mut(),
                 requested[0],
@@ -878,12 +973,11 @@ impl ContainerState {
                 requested[3],
                 SWP_NOACTIVATE | SWP_NOZORDER,
             ) == 0
-            {
-                return Err(last_error(tr(
-                    "无法同步兼容容器位置",
-                    "Cannot position the compatibility container content",
-                )));
-            }
+        {
+            return Err(last_error(tr(
+                "无法同步兼容容器位置",
+                "Cannot position the compatibility container content",
+            )));
         }
         self.layout_request.set(Some(requested));
         self.compatibility_layout_pending.set(false);
@@ -1117,10 +1211,11 @@ impl WindowContainer {
 
     fn hosting_mode(window: &WindowInfo) -> Result<HostingMode, String> {
         unsafe {
-            if read_window_class(window.hwnd)? == "Chrome_WidgetWin_1"
-                && read_extended_style(window.hwnd)? & WS_EX_NOREDIRECTIONBITMAP != 0
+            if !GetMenu(window.hwnd).is_null()
+                || (read_window_class(window.hwnd)? == "Chrome_WidgetWin_1"
+                    && read_extended_style(window.hwnd)? & WS_EX_NOREDIRECTIONBITMAP != 0)
             {
-                // 不再强制嵌入这一绘制组合，也不依赖特定程序名或 GPU 子窗口寿命
+                // 原生菜单不能附着于子窗口，与 GPU 根窗口一起保留顶层身份
                 Ok(HostingMode::TopLevel)
             } else {
                 Ok(HostingMode::Embedded)
@@ -1146,7 +1241,25 @@ impl WindowContainer {
             let mut placement: WINDOWPLACEMENT = zeroed();
             placement.length = size_of::<WINDOWPLACEMENT>() as u32;
             let mut original_rect: RECT = zeroed();
-            let nonce = NEXT_HOST_NONCE.fetch_add(1, Ordering::Relaxed);
+            let mut candidate = NEXT_HOST_NONCE.load(Ordering::Relaxed);
+            let nonce = loop {
+                let next = candidate.checked_add(1).ok_or_else(|| {
+                    tr(
+                        "透明容器身份编号已耗尽，请重新打开 Trans",
+                        "Transparency container identity IDs are exhausted; reopen Trans",
+                    )
+                    .to_owned()
+                })?;
+                match NEXT_HOST_NONCE.compare_exchange_weak(
+                    candidate,
+                    next,
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                ) {
+                    Ok(previous) => break previous,
+                    Err(current) => candidate = current,
+                }
+            };
             let mode = Self::hosting_mode(window)?;
             let original_ex_style = read_extended_style(window.hwnd)?;
             let original_layered =
@@ -1173,7 +1286,7 @@ impl WindowContainer {
                 token,
                 original_style: GetWindowLongPtrW(window.hwnd, GWL_STYLE) as u32,
                 original_ex_style,
-                original_owner: GetWindow(window.hwnd, GW_OWNER),
+                original_owner: None,
                 original_placement: placement,
                 original_rect,
                 mode,
@@ -1231,6 +1344,8 @@ impl WindowContainer {
                 .into());
             }
             let mut state = state;
+            state.original_owner = OwnerIdentity::capture(window.hwnd, nonce)?;
+            state.validate_original_owner()?;
             state.original_placement = placement;
             state.original_rect = original_rect;
             state.frame_insets = FrameInsets::capture(window.hwnd, original_rect);
@@ -1360,6 +1475,7 @@ impl WindowContainer {
         state.taskbar_group.replace(Some(taskbar_group));
         // 宿主状态就绪后统一初始化外框，再进入各自的目标托管流程
         state.initialize_container_frame(self.hwnd)?;
+        state.validate_original_owner()?;
         if state.mode == HostingMode::TopLevel {
             // 透明度也可能先写入原窗口，失败时必须保留可恢复的原始快照
             state.needs_restore.set(true);
@@ -1368,6 +1484,15 @@ impl WindowContainer {
         let state = self.state()?;
         state.validate()?;
         state.icons.apply(self.hwnd);
+        state.validate_original_owner()?;
+        if state.mode == HostingMode::Embedded && !GetMenu(state.target.hwnd).is_null() {
+            // 初始化期间新增菜单时停止转为子窗口，重试后重新选择托管方式
+            return Err(tr(
+                "目标窗口的菜单已变化，请重新启用独立容器以保留菜单",
+                "The target window's menu changed; enable the independent container again to preserve its menu",
+            )
+            .into());
+        }
         state.needs_restore.set(true);
         if state.mode == HostingMode::TopLevel {
             state.set_target_long(GWLP_HWNDPARENT, self.hwnd as isize)?;
@@ -1494,7 +1619,7 @@ impl WindowContainer {
                 )
                 .into());
             }
-            if !state.original_owner.is_null() {
+            if state.original_owner.is_some() {
                 return Err(tr(
                     "原窗口具有外部所属关系，无法保证独立恢复置顶状态，请选择所属窗口操作",
                     "The original window has an external owner; select that owner so the topmost state can be restored independently",
@@ -1866,11 +1991,11 @@ impl WindowContainer {
                         GWL_EXSTYLE,
                         ((state.original_ex_style & !WS_EX_TOPMOST) | topmost) as isize,
                     )?;
-                    let owner = if IsWindow(state.original_owner) != 0 {
-                        state.original_owner
-                    } else {
-                        null_mut()
-                    };
+                    // 身份标记失效时保持无所属窗口，不连接至复用的 HWND
+                    let owner = state
+                        .original_owner
+                        .as_ref()
+                        .map_or(null_mut(), |owner| owner.restorable_hwnd());
                     state.set_target_long(GWLP_HWNDPARENT, owner as isize)?;
                     if state.mode == HostingMode::TopLevel {
                         state.validate()?;
@@ -2055,6 +2180,11 @@ unsafe extern "system" fn container_proc(
         return result;
     }
     if let Some(state) = state.as_deref() {
+        if matches!(message, WM_THEMECHANGED | WM_DWMCOMPOSITIONCHANGED)
+            && state.validate_host(host).is_ok()
+        {
+            container_frame::apply_window_corners(host);
+        }
         if let Some(result) = state.caption.process(host, message, wparam, lparam) {
             if state.mode == HostingMode::TopLevel
                 && matches!(message, WM_LBUTTONUP | WM_CANCELMODE | WM_CAPTURECHANGED)
@@ -2264,6 +2394,22 @@ unsafe fn read_window_class(hwnd: HWND) -> Result<String, String> {
         )));
     }
     Ok(String::from_utf16_lossy(&class[..length as usize]))
+}
+
+unsafe fn read_owner(hwnd: HWND) -> Result<HWND, String> {
+    SetLastError(0);
+    let owner = GetWindow(hwnd, GW_OWNER);
+    let error = GetLastError();
+    if owner.is_null() && error != 0 {
+        return Err(error_with_code(
+            tr(
+                "无法读取原所属窗口，已取消嵌入",
+                "Cannot read the original owner; embedding was cancelled",
+            ),
+            error,
+        ));
+    }
+    Ok(owner)
 }
 
 unsafe fn read_extended_style(hwnd: HWND) -> Result<u32, String> {

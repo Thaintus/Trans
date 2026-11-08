@@ -9,9 +9,13 @@ mod container_frame;
 #[cfg(windows)]
 mod hotkey;
 #[cfg(windows)]
+mod list_layout;
+#[cfg(windows)]
 mod list_scrollbar;
 #[cfg(windows)]
 mod localization;
+#[cfg(windows)]
+mod mini_list;
 #[cfg(windows)]
 mod picker_overlay;
 #[cfg(windows)]
@@ -32,6 +36,8 @@ mod window_container;
 mod window_control;
 #[cfg(windows)]
 mod window_events;
+#[cfg(windows)]
+mod window_redraw;
 #[cfg(windows)]
 mod window_search;
 #[cfg(windows)]

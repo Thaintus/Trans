@@ -73,7 +73,8 @@ struct ChangedWindow {
     next_maintenance_retry: Option<Instant>,
     taskbar_hidden: bool,
     taskbar_maintenance_enabled: bool,
-    original_taskbar_visible: Option<bool>,
+    // 仅记录本工具对原窗口成功隐藏且尚未撤销的任务栏操作
+    direct_taskbar_hidden: bool,
     original_topmost: Option<bool>,
     desired_topmost: Option<bool>,
 }
@@ -244,7 +245,7 @@ impl WindowController {
             next_maintenance_retry: None,
             taskbar_hidden: false,
             taskbar_maintenance_enabled: false,
-            original_taskbar_visible: None,
+            direct_taskbar_hidden: false,
             original_topmost: None,
             desired_topmost: None,
         };
@@ -371,6 +372,11 @@ impl WindowController {
                 self.changed.remove(&key);
                 return Ok(());
             }
+            // 宿主已释放，先恢复原窗口的操作记录，再应用容器中的隐藏选择
+            if let Some(current) = self.changed.get_mut(&key) {
+                current.taskbar_hidden = current.direct_taskbar_hidden;
+                current.taskbar_maintenance_enabled = current.direct_taskbar_hidden;
+            }
             let transparency_restored: Result<(), String> = (|| {
                 self.require_owned(&tracked)?;
                 if let Some(percent) = tracked.desired_transparency {
@@ -383,15 +389,7 @@ impl WindowController {
                 }
                 Ok(())
             })();
-            let taskbar_restored: Result<(), String> = (|| {
-                if tracked.taskbar_hidden {
-                    let taskbar = TaskbarList::new()?;
-                    self.require_owned(&tracked)?;
-                    taskbar.set_hidden(window.hwnd, true)?;
-                    self.require_owned(&tracked)?;
-                }
-                Ok(())
-            })();
+            let taskbar_restored = self.set_taskbar_hidden(window, tracked.taskbar_hidden);
             let topmost_restored = if let Some(enabled) = tracked.desired_topmost {
                 self.write_topmost(&tracked, enabled).map(|complete| {
                     if !complete {
@@ -431,9 +429,6 @@ impl WindowController {
         let percent = tracked
             .desired_transparency
             .unwrap_or(tracked.last_transparency);
-        let original_taskbar_visible = tracked
-            .original_taskbar_visible
-            .unwrap_or_else(|| validate_taskbar_candidate(window).is_ok());
         // 先撤销本工具对原窗口的透明度，避免原窗口和宿主两层透明度叠乘
         if tracked.transparency_modified {
             if let Err(error) = self.write_snapshot(&tracked, tracked.original) {
@@ -454,7 +449,6 @@ impl WindowController {
                     if let Some(current) = self.changed.get_mut(&key) {
                         current.last_transparency = percent;
                         current.desired_transparency = Some(percent);
-                        current.original_taskbar_visible = Some(original_taskbar_visible);
                     }
                     return Err(error.message);
                 }
@@ -471,7 +465,6 @@ impl WindowController {
         if let Some(current) = self.changed.get_mut(&key) {
             current.last_transparency = percent;
             current.desired_transparency = Some(percent);
-            current.original_taskbar_visible = Some(original_taskbar_visible);
             current.clear_maintenance_failures();
         }
         self.container_errors.remove(&key);
@@ -911,23 +904,22 @@ impl WindowController {
 
     pub fn set_taskbar_hidden(&mut self, window: &WindowInfo, hidden: bool) -> Result<(), String> {
         let tracked = self.tracked_window(window)?;
-        self.require_container_ready(window.hwnd as usize)?;
+        let key = window.hwnd as usize;
+        self.require_container_ready(key)?;
+        let container_mode = self.containers.contains_key(&key);
         if !hidden && !tracked.taskbar_hidden {
             return Ok(());
         }
-        if hidden && tracked.original_taskbar_visible.is_none() {
-            if !self.containers.contains_key(&(window.hwnd as usize)) {
-                validate_taskbar_candidate(window)?;
-            }
+        if hidden && !container_mode && !tracked.direct_taskbar_hidden {
+            validate_taskbar_candidate(window)?;
         }
         let taskbar = TaskbarList::new()?;
         self.require_owned(&tracked)?;
         taskbar.set_hidden(self.taskbar_window(&tracked)?, hidden)?;
         self.require_owned(&tracked)?;
-        if let Some(current) = self.changed.get_mut(&(window.hwnd as usize)) {
-            if current.original_taskbar_visible.is_none() {
-                // 标准任务栏资格只能推定原按钮存在，ITaskbarList 没有查询接口
-                current.original_taskbar_visible = Some(true);
+        if let Some(current) = self.changed.get_mut(&key) {
+            if !container_mode {
+                current.direct_taskbar_hidden = hidden;
             }
             current.taskbar_hidden = hidden;
             current.taskbar_maintenance_enabled = hidden;
@@ -1231,18 +1223,15 @@ impl WindowController {
     }
 
     fn restore_taskbar(&mut self, tracked: &ChangedWindow) -> Result<(), String> {
-        if !tracked.taskbar_hidden {
-            return Ok(());
+        // 只隐藏过宿主时不修改原窗口，原窗口隐藏记录不受宿主显示状态影响
+        if tracked.direct_taskbar_hidden {
+            let taskbar = TaskbarList::new()?;
+            self.require_owned(tracked)?;
+            taskbar.set_hidden(tracked.window.hwnd, false)?;
+            self.require_owned(tracked)?;
         }
-        let original_visible = tracked.original_taskbar_visible.ok_or(tr(
-            "缺少原始任务栏状态，已保留恢复记录",
-            "The original taskbar state is missing; the recovery record was retained",
-        ))?;
-        let taskbar = TaskbarList::new()?;
-        self.require_owned(tracked)?;
-        taskbar.set_hidden(tracked.window.hwnd, !original_visible)?;
-        self.require_owned(tracked)?;
         if let Some(current) = self.changed.get_mut(&(tracked.window.hwnd as usize)) {
+            current.direct_taskbar_hidden = false;
             current.taskbar_hidden = false;
             current.taskbar_maintenance_enabled = false;
         }

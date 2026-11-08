@@ -160,7 +160,7 @@ impl Hotkey {
         Ok(Some(if legacy_win { Self::default() } else { hotkey }))
     }
 
-    pub fn to_control(&self) -> Result<u16, String> {
+    pub fn to_control(self) -> Result<u16, String> {
         self.validate()?;
 
         let mut flags = 0;

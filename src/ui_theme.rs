@@ -10,7 +10,7 @@ use windows_sys::Win32::Graphics::GdiPlus as gdip;
 use windows_sys::Win32::UI::Controls::*;
 use windows_sys::Win32::UI::HiDpi::GetDpiForWindow;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-    GetFocus, IsWindowEnabled, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT,
+    GetCapture, GetFocus, IsWindowEnabled, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT,
 };
 use windows_sys::Win32::UI::Shell::{
     DefSubclassProc, GetWindowSubclass, RemoveWindowSubclass, SetWindowSubclass,
@@ -44,6 +44,7 @@ const COMBO_EDIT_THEME_SUBCLASS: usize = 0x5452_5345;
 const INPUT_THEME_SUBCLASS: usize = 0x5452_5348;
 const HOTKEY_TEXT_SUBCLASS: usize = 0x5452_534b;
 const COMPACT_CHECKBOX_SUBCLASS: usize = 0x5452_5354;
+const TRACKBAR_THEME_SUBCLASS: usize = 0x5452_5352;
 
 thread_local! {
     static WINDOW_BADGES: RefCell<HashMap<usize, WindowBadges>> = RefCell::new(HashMap::new());
@@ -187,7 +188,9 @@ pub enum ButtonStyle {
     Picker,
     Refresh,
     NameVisibility,
+    MiniMode,
     Back,
+    OpenWindow,
     Primary,
     Secondary,
     Icon,
@@ -272,7 +275,7 @@ struct SavedDc {
 impl SavedDc {
     unsafe fn new(hdc: HDC) -> Option<Self> {
         let level = SaveDC(hdc);
-        (level != 0).then_some(Self { hdc, level })
+        (level != 0).then(|| Self { hdc, level })
     }
 }
 
@@ -292,12 +295,139 @@ unsafe fn fill(hdc: HDC, rect: &RECT, color: COLORREF) {
 }
 
 unsafe fn rounded(hdc: HDC, rect: &RECT, radius: i32, color: COLORREF) {
+    draw_rounded_surface(hdc, rect, radius, color, None);
+}
+
+// 矩形使用客户区逻辑坐标，半径和边框宽度使用物理像素
+pub unsafe fn draw_rounded_surface(
+    dc: HDC,
+    rect: &RECT,
+    radius: i32,
+    color: COLORREF,
+    border: Option<(COLORREF, i32)>,
+) -> bool {
+    if dc.is_null() || rect.right <= rect.left || rect.bottom <= rect.top {
+        return false;
+    }
+    let Some(_saved) = SavedDc::new(dc) else {
+        return false;
+    };
+    let short_side = (rect.right - rect.left).min(rect.bottom - rect.top);
+    let radius = radius.max(0).min((short_side + 1) / 2);
+    let border = border
+        .filter(|(_, width)| *width > 0)
+        .map(|(color, width)| (color, width.min(short_side)));
+    if rounded_surface_antialiased(dc, rect, radius, color, border) {
+        return true;
+    }
+    // GDI+ 不可用时保留原生绘制，不重复尝试已经失败的抗锯齿路径
+    if let Some((border_color, width)) = border {
+        if !rounded_gdi(dc, rect, radius, border_color) {
+            return false;
+        }
+        let inner = inset(*rect, width);
+        if inner.right > inner.left && inner.bottom > inner.top {
+            return rounded_gdi(dc, &inner, (radius - width).max(0), color);
+        }
+        true
+    } else {
+        rounded_gdi(dc, rect, radius, color)
+    }
+}
+
+unsafe fn rounded_surface_antialiased(
+    dc: HDC,
+    rect: &RECT,
+    radius: i32,
+    color: COLORREF,
+    border: Option<(COLORREF, i32)>,
+) -> bool {
+    if !GDIPLUS_READY.with(Cell::get) {
+        return false;
+    }
+    let mut corners = [
+        POINT {
+            x: rect.left,
+            y: rect.top,
+        },
+        POINT {
+            x: rect.right,
+            y: rect.bottom,
+        },
+    ];
+    if LPtoDP(dc, corners.as_mut_ptr(), corners.len() as i32) == 0 {
+        return false;
+    }
+    let Some(_saved) = SavedDc::new(dc) else {
+        return false;
+    };
+    if SetWindowOrgEx(dc, 0, 0, null_mut()) == 0 || SetViewportOrgEx(dc, 0, 0, null_mut()) == 0 {
+        return false;
+    }
+    let Some(graphics) = GdiPlusGraphics::new(dc) else {
+        return false;
+    };
+    let Some(path) = GdiPlusPath::new() else {
+        return false;
+    };
+    let short_side = (corners[1].x - corners[0].x).min(corners[1].y - corners[0].y) as f32;
+    if short_side <= 0.0 {
+        return false;
+    }
+    let (color, border) = match border {
+        Some((border_color, width)) if width as f32 >= short_side => (border_color, None),
+        _ => (color, border),
+    };
+    let stroke = border.map_or(0.0, |(_, width)| width as f32);
+    let half_stroke = stroke / 2.0;
+    // 路径按半笔宽内缩，让笔画外边缘落在整数像素边界
+    let left = corners[0].x as f32 + half_stroke;
+    let top = corners[0].y as f32 + half_stroke;
+    let right = corners[1].x as f32 - half_stroke;
+    let bottom = corners[1].y as f32 - half_stroke;
+    let diameter = (2.0 * radius as f32 - stroke)
+        .max(0.0)
+        .min(right - left)
+        .min(bottom - top);
+    let Some(brush) = GdiPlusBrush::new(color) else {
+        return false;
+    };
+    let pen = match border {
+        Some((color, _)) => match GdiPlusPen::new(color, stroke) {
+            Some(pen) => Some(pen),
+            None => return false,
+        },
+        None => None,
+    };
+    if gdip::GdipSetPageUnit(graphics.0, gdip::UnitPixel) != gdip::Ok
+        || gdip::GdipSetSmoothingMode(graphics.0, gdip::SmoothingModeAntiAlias8x8) != gdip::Ok
+        || gdip::GdipSetPixelOffsetMode(graphics.0, gdip::PixelOffsetModeHighQuality) != gdip::Ok
+    {
+        return false;
+    }
+    if !rounded_path(&path, left, top, right, bottom, diameter)
+        || gdip::GdipFillPath(graphics.0, brush.0.cast(), path.0) != gdip::Ok
+    {
+        return false;
+    }
+    if let Some(pen) = pen {
+        if gdip::GdipDrawPath(graphics.0, pen.0, path.0) != gdip::Ok {
+            return false;
+        }
+    }
+    gdip::GdipFlush(graphics.0, gdip::FlushIntentionSync) == gdip::Ok
+}
+
+unsafe fn rounded_gdi(hdc: HDC, rect: &RECT, radius: i32, color: COLORREF) -> bool {
     if rect.right <= rect.left || rect.bottom <= rect.top {
-        return;
+        return false;
     }
     SetDCBrushColor(hdc, color);
     SelectObject(hdc, GetStockObject(DC_BRUSH));
     SelectObject(hdc, GetStockObject(NULL_PEN));
+    if radius <= 0 {
+        return FillRect(hdc, rect, GetStockObject(DC_BRUSH)) != 0;
+    }
     RoundRect(
         hdc,
         rect.left,
@@ -306,7 +436,7 @@ unsafe fn rounded(hdc: HDC, rect: &RECT, radius: i32, color: COLORREF) {
         rect.bottom,
         radius * 2,
         radius * 2,
-    );
+    ) != 0
 }
 
 fn inset(rect: RECT, amount: i32) -> RECT {
@@ -537,8 +667,8 @@ unsafe fn draw_compact_checkbox(hwnd: HWND, dc: HDC, rect: RECT, hovered: bool) 
     let foreground = if enabled { ACCENT } else { DISABLED_TEXT };
     fill(dc, &rect, BACKGROUND);
     if !checkbox_glyph_antialiased(dc, glyph, dpi, border, face, foreground, checked) {
-        rounded(dc, &glyph, pixels(3, dpi), border);
-        rounded(dc, &inset(glyph, pixels(1, dpi)), pixels(2, dpi), face);
+        rounded_gdi(dc, &glyph, pixels(3, dpi), border);
+        rounded_gdi(dc, &inset(glyph, pixels(1, dpi)), pixels(2, dpi), face);
         if checked {
             let pen = CreatePen(PS_SOLID, pixels(1, dpi), foreground);
             if !pen.is_null() {
@@ -706,7 +836,7 @@ unsafe fn is_edit_control(hwnd: HWND) -> bool {
         && class[..4]
             .iter()
             .copied()
-            .zip([b'E', b'D', b'I', b'T'])
+            .zip(*b"EDIT")
             .all(|(actual, expected)| actual == expected as u16 || actual == (expected + 32) as u16)
 }
 
@@ -777,7 +907,7 @@ pub unsafe fn update_input_metrics(hwnd: HWND) {
     {
         return;
     }
-    // 只重新计算客户区，保留父窗口批量布局后的统一重绘
+    // 只重新计算客户区，让原生控件同步维护边缘失效区域
     SetWindowPos(
         hwnd,
         null_mut(),
@@ -785,13 +915,7 @@ pub unsafe fn update_input_metrics(hwnd: HWND) {
         0,
         0,
         0,
-        SWP_NOMOVE
-            | SWP_NOSIZE
-            | SWP_NOZORDER
-            | SWP_NOACTIVATE
-            | SWP_FRAMECHANGED
-            | SWP_NOREDRAW
-            | SWP_NOCOPYBITS,
+        SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED,
     );
 }
 
@@ -976,8 +1100,8 @@ unsafe fn paint_input_frame(hwnd: HWND) {
         fill(dc, &rect, BACKGROUND);
         if !draw_input_outline_antialiased(dc, rect, dpi, border) {
             let outline = inset(rect, pixels(1, dpi));
-            rounded(dc, &outline, pixels(7, dpi), border);
-            rounded(dc, &inset(outline, pixels(1, dpi)), pixels(6, dpi), SURFACE);
+            rounded_gdi(dc, &outline, pixels(7, dpi), border);
+            rounded_gdi(dc, &inset(outline, pixels(1, dpi)), pixels(6, dpi), SURFACE);
         }
     }
     ReleaseDC(hwnd, dc);
@@ -1084,7 +1208,7 @@ unsafe fn position_combo_edit(combo: HWND) {
         bounds.top,
         bounds.right - bounds.left,
         height,
-        SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOREDRAW | SWP_NOCOPYBITS,
+        SWP_NOZORDER | SWP_NOACTIVATE,
     );
 }
 
@@ -1246,8 +1370,8 @@ unsafe fn draw_combo_frame(hwnd: HWND, dc: HDC, rect: RECT) -> bool {
     });
     if !draw_combo_antialiased(dc, rect, button, dpi, border, foreground) {
         let outline = inset(rect, pixels(1, dpi));
-        rounded(dc, &outline, pixels(7, dpi), border);
-        rounded(dc, &inset(outline, pixels(1, dpi)), pixels(6, dpi), SURFACE);
+        rounded_gdi(dc, &outline, pixels(7, dpi), border);
+        rounded_gdi(dc, &inset(outline, pixels(1, dpi)), pixels(6, dpi), SURFACE);
         let cx = (button.left + button.right) / 2;
         let cy = (rect.top + rect.bottom) / 2;
         let pen = CreatePen(PS_SOLID, pixels(1, dpi), foreground);
@@ -1328,9 +1452,21 @@ unsafe fn rounded_path(
     bottom: f32,
     diameter: f32,
 ) -> bool {
-    right - left >= diameter
-        && bottom - top >= diameter
-        && gdip::GdipAddPathArc(path.0, left, top, diameter, diameter, 180.0, 90.0) == gdip::Ok
+    let width = right - left;
+    let height = bottom - top;
+    if ![left, top, right, bottom, diameter, width, height]
+        .into_iter()
+        .all(f32::is_finite)
+        || width <= 0.0
+        || height <= 0.0
+    {
+        return false;
+    }
+    let diameter = diameter.max(0.0).min(width).min(height);
+    if diameter == 0.0 {
+        return gdip::GdipAddPathRectangle(path.0, left, top, width, height) == gdip::Ok;
+    }
+    gdip::GdipAddPathArc(path.0, left, top, diameter, diameter, 180.0, 90.0) == gdip::Ok
         && gdip::GdipAddPathArc(
             path.0,
             right - diameter,
@@ -1411,44 +1547,8 @@ unsafe fn draw_scrollbar_thumb(dc: HDC, rect: &RECT, color: COLORREF) {
     if diameter <= 0 || dc.is_null() {
         return;
     }
-    if !scrollbar_thumb_antialiased(dc, rect, color, diameter as f32) {
-        if let Some(_saved) = SavedDc::new(dc) {
-            rounded(dc, rect, (diameter + 1) / 2, color);
-        }
-    }
-}
-
-unsafe fn scrollbar_thumb_antialiased(
-    dc: HDC,
-    rect: &RECT,
-    color: COLORREF,
-    diameter: f32,
-) -> bool {
-    if !GDIPLUS_READY.with(Cell::get) {
-        return false;
-    }
-    let Some(graphics) = GdiPlusGraphics::new(dc) else {
-        return false;
-    };
-    let Some(path) = GdiPlusPath::new() else {
-        return false;
-    };
-    let Some(brush) = GdiPlusBrush::new(color) else {
-        return false;
-    };
-    gdip::GdipSetPageUnit(graphics.0, gdip::UnitPixel) == gdip::Ok
-        && gdip::GdipSetSmoothingMode(graphics.0, gdip::SmoothingModeAntiAlias8x8) == gdip::Ok
-        && gdip::GdipSetPixelOffsetMode(graphics.0, gdip::PixelOffsetModeHighQuality) == gdip::Ok
-        && rounded_path(
-            &path,
-            rect.left as f32,
-            rect.top as f32,
-            rect.right as f32,
-            rect.bottom as f32,
-            diameter,
-        )
-        && gdip::GdipFillPath(graphics.0, brush.0.cast(), path.0) == gdip::Ok
-        && gdip::GdipFlush(graphics.0, gdip::FlushIntentionSync) == gdip::Ok
+    // 半径向上取整后由共用路径限制直径，奇数宽度同样保持完整圆头
+    draw_rounded_surface(dc, rect, diameter / 2 + diameter % 2, color, None);
 }
 
 unsafe fn draw_input_outline_antialiased(dc: HDC, rect: RECT, dpi: u32, border: COLORREF) -> bool {
@@ -1757,6 +1857,27 @@ unsafe fn scaled_icon_path_antialiased(
         && build(path.0, cx, cy, scale)
         && gdip::GdipDrawPath(graphics.0, pen.0, path.0) == gdip::Ok
         && gdip::GdipFlush(graphics.0, gdip::FlushIntentionSync) == gdip::Ok
+}
+
+pub(crate) unsafe fn draw_caption_button_icon(
+    dc: HDC,
+    rect: RECT,
+    dpi: u32,
+    color: COLORREF,
+    close: bool,
+) -> bool {
+    let scale = dpi.max(96) as f32 / 96.0;
+    scaled_icon_path_antialiased(dc, rect, color, scale, scale, |path, cx, cy, scale| {
+        let half = 4.5 * scale;
+        if close {
+            gdip::GdipAddPathLine(path, cx - half, cy - half, cx + half, cy + half) == gdip::Ok
+                && gdip::GdipStartPathFigure(path) == gdip::Ok
+                && gdip::GdipAddPathLine(path, cx + half, cy - half, cx - half, cy + half)
+                    == gdip::Ok
+        } else {
+            gdip::GdipAddPathLine(path, cx - half, cy, cx + half, cy) == gdip::Ok
+        }
+    })
 }
 
 fn gear_points(cx: f32, cy: f32, scale: f32) -> [gdip::PointF; 36] {
@@ -2224,6 +2345,115 @@ unsafe fn name_visibility_icon(dc: HDC, rect: RECT, dpi: u32, color: COLORREF, v
     DeleteObject(pen);
 }
 
+unsafe fn open_window_icon(dc: HDC, rect: RECT, dpi: u32, color: COLORREF) {
+    let lines: [&[(f32, f32)]; 3] = [
+        &[
+            (-1.5, -5.5),
+            (-5.5, -5.5),
+            (-5.5, 5.5),
+            (5.5, 5.5),
+            (5.5, 1.5),
+        ],
+        &[(-0.5, 0.5), (6.0, -6.0)],
+        &[(1.5, -6.0), (6.0, -6.0), (6.0, -1.5)],
+    ];
+    let scale = dpi.max(96) as f32 / 96.0;
+    let stroke = 1.5 * scale;
+    if scaled_icon_path_antialiased(dc, rect, color, scale, stroke, |path, cx, cy, scale| {
+        for line in lines {
+            if gdip::GdipStartPathFigure(path) != gdip::Ok {
+                return false;
+            }
+            for pair in line.windows(2) {
+                if gdip::GdipAddPathLine(
+                    path,
+                    cx + pair[0].0 * scale,
+                    cy + pair[0].1 * scale,
+                    cx + pair[1].0 * scale,
+                    cy + pair[1].1 * scale,
+                ) != gdip::Ok
+                {
+                    return false;
+                }
+            }
+        }
+        true
+    }) {
+        return;
+    }
+    let Some(saved) = SavedDc::new(dc) else {
+        return;
+    };
+    let cx = (rect.left + rect.right) as f32 / 2.0;
+    let cy = (rect.top + rect.bottom) as f32 / 2.0;
+    let pen = CreatePen(PS_SOLID, stroke.round().max(1.0) as i32, color);
+    if pen.is_null() {
+        return;
+    }
+    SelectObject(dc, pen);
+    for line in lines {
+        let mut points: [POINT; 5] = zeroed();
+        for (point, &(x, y)) in points.iter_mut().zip(line) {
+            point.x = (cx + x * scale).round() as i32;
+            point.y = (cy + y * scale).round() as i32;
+        }
+        Polyline(dc, points.as_ptr(), line.len() as i32);
+    }
+    drop(saved);
+    DeleteObject(pen);
+}
+
+unsafe fn mini_mode_icon(dc: HDC, rect: RECT, dpi: u32, color: COLORREF, expand: bool) {
+    let tip = if expand { 8.0 } else { 2.0 };
+    let tail = if expand { 2.0 } else { 8.0 };
+    let wing = if expand { 3.0 } else { 7.0 };
+    let dpi_scale = dpi.max(96) as f32 / 96.0;
+    let scale = if expand { 11.0 / 16.0 } else { 18.0 / 24.0 } * dpi_scale;
+    let stroke = 1.5 * dpi_scale;
+    if scaled_icon_path_antialiased(dc, rect, color, scale, stroke, |path, cx, cy, scale| {
+        for direction in [-1.0, 1.0] {
+            let point = |x: f32, y: f32| gdip::PointF {
+                X: cx + x * direction * scale,
+                Y: cy + y * direction * scale,
+            };
+            let shaft = [point(tail, -tail), point(tip, -tip)];
+            let head = [point(wing, -tip), point(tip, -tip), point(tip, -wing)];
+            if gdip::GdipStartPathFigure(path) != gdip::Ok
+                || gdip::GdipAddPathLine2(path, shaft.as_ptr(), shaft.len() as i32) != gdip::Ok
+                || gdip::GdipStartPathFigure(path) != gdip::Ok
+                || gdip::GdipAddPathLine2(path, head.as_ptr(), head.len() as i32) != gdip::Ok
+            {
+                return false;
+            }
+        }
+        true
+    }) {
+        return;
+    }
+    let Some(saved) = SavedDc::new(dc) else {
+        return;
+    };
+    let cx = (rect.left + rect.right) as f32 / 2.0;
+    let cy = (rect.top + rect.bottom) as f32 / 2.0;
+    let pen = CreatePen(PS_SOLID, stroke.round().max(1.0) as i32, color);
+    if pen.is_null() {
+        return;
+    }
+    SelectObject(dc, pen);
+    for direction in [-1.0, 1.0] {
+        let point = |x: f32, y: f32| POINT {
+            x: (cx + x * direction * scale).round() as i32,
+            y: (cy + y * direction * scale).round() as i32,
+        };
+        let shaft = [point(tail, -tail), point(tip, -tip)];
+        let head = [point(wing, -tip), point(tip, -tip), point(tip, -wing)];
+        Polyline(dc, shaft.as_ptr(), shaft.len() as i32);
+        Polyline(dc, head.as_ptr(), head.len() as i32);
+    }
+    drop(saved);
+    DeleteObject(pen);
+}
+
 unsafe fn draw_button_content(item: &DRAWITEMSTRUCT, style: ButtonStyle, selected: bool) -> bool {
     let Some(_saved) = SavedDc::new(item.hDC) else {
         return false;
@@ -2282,7 +2512,7 @@ unsafe fn draw_button_content(item: &DRAWITEMSTRUCT, style: ButtonStyle, selecte
         } else {
             (ACCENT_SOFT, PICKER_BORDER, ACCENT)
         }
-    } else if selected {
+    } else if selected && !matches!(style, ButtonStyle::MiniMode) {
         (if pressed { PRESSED } else { ACCENT_SOFT }, ACCENT, ACCENT)
     } else if pressed {
         (PRESSED, BORDER, TEXT)
@@ -2292,7 +2522,13 @@ unsafe fn draw_button_content(item: &DRAWITEMSTRUCT, style: ButtonStyle, selecte
         (
             SURFACE,
             BORDER,
-            if matches!(style, ButtonStyle::Icon | ButtonStyle::Back) {
+            if matches!(
+                style,
+                ButtonStyle::Icon
+                    | ButtonStyle::Back
+                    | ButtonStyle::OpenWindow
+                    | ButtonStyle::MiniMode
+            ) {
                 MUTED
             } else {
                 TEXT
@@ -2301,9 +2537,14 @@ unsafe fn draw_button_content(item: &DRAWITEMSTRUCT, style: ButtonStyle, selecte
     };
     fill(item.hDC, &item.rcItem, BACKGROUND);
     let outline = inset(item.rcItem, pixels(1, dpi));
-    rounded(item.hDC, &outline, pixels(7, dpi), border);
+    draw_rounded_surface(
+        item.hDC,
+        &outline,
+        pixels(7, dpi),
+        background,
+        Some((border, pixels(1, dpi))),
+    );
     let face = inset(outline, pixels(1, dpi));
-    rounded(item.hDC, &face, pixels(6, dpi), background);
     let mut content = inset(face, pixels(4, dpi));
     content.top = face.top + pixels(1, dpi);
     content.bottom = face.bottom - pixels(1, dpi);
@@ -2313,8 +2554,12 @@ unsafe fn draw_button_content(item: &DRAWITEMSTRUCT, style: ButtonStyle, selecte
         refresh_icon(item.hDC, item.rcItem, dpi, foreground);
     } else if matches!(style, ButtonStyle::Back) {
         back_icon(item.hDC, item.rcItem, dpi, foreground);
+    } else if matches!(style, ButtonStyle::OpenWindow) {
+        open_window_icon(item.hDC, item.rcItem, dpi, foreground);
     } else if matches!(style, ButtonStyle::Icon) {
         settings_icon(item.hDC, item.rcItem, dpi, foreground);
+    } else if matches!(style, ButtonStyle::MiniMode) {
+        mini_mode_icon(item.hDC, item.rcItem, dpi, foreground, selected);
     } else {
         let length = GetWindowTextLengthW(item.hwndItem).max(0) as usize;
         let mut text = vec![0_u16; length + 1];
@@ -2337,19 +2582,108 @@ unsafe fn draw_button_content(item: &DRAWITEMSTRUCT, style: ButtonStyle, selecte
     true
 }
 
-pub unsafe fn draw_trackbar(draw: &NMCUSTOMDRAW, compact: bool) -> LRESULT {
-    if draw.dwDrawStage == CDDS_PREPAINT {
-        return CDRF_NOTIFYITEMDRAW as LRESULT;
+#[derive(Clone, Copy)]
+struct TrackbarVisual {
+    client: RECT,
+    channel: RECT,
+    thumb: RECT,
+    dpi: u32,
+    compact: bool,
+    vertical: bool,
+    enabled: bool,
+    highlighted: bool,
+}
+
+pub unsafe fn install_trackbar_theme(hwnd: HWND, compact: bool) -> bool {
+    SetWindowSubclass(
+        hwnd,
+        Some(trackbar_theme_proc),
+        TRACKBAR_THEME_SUBCLASS,
+        compact as usize,
+    ) != 0
+}
+
+unsafe extern "system" fn trackbar_theme_proc(
+    hwnd: HWND,
+    message: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+    subclass: usize,
+    compact: usize,
+) -> LRESULT {
+    match message {
+        WM_ERASEBKGND => return 1,
+        WM_PAINT => {
+            // 绘制仅消费已有失效区，避免在合成控件树时再次触发祖先重绘
+            let mut paint: PAINTSTRUCT = zeroed();
+            let dc = BeginPaint(hwnd, &mut paint);
+            if !dc.is_null() && !paint_trackbar(hwnd, dc, compact != 0) {
+                DefSubclassProc(hwnd, WM_PRINTCLIENT, dc as usize, PRF_CLIENT as isize);
+            }
+            EndPaint(hwnd, &paint);
+            return 0;
+        }
+        WM_PRINTCLIENT => {
+            if paint_trackbar(hwnd, wparam as HDC, compact != 0) {
+                return 0;
+            }
+        }
+        WM_MOUSEMOVE => {
+            let mut tracking = TRACKMOUSEEVENT {
+                cbSize: size_of::<TRACKMOUSEEVENT>() as u32,
+                dwFlags: TME_LEAVE,
+                hwndTrack: hwnd,
+                ..zeroed()
+            };
+            TrackMouseEvent(&mut tracking);
+        }
+        WM_NCDESTROY => {
+            RemoveWindowSubclass(hwnd, Some(trackbar_theme_proc), subclass);
+        }
+        _ => {}
     }
-    if draw.dwDrawStage != CDDS_ITEMPREPAINT {
-        return CDRF_DODEFAULT as LRESULT;
-    }
-    let Some(_saved) = SavedDc::new(draw.hdc) else {
-        return CDRF_DODEFAULT as LRESULT;
+    // 在原生处理状态变化前扩展失效区，使同步绘制也覆盖旧进度和光晕
+    let redraw = match message {
+        TBM_SETPOS | TBM_SETRANGE | TBM_SETRANGEMIN | TBM_SETRANGEMAX => wparam != 0,
+        WM_MOUSEMOVE
+        | WM_MOUSELEAVE
+        | WM_LBUTTONDOWN
+        | WM_LBUTTONUP
+        | WM_KEYDOWN
+        | WM_KEYUP
+        | WM_MOUSEWHEEL
+        | WM_TIMER
+        | WM_CAPTURECHANGED
+        | WM_CANCELMODE
+        | WM_ENABLE
+        | WM_SETFOCUS
+        | WM_KILLFOCUS
+        | WM_UPDATEUISTATE
+        | WM_SIZE
+        | WM_THEMECHANGED
+        | WM_DPICHANGED_AFTERPARENT
+        | TBM_SETTHUMBLENGTH
+        | TBM_SETPOSNOTIFY => true,
+        _ => false,
     };
-    let hwnd = draw.hdr.hwndFrom;
+    if redraw {
+        InvalidateRect(hwnd, null(), 0);
+    }
+    DefSubclassProc(hwnd, message, wparam, lparam)
+}
+
+unsafe fn paint_trackbar(hwnd: HWND, dc: HDC, compact: bool) -> bool {
+    let mut client: RECT = zeroed();
+    if dc.is_null()
+        || GetClientRect(hwnd, &mut client) == 0
+        || client.right <= 0
+        || client.bottom <= 0
+    {
+        return false;
+    }
     let dpi = GetDpiForWindow(hwnd).max(96);
     let enabled = IsWindowEnabled(hwnd) != 0;
+    let vertical = GetWindowLongPtrW(hwnd, GWL_STYLE) as u32 & TBS_VERT != 0;
     let mut thumb: RECT = zeroed();
     SendMessageW(
         hwnd,
@@ -2357,60 +2691,102 @@ pub unsafe fn draw_trackbar(draw: &NMCUSTOMDRAW, compact: bool) -> LRESULT {
         0,
         (&mut thumb as *mut RECT) as LPARAM,
     );
+    let mut channel: RECT = zeroed();
+    SendMessageW(
+        hwnd,
+        TBM_GETCHANNELRECT,
+        0,
+        &mut channel as *mut RECT as LPARAM,
+    );
+    let mut cursor: POINT = zeroed();
+    let hot = GetCursorPos(&mut cursor) != 0
+        && ScreenToClient(hwnd, &mut cursor) != 0
+        && PtInRect(&thumb, cursor) != 0;
+    let keyboard_focus = GetFocus() == hwnd
+        && SendMessageW(hwnd, WM_QUERYUISTATE, 0, 0) as u32 & UISF_HIDEFOCUS == 0;
+    let visual = TrackbarVisual {
+        client,
+        channel,
+        thumb,
+        dpi,
+        compact,
+        vertical,
+        enabled,
+        highlighted: hot || keyboard_focus || GetCapture() == hwnd,
+    };
+    if let Some(buffer) = PaintBuffer::new(dc, client) {
+        if draw_trackbar_frame(buffer.dc(), visual) && buffer.present(dc) {
+            return true;
+        }
+    }
+    draw_trackbar_frame(dc, visual)
+}
+
+unsafe fn draw_trackbar_frame(dc: HDC, visual: TrackbarVisual) -> bool {
+    let Some(_saved) = SavedDc::new(dc) else {
+        return false;
+    };
+    let TrackbarVisual {
+        client,
+        mut channel,
+        thumb,
+        dpi,
+        compact,
+        vertical,
+        enabled,
+        highlighted,
+    } = visual;
+    // 背景、轨道和手柄在同一缓冲中完成，消除擦底与分项绘制造成的闪动
+    fill(dc, &client, BACKGROUND);
     let cx = (thumb.left + thumb.right) / 2;
     let cy = (thumb.top + thumb.bottom) / 2;
-    match draw.dwItemSpec as u32 {
-        TBCD_CHANNEL => {
-            let mut channel: RECT = zeroed();
-            SendMessageW(
-                hwnd,
-                TBM_GETCHANNELRECT,
-                0,
-                (&mut channel as *mut RECT) as LPARAM,
-            );
-            let height = pixels(if compact { 3 } else { 4 }, dpi);
-            channel.top = cy - height / 2;
-            channel.bottom = channel.top + height;
-            rounded(draw.hdc, &channel, height, TRACK);
-            if enabled && cx > channel.left {
-                channel.right = cx.min(channel.right);
-                rounded(draw.hdc, &channel, height, ACCENT);
-            }
-            CDRF_SKIPDEFAULT as LRESULT
-        }
-        TBCD_THUMB => {
-            let radius = pixels(if compact { 5 } else { 8 }, dpi);
-            // 主手柄不超出原生命中矩形，避免可见圆边缘无法开始拖动
-            let radius = if compact {
-                radius
-            } else {
-                radius.min(((thumb.right - thumb.left).min(thumb.bottom - thumb.top) / 2).max(1))
-            };
-            let circle = RECT {
-                left: cx - radius,
-                top: cy - radius,
-                right: cx + radius,
-                bottom: cy + radius,
-            };
-            let keyboard_focus = GetFocus() == hwnd
-                && SendMessageW(hwnd, WM_QUERYUISTATE, 0, 0) as u32 & UISF_HIDEFOCUS == 0;
-            if enabled && (draw.uItemState & (CDIS_HOT | CDIS_SELECTED) != 0 || keyboard_focus) {
-                let halo = inset(circle, -pixels(2, dpi));
-                rounded(draw.hdc, &halo, radius + pixels(2, dpi), ACCENT_SOFT);
-            }
-            rounded(
-                draw.hdc,
-                &circle,
-                radius,
-                if enabled { ACCENT } else { DISABLED_TEXT },
-            );
-            let center = inset(circle, pixels(2, dpi));
-            rounded(draw.hdc, &center, radius, SURFACE);
-            CDRF_SKIPDEFAULT as LRESULT
-        }
-        TBCD_TICS => CDRF_SKIPDEFAULT as LRESULT,
-        _ => CDRF_DODEFAULT as LRESULT,
+    let thickness = pixels(if compact { 3 } else { 4 }, dpi);
+    if vertical {
+        // 只取原生轨道长边，避开竖向控件返回矩形的横纵坐标差异
+        let length = (channel.right - channel.left)
+            .max(channel.bottom - channel.top)
+            .clamp(1, client.bottom - client.top);
+        channel.top = client.top + (client.bottom - client.top - length) / 2;
+        channel.bottom = channel.top + length;
+        channel.left = cx - thickness / 2;
+        channel.right = channel.left + thickness;
+    } else {
+        channel.top = cy - thickness / 2;
+        channel.bottom = channel.top + thickness;
     }
+    rounded(dc, &channel, thickness, TRACK);
+    if enabled && vertical && cy < channel.bottom {
+        channel.top = cy.max(channel.top);
+        rounded(dc, &channel, thickness, ACCENT);
+    } else if enabled && !vertical && cx > channel.left {
+        channel.right = cx.min(channel.right);
+        rounded(dc, &channel, thickness, ACCENT);
+    }
+    let radius = pixels(if compact { 5 } else { 8 }, dpi);
+    // 主手柄和竖向手柄不超出原生命中矩形，避免可见圆边缘无法开始拖动
+    let radius = if compact && !vertical {
+        radius
+    } else {
+        radius.min(((thumb.right - thumb.left).min(thumb.bottom - thumb.top) / 2).max(1))
+    };
+    let circle = RECT {
+        left: cx - radius,
+        top: cy - radius,
+        right: cx + radius,
+        bottom: cy + radius,
+    };
+    if enabled && highlighted {
+        let halo = inset(circle, -pixels(2, dpi));
+        rounded(dc, &halo, radius + pixels(2, dpi), ACCENT_SOFT);
+    }
+    draw_rounded_surface(
+        dc,
+        &circle,
+        radius,
+        SURFACE,
+        Some((if enabled { ACCENT } else { DISABLED_TEXT }, pixels(2, dpi))),
+    );
+    true
 }
 
 const LIST_BADGE_SIDE: i32 = 11;
@@ -2547,7 +2923,7 @@ unsafe fn draw_list_name(draw: &NMLVCUSTOMDRAW, badges: WindowBadges) -> bool {
         return false;
     }
     // DrawTextExW 的省略处理最多额外写入四个字符
-    let mut text = vec![0_u16; 1028];
+    let mut text = [0_u16; 1028];
     let mut item = LVITEMW {
         mask: LVIF_IMAGE | LVIF_STATE,
         iItem: row as i32,
@@ -2568,9 +2944,6 @@ unsafe fn draw_list_name(draw: &NMLVCUSTOMDRAW, badges: WindowBadges) -> bool {
         row,
         &mut name as *mut LVITEMW as LPARAM,
     );
-    if length <= 0 {
-        return false;
-    }
     let Some(_saved) = SavedDc::new(dc) else {
         return false;
     };
@@ -2664,8 +3037,9 @@ unsafe fn draw_list_name(draw: &NMLVCUSTOMDRAW, badges: WindowBadges) -> bool {
         right: cell.right - pixels(4, dpi) - badge_width,
         ..cell
     };
-    if content.right <= content.left {
-        return false;
+    if content.right <= content.left || length <= 0 {
+        // 窄列或空名称仍保留已绘制的原色图标，避免原生选中绘制再次覆盖
+        return true;
     }
     font_for(dc, list);
     SetBkMode(dc, TRANSPARENT as i32);
@@ -2679,7 +3053,7 @@ unsafe fn draw_list_name(draw: &NMLVCUSTOMDRAW, badges: WindowBadges) -> bool {
         null(),
     ) == 0
     {
-        return false;
+        return true;
     }
     if !badges.any() {
         return true;
@@ -2687,7 +3061,7 @@ unsafe fn draw_list_name(draw: &NMLVCUSTOMDRAW, badges: WindowBadges) -> bool {
     let shown_length = text.iter().position(|value| *value == 0).unwrap_or(1024);
     let mut extent: SIZE = zeroed();
     if GetTextExtentPoint32W(dc, text.as_ptr(), shown_length as i32, &mut extent) == 0 {
-        return false;
+        return true;
     }
     // 状态符号紧贴名称末端横向排列，关闭的状态不占位
     let mut left =
@@ -2717,7 +3091,6 @@ unsafe fn draw_list_name(draw: &NMLVCUSTOMDRAW, badges: WindowBadges) -> bool {
 }
 
 pub unsafe fn draw_list(draw: &mut NMLVCUSTOMDRAW) -> LRESULT {
-    let badges = window_badges(draw.nmcd.lItemlParam as usize);
     match draw.nmcd.dwDrawStage {
         CDDS_PREPAINT => CDRF_NOTIFYITEMDRAW as LRESULT,
         CDDS_ITEMPREPAINT => {
@@ -2736,6 +3109,7 @@ pub unsafe fn draw_list(draw: &mut NMLVCUSTOMDRAW) -> LRESULT {
             (CDRF_NEWFONT | notify_subitems) as LRESULT
         }
         stage if stage == CDDS_ITEMPREPAINT | CDDS_SUBITEM && draw.iSubItem == 0 => {
+            let badges = window_badges(draw.nmcd.lItemlParam as usize);
             if draw_list_name(draw, badges) {
                 CDRF_SKIPDEFAULT as LRESULT
             } else {
@@ -2801,4 +3175,603 @@ pub unsafe fn draw_header(draw: &NMCUSTOMDRAW) -> LRESULT {
         align | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX,
     );
     CDRF_SKIPDEFAULT as LRESULT
+}
+
+#[cfg(test)]
+mod rendering_tests {
+    use super::*;
+    use std::sync::Mutex;
+    use windows_sys::Win32::System::Threading::{
+        GetCurrentProcess, GetGuiResources, GR_GDIOBJECTS,
+    };
+
+    // 所有画布均为内存 DIB，不创建窗口或获取桌面 DC
+    static GDI_TEST_LOCK: Mutex<()> = Mutex::new(());
+    const SENTINEL: COLORREF = rgb(217, 31, 183);
+
+    struct Canvas {
+        dc: HDC,
+        bitmap: HBITMAP,
+        previous_bitmap: HGDIOBJ,
+        bits: *mut u32,
+        width: i32,
+        height: i32,
+    }
+
+    impl Canvas {
+        unsafe fn new(width: i32, height: i32, background: COLORREF) -> Self {
+            assert!(width > 0 && height > 0);
+            let dc = CreateCompatibleDC(null_mut());
+            assert!(!dc.is_null(), "CreateCompatibleDC failed");
+            let mut canvas = Self {
+                dc,
+                bitmap: null_mut(),
+                previous_bitmap: null_mut(),
+                bits: null_mut(),
+                width,
+                height,
+            };
+            let info = BITMAPINFO {
+                bmiHeader: BITMAPINFOHEADER {
+                    biSize: size_of::<BITMAPINFOHEADER>() as u32,
+                    biWidth: width,
+                    biHeight: -height,
+                    biPlanes: 1,
+                    biBitCount: 32,
+                    biCompression: BI_RGB,
+                    ..zeroed()
+                },
+                ..zeroed()
+            };
+            let mut bits = null_mut();
+            canvas.bitmap = CreateDIBSection(dc, &info, DIB_RGB_COLORS, &mut bits, null_mut(), 0);
+            assert!(!canvas.bitmap.is_null(), "CreateDIBSection failed");
+            assert!(!bits.is_null(), "DIB pixels are missing");
+            canvas.bits = bits.cast();
+            canvas.previous_bitmap = SelectObject(dc, canvas.bitmap);
+            assert!(!canvas.previous_bitmap.is_null(), "SelectObject failed");
+            fill(dc, &canvas.rect(), background);
+            canvas
+        }
+
+        fn rect(&self) -> RECT {
+            RECT {
+                left: 0,
+                top: 0,
+                right: self.width,
+                bottom: self.height,
+            }
+        }
+
+        unsafe fn pixels(&self) -> Vec<u32> {
+            assert_ne!(GdiFlush(), 0, "GDI drawing did not finish");
+            std::slice::from_raw_parts(self.bits, (self.width * self.height) as usize)
+                .iter()
+                .map(|pixel| pixel & 0x00ff_ffff)
+                .collect()
+        }
+    }
+
+    impl Drop for Canvas {
+        fn drop(&mut self) {
+            unsafe {
+                if !self.previous_bitmap.is_null() {
+                    SelectObject(self.dc, self.previous_bitmap);
+                }
+                if !self.bitmap.is_null() {
+                    DeleteObject(self.bitmap);
+                }
+                DeleteDC(self.dc);
+            }
+        }
+    }
+
+    fn dib_color(color: COLORREF) -> u32 {
+        ((color & 0xff) << 16) | (color & 0xff00) | ((color >> 16) & 0xff)
+    }
+
+    fn inside(rect: RECT, x: i32, y: i32) -> bool {
+        x >= rect.left && x < rect.right && y >= rect.top && y < rect.bottom
+    }
+
+    fn trackbar_visual(length: i32, dpi: u32, vertical: bool, compact: bool) -> TrackbarVisual {
+        let side = pixels(32, dpi);
+        let length = pixels(length, dpi);
+        let half = pixels(9, dpi);
+        let center = length / 3;
+        let (client, thumb, channel) = if vertical {
+            (
+                RECT {
+                    right: side,
+                    bottom: length,
+                    ..unsafe { zeroed() }
+                },
+                RECT {
+                    left: side / 2 - half,
+                    top: center - half,
+                    right: side / 2 + half,
+                    bottom: center + half,
+                },
+                RECT {
+                    left: 0,
+                    top: 0,
+                    right: length - pixels(20, dpi),
+                    bottom: pixels(4, dpi),
+                },
+            )
+        } else {
+            (
+                RECT {
+                    right: length,
+                    bottom: side,
+                    ..unsafe { zeroed() }
+                },
+                RECT {
+                    left: center - half,
+                    top: side / 2 - half,
+                    right: center + half,
+                    bottom: side / 2 + half,
+                },
+                RECT {
+                    left: pixels(10, dpi),
+                    top: 0,
+                    right: length - pixels(10, dpi),
+                    bottom: pixels(4, dpi),
+                },
+            )
+        };
+        TrackbarVisual {
+            client,
+            thumb,
+            channel,
+            dpi,
+            vertical,
+            compact,
+            enabled: true,
+            highlighted: true,
+        }
+    }
+
+    #[test]
+    fn trackbar_resize_replaces_old_thumb_and_background_in_one_buffer() {
+        let _serial = GDI_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        unsafe {
+            for dpi in [96, 144, 192] {
+                for vertical in [false, true] {
+                    for compact in [false, true] {
+                        let canvas = Canvas::new(pixels(240, dpi), pixels(240, dpi), SENTINEL);
+                        for length in [220, 80, 150, 220] {
+                            let mut visual = trackbar_visual(length, dpi, vertical, compact);
+                            visual.enabled = length != 80;
+                            let reference = Canvas::new(canvas.width, canvas.height, SENTINEL);
+                            assert!(draw_trackbar_frame(reference.dc, visual));
+                            {
+                                let buffer = PaintBuffer::new(canvas.dc, visual.client)
+                                    .expect("buffer creation failed");
+                                assert!(draw_trackbar_frame(buffer.dc(), visual));
+                                assert!(buffer.present(canvas.dc));
+                            }
+                            let actual = canvas.pixels();
+                            let expected = reference.pixels();
+                            for y in visual.client.top..visual.client.bottom {
+                                for x in visual.client.left..visual.client.right {
+                                    let index = (y * canvas.width + x) as usize;
+                                    assert_ne!(
+                                        actual[index],
+                                        dib_color(SENTINEL),
+                                        "unpainted slider pixel"
+                                    );
+                                    assert_eq!(
+                                        actual[index], expected[index],
+                                        "old thumb or channel remained at ({x}, {y})"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn trackbar_partial_updates_reconstruct_the_same_complete_frame() {
+        let _serial = GDI_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        unsafe {
+            for vertical in [false, true] {
+                let visual = trackbar_visual(160, 144, vertical, false);
+                let reference = Canvas::new(240, 240, SENTINEL);
+                let partial = Canvas::new(240, 240, SENTINEL);
+                assert!(draw_trackbar_frame(reference.dc, visual));
+                let middle = visual.client.right / 2;
+                for clip in [
+                    RECT {
+                        right: middle,
+                        ..visual.client
+                    },
+                    RECT {
+                        left: middle,
+                        ..visual.client
+                    },
+                ] {
+                    let _saved = SavedDc::new(partial.dc).expect("SaveDC failed");
+                    assert_ne!(
+                        IntersectClipRect(partial.dc, clip.left, clip.top, clip.right, clip.bottom),
+                        ERROR
+                    );
+                    let buffer = PaintBuffer::new(partial.dc, visual.client)
+                        .expect("buffer creation failed");
+                    assert!(draw_trackbar_frame(buffer.dc(), visual));
+                    assert!(buffer.present(partial.dc));
+                }
+                assert_eq!(partial.pixels(), reference.pixels());
+            }
+        }
+    }
+
+    #[test]
+    fn all_button_styles_match_direct_drawing_after_repeated_resizing() {
+        let _serial = GDI_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let _graphics = GdiPlusSession::new().expect("GDI+ startup failed");
+        unsafe {
+            for (name, style) in [
+                ("picker", ButtonStyle::Picker),
+                ("refresh", ButtonStyle::Refresh),
+                ("eye", ButtonStyle::NameVisibility),
+                ("mini", ButtonStyle::MiniMode),
+                ("back", ButtonStyle::Back),
+                ("primary", ButtonStyle::Primary),
+                ("secondary", ButtonStyle::Secondary),
+                ("settings", ButtonStyle::Icon),
+            ] {
+                for size in [32, 24, 44, 32] {
+                    for state in [0, ODS_DISABLED, ODS_SELECTED] {
+                        let reference = Canvas::new(80, 72, SENTINEL);
+                        let buffered = Canvas::new(80, 72, SENTINEL);
+                        let rect = RECT {
+                            left: 13,
+                            top: 9,
+                            right: 13 + size,
+                            bottom: 9 + size,
+                        };
+                        let item = DRAWITEMSTRUCT {
+                            CtlType: ODT_BUTTON,
+                            itemAction: ODA_DRAWENTIRE,
+                            itemState: state,
+                            hDC: reference.dc,
+                            rcItem: rect,
+                            ..zeroed()
+                        };
+                        assert!(draw_button_content(&item, style, true));
+                        let item = DRAWITEMSTRUCT {
+                            hDC: buffered.dc,
+                            ..item
+                        };
+                        draw_button(&item, style, true);
+                        let expected = reference.pixels();
+                        assert_eq!(
+                            buffered.pixels(),
+                            expected,
+                            "{name}, size={size}, state={state}"
+                        );
+                        let mut ink = 0;
+                        for y in 0..reference.height {
+                            for x in 0..reference.width {
+                                let pixel = expected[(y * reference.width + x) as usize];
+                                if inside(rect, x, y) {
+                                    assert_ne!(
+                                        pixel,
+                                        dib_color(SENTINEL),
+                                        "unpainted {name} at ({x}, {y})"
+                                    );
+                                    ink += usize::from(pixel != dib_color(BACKGROUND));
+                                } else {
+                                    assert_eq!(
+                                        pixel,
+                                        dib_color(SENTINEL),
+                                        "{name} painted outside its bounds"
+                                    );
+                                }
+                            }
+                        }
+                        assert!(ink > 0, "{name} disappeared");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn partial_button_repaints_reconstruct_the_complete_image() {
+        let _serial = GDI_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let _graphics = GdiPlusSession::new().expect("GDI+ startup failed");
+        unsafe {
+            for style in [
+                ButtonStyle::Picker,
+                ButtonStyle::Refresh,
+                ButtonStyle::Icon,
+                ButtonStyle::MiniMode,
+            ] {
+                let reference = Canvas::new(64, 56, SENTINEL);
+                let partial = Canvas::new(64, 56, SENTINEL);
+                let rect = RECT {
+                    left: 11,
+                    top: 7,
+                    right: 43,
+                    bottom: 39,
+                };
+                let item = DRAWITEMSTRUCT {
+                    CtlType: ODT_BUTTON,
+                    itemAction: ODA_DRAWENTIRE,
+                    hDC: reference.dc,
+                    rcItem: rect,
+                    ..zeroed()
+                };
+                draw_button(&item, style, false);
+                let item = DRAWITEMSTRUCT {
+                    hDC: partial.dc,
+                    ..item
+                };
+                for clip in [RECT { right: 27, ..rect }, RECT { left: 27, ..rect }] {
+                    let _saved = SavedDc::new(partial.dc).expect("SaveDC failed");
+                    assert_ne!(
+                        IntersectClipRect(partial.dc, clip.left, clip.top, clip.right, clip.bottom),
+                        ERROR
+                    );
+                    draw_button(&item, style, false);
+                }
+                assert_eq!(partial.pixels(), reference.pixels());
+            }
+        }
+    }
+
+    #[test]
+    fn paint_buffer_preserves_client_clip_with_nonzero_dirty_origin() {
+        let _serial = GDI_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        unsafe {
+            let canvas = Canvas::new(64, 48, SENTINEL);
+            let dirty = RECT {
+                left: 7,
+                top: 5,
+                right: 57,
+                bottom: 43,
+            };
+            let client = RECT {
+                left: 12,
+                top: 13,
+                right: 52,
+                bottom: 38,
+            };
+            let marker = RECT {
+                left: 10,
+                top: 7,
+                right: 20,
+                bottom: 11,
+            };
+            let _saved = SavedDc::new(canvas.dc).expect("SaveDC failed");
+            assert_ne!(
+                ExcludeClipRect(
+                    canvas.dc,
+                    client.left,
+                    client.top,
+                    client.right,
+                    client.bottom
+                ),
+                ERROR
+            );
+            {
+                let buffer = PaintBuffer::new(canvas.dc, dirty).expect("buffer creation failed");
+                fill(buffer.dc(), &dirty, BACKGROUND);
+                fill(buffer.dc(), &marker, ACCENT);
+                assert!(buffer.present(canvas.dc));
+            }
+            assert_eq!(
+                GetCurrentObject(canvas.dc, OBJ_BITMAP as u32),
+                canvas.bitmap
+            );
+            let pixels = canvas.pixels();
+            for y in 0..canvas.height {
+                for x in 0..canvas.width {
+                    let expected = if !inside(dirty, x, y) || inside(client, x, y) {
+                        SENTINEL
+                    } else if inside(marker, x, y) {
+                        ACCENT
+                    } else {
+                        BACKGROUND
+                    };
+                    assert_eq!(
+                        pixels[(y * canvas.width + x) as usize],
+                        dib_color(expected),
+                        "at ({x}, {y})"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn paint_buffer_resize_sequence_repaints_edges_and_releases_gdi_objects() {
+        let _serial = GDI_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        unsafe {
+            let canvas = Canvas::new(80, 60, SENTINEL);
+            // 预热兼容位图路径后再检查重复扩缩时的资源数
+            drop(PaintBuffer::new(canvas.dc, canvas.rect()).expect("buffer creation failed"));
+            assert_ne!(GdiFlush(), 0);
+            let baseline = GetGuiResources(GetCurrentProcess(), GR_GDIOBJECTS);
+            assert!(baseline > 0, "GDI resource query failed");
+            for &(width, height) in [(72, 52), (24, 20), (61, 43), (38, 29)]
+                .iter()
+                .cycle()
+                .take(32)
+            {
+                fill(canvas.dc, &canvas.rect(), SENTINEL);
+                let bounds = RECT {
+                    left: 0,
+                    top: 0,
+                    right: width,
+                    bottom: height,
+                };
+                {
+                    let buffer =
+                        PaintBuffer::new(canvas.dc, bounds).expect("buffer creation failed");
+                    fill(buffer.dc(), &bounds, BACKGROUND);
+                    fill(
+                        buffer.dc(),
+                        &RECT {
+                            left: width - 1,
+                            ..bounds
+                        },
+                        ACCENT,
+                    );
+                    fill(
+                        buffer.dc(),
+                        &RECT {
+                            top: height - 1,
+                            ..bounds
+                        },
+                        TEXT,
+                    );
+                    assert!(buffer.present(canvas.dc));
+                }
+                let pixels = canvas.pixels();
+                for y in 0..canvas.height {
+                    for x in 0..canvas.width {
+                        let expected = if !inside(bounds, x, y) {
+                            SENTINEL
+                        } else if y == height - 1 {
+                            TEXT
+                        } else if x == width - 1 {
+                            ACCENT
+                        } else {
+                            BACKGROUND
+                        };
+                        assert_eq!(
+                            pixels[(y * canvas.width + x) as usize],
+                            dib_color(expected),
+                            "size {width}x{height}, at ({x}, {y})"
+                        );
+                    }
+                }
+            }
+            assert_eq!(
+                GetCurrentObject(canvas.dc, OBJ_BITMAP as u32),
+                canvas.bitmap
+            );
+            assert_eq!(
+                GetGuiResources(GetCurrentProcess(), GR_GDIOBJECTS),
+                baseline,
+                "repeated buffer allocation leaked GDI objects"
+            );
+        }
+    }
+
+    #[test]
+    fn caption_icons_match_when_buffer_origin_is_nonzero() {
+        let _serial = GDI_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let _graphics = GdiPlusSession::new().expect("GDI+ startup failed");
+        unsafe {
+            let rect = RECT {
+                left: 17,
+                top: 11,
+                right: 49,
+                bottom: 43,
+            };
+            for dpi in [96, 144, 192] {
+                for close in [false, true] {
+                    let reference = Canvas::new(64, 56, BACKGROUND);
+                    let buffered = Canvas::new(64, 56, BACKGROUND);
+                    assert!(draw_caption_button_icon(
+                        reference.dc,
+                        rect,
+                        dpi,
+                        TEXT,
+                        close
+                    ));
+                    {
+                        let buffer =
+                            PaintBuffer::new(buffered.dc, rect).expect("buffer creation failed");
+                        fill(buffer.dc(), &rect, BACKGROUND);
+                        assert!(draw_caption_button_icon(
+                            buffer.dc(),
+                            rect,
+                            dpi,
+                            TEXT,
+                            close
+                        ));
+                        assert!(buffer.present(buffered.dc));
+                    }
+                    let expected = reference.pixels();
+                    assert!(
+                        expected.iter().any(|&pixel| pixel != dib_color(BACKGROUND)),
+                        "the reference icon is empty"
+                    );
+                    assert_eq!(buffered.pixels(), expected, "dpi={dpi}, close={close}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn caption_icon_partial_clip_preserves_pixels_outside_clip() {
+        let _serial = GDI_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let _graphics = GdiPlusSession::new().expect("GDI+ startup failed");
+        unsafe {
+            let reference = Canvas::new(64, 48, BACKGROUND);
+            let clipped = Canvas::new(64, 48, BACKGROUND);
+            let rect = RECT {
+                left: 20,
+                top: 8,
+                right: 44,
+                bottom: 32,
+            };
+            let clip = RECT { right: 32, ..rect };
+            assert!(draw_caption_button_icon(
+                reference.dc,
+                rect,
+                144,
+                TEXT,
+                true
+            ));
+            {
+                let _saved = SavedDc::new(clipped.dc).expect("SaveDC failed");
+                assert_ne!(
+                    IntersectClipRect(clipped.dc, clip.left, clip.top, clip.right, clip.bottom),
+                    ERROR
+                );
+                assert!(draw_caption_button_icon(clipped.dc, rect, 144, TEXT, true));
+            }
+            let reference_pixels = reference.pixels();
+            let clipped_pixels = clipped.pixels();
+            let mut visible_ink = 0;
+            for y in 0..clipped.height {
+                for x in 0..clipped.width {
+                    let index = (y * clipped.width + x) as usize;
+                    let expected = if inside(clip, x, y) {
+                        reference_pixels[index]
+                    } else {
+                        dib_color(BACKGROUND)
+                    };
+                    visible_ink += usize::from(expected != dib_color(BACKGROUND));
+                    assert_eq!(clipped_pixels[index], expected, "at ({x}, {y})");
+                }
+            }
+            assert!(visible_ink > 0, "the clipped icon is empty");
+        }
+    }
 }

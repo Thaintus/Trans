@@ -4,6 +4,7 @@
 - 根据用户对本项目的持续授权，代码修改完成后默认自行进行 Windows x64 Release 打包并交付 `Trans.exe`，无需再次询问是否打包；用户当轮明确要求不打包时按当轮要求执行
 - 此授权包含打包所需的编译；仅修改文档或项目规则时无需重新构建，未明确要求时不主动运行测试
 - 使用锁定依赖执行 `cargo build --release --locked --target x86_64-pc-windows-msvc`，优先使用已缓存依赖离线构建，将 `CARGO_TARGET_DIR` 指向项目内的 `target`
+- 每次通过 `scripts/build-release.ps1` 打包时自动将补丁版本加一，同步 Cargo.toml、Cargo.lock、关于页和 EXE 文件版本；成功后保留新版本，构建或发布失败恢复原版本，禁止并发打包复用版本号
 - 将构建产物发布到新的 `dist/release-yyyyMMdd-HHmmss/Trans.exe`，保留旧包，不自动关闭正在运行的实例；生成同目录 `Trans.exe.sha256`，核对源文件与发布文件哈希、x64 Windows GUI 格式，并在最终回复提供完整路径链接
 - README 仅维护项目介绍、功能、使用方法、通用兼容性、构建与许可说明，不写迭代过程、打包记录、验证流水或具体应用的适配与排查细节；专项细节放入独立文档
 - 迭代、打包及验证记录统一写入独立文档 `docs/validation-history.md`；发布后在该文档记录包路径、大小、SHA256 和验证范围，构建及静态检查不能代替实际运行验证

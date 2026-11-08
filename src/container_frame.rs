@@ -4,6 +4,9 @@ use std::mem::{size_of, zeroed};
 use std::ptr::null_mut;
 
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
+use windows_sys::Win32::Graphics::Dwm::{
+    DwmSetWindowAttribute, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND,
+};
 use windows_sys::Win32::Graphics::Gdi::*;
 use windows_sys::Win32::UI::HiDpi::{
     GetDpiForWindow, GetSystemMetricsForDpi, SystemParametersInfoForDpi,
@@ -21,9 +24,22 @@ const HOVER: u32 = 0x00ed_e8e3;
 const PRESSED: u32 = 0x00d5_d0cb;
 const CLOSE_HOVER: u32 = 0x0023_11c4;
 
+pub(crate) unsafe fn apply_window_corners(hwnd: HWND) {
+    // 自有窗口使用系统圆角保留合成边缘，旧系统不支持时沿用原有外观
+    let preference = DWMWCP_ROUND;
+    let _ = DwmSetWindowAttribute(
+        hwnd,
+        DWMWA_WINDOW_CORNER_PREFERENCE as u32,
+        &preference as *const _ as _,
+        size_of::<i32>() as u32,
+    );
+}
+
 pub struct ContainerFrame {
     hover: Cell<u32>,
     pressed: Cell<u32>,
+    minimize_button: bool,
+    maximize_button: bool,
 }
 
 impl Default for ContainerFrame {
@@ -31,6 +47,8 @@ impl Default for ContainerFrame {
         Self {
             hover: Cell::new(HTNOWHERE),
             pressed: Cell::new(HTNOWHERE),
+            minimize_button: true,
+            maximize_button: true,
         }
     }
 }
@@ -61,10 +79,12 @@ struct Layout {
     caption: i32,
     button: i32,
     dpi: u32,
+    minimize_button: bool,
+    maximize_button: bool,
 }
 
 impl Layout {
-    unsafe fn read(host: HWND) -> Option<Self> {
+    unsafe fn read(host: HWND, minimize_button: bool, maximize_button: bool) -> Option<Self> {
         let mut window: RECT = zeroed();
         if GetWindowRect(host, &mut window) == 0 {
             return None;
@@ -75,28 +95,65 @@ impl Layout {
             return None;
         }
         let dpi = GetDpiForWindow(host).max(96);
+        let caption = caption_height(dpi).min(height - 1);
+        let button = if maximize_button {
+            scaled(46, dpi).min((width - 2) / 3).max(1)
+        } else {
+            let count = if minimize_button { 2 } else { 1 };
+            let available = (width - 2 - count * scaled(4, dpi)).max(0);
+            scaled(20, dpi)
+                .min(available / count)
+                .min((caption - 2).max(0))
+        };
         Some(Self {
             window,
             width,
             height,
-            caption: caption_height(dpi).min(height - 1),
-            button: scaled(46, dpi).min((width - 2) / 3).max(1),
+            caption,
+            button,
             dpi,
+            minimize_button,
+            maximize_button,
         })
     }
 
-    fn button_rect(&self, hit: u32) -> RECT {
+    fn button_rect(&self, hit: u32) -> Option<RECT> {
+        if self.button <= 0 {
+            return None;
+        }
         let index = match hit {
             HTCLOSE => 1,
-            HTMAXBUTTON => 2,
-            _ => 3,
+            HTMAXBUTTON if self.maximize_button => 2,
+            HTMINBUTTON if self.minimize_button => {
+                if self.maximize_button {
+                    3
+                } else {
+                    2
+                }
+            }
+            _ => return None,
         };
-        RECT {
+        if !self.maximize_button {
+            let gap = scaled(4, self.dpi);
+            let right = self.width - 1 - gap - (index - 1) * (self.button + gap);
+            let top = 1 + (self.caption - 1 - self.button) / 2;
+            return Some(RECT {
+                left: right - self.button,
+                top,
+                right,
+                bottom: top + self.button,
+            });
+        }
+        Some(RECT {
             left: self.width - 1 - index * self.button,
             top: 1,
             right: self.width - 1 - (index - 1) * self.button,
             bottom: self.caption,
-        }
+        })
+    }
+
+    fn show_title(&self) -> bool {
+        self.minimize_button || self.maximize_button || self.width - 2 >= scaled(100, self.dpi)
     }
 
     unsafe fn hit(&self, host: HWND, point: POINT) -> u32 {
@@ -136,11 +193,17 @@ impl Layout {
             return HTCLIENT;
         }
         for hit in [HTCLOSE, HTMAXBUTTON, HTMINBUTTON] {
-            if x >= self.button_rect(hit).left {
+            if self.button_rect(hit).is_some_and(|rect| {
+                if self.maximize_button {
+                    x >= rect.left
+                } else {
+                    x >= rect.left && x < rect.right && y >= rect.top && y < rect.bottom
+                }
+            }) {
                 return hit;
             }
         }
-        if x < scaled(32, self.dpi) {
+        if self.show_title() && x < scaled(32, self.dpi) {
             HTSYSMENU
         } else {
             HTCAPTION
@@ -148,13 +211,15 @@ impl Layout {
     }
 }
 
-fn is_button(hit: u32) -> bool {
-    matches!(hit, HTMINBUTTON | HTMAXBUTTON | HTCLOSE)
-}
-
 unsafe fn fill(dc: HDC, rect: RECT, color: u32) {
     SetDCBrushColor(dc, color);
     FillRect(dc, &rect, GetStockObject(DC_BRUSH));
+}
+
+unsafe fn fill_rounded(dc: HDC, rect: RECT, color: u32, radius: i32) {
+    if !crate::ui_theme::draw_rounded_surface(dc, &rect, radius, color, None) {
+        fill(dc, rect, color);
+    }
 }
 
 unsafe fn line(dc: HDC, x1: i32, y1: i32, x2: i32, y2: i32) {
@@ -163,10 +228,56 @@ unsafe fn line(dc: HDC, x1: i32, y1: i32, x2: i32, y2: i32) {
 }
 
 impl ContainerFrame {
+    pub const fn without_maximize() -> Self {
+        Self {
+            hover: Cell::new(HTNOWHERE),
+            pressed: Cell::new(HTNOWHERE),
+            minimize_button: true,
+            maximize_button: false,
+        }
+    }
+
+    pub const fn close_only() -> Self {
+        Self {
+            hover: Cell::new(HTNOWHERE),
+            pressed: Cell::new(HTNOWHERE),
+            minimize_button: false,
+            maximize_button: false,
+        }
+    }
+
+    pub unsafe fn cancel_interaction(&self, host: HWND) {
+        let was_pressed = self.pressed.replace(HTNOWHERE) != HTNOWHERE;
+        self.hover.set(HTNOWHERE);
+        // 切换标题栏实例前释放自己的按钮捕获，不干扰选窗或滑块捕获
+        if was_pressed && GetCapture() == host {
+            ReleaseCapture();
+        }
+    }
+
+    fn is_button(&self, hit: u32) -> bool {
+        hit == HTCLOSE
+            || (self.minimize_button && hit == HTMINBUTTON)
+            || (self.maximize_button && hit == HTMAXBUTTON)
+    }
+
     unsafe fn paint(&self, host: HWND) {
-        let Some(layout) = Layout::read(host) else {
+        let mut icon = SendMessageW(host, WM_GETICON, ICON_SMALL as usize, 0) as HICON;
+        if icon.is_null() {
+            icon = GetClassLongPtrW(host, GCLP_HICONSM) as HICON;
+        }
+        if icon.is_null() {
+            icon = GetClassLongPtrW(host, GCLP_HICON) as HICON;
+        }
+        let mut title = [0u16; 1024];
+        let length = GetWindowTextW(host, title.as_mut_ptr(), title.len() as i32);
+        // 同步消息取完图标和标题后再读取尺寸，绘制期间只使用本次快照
+        let Some(layout) = Layout::read(host, self.minimize_button, self.maximize_button) else {
             return;
         };
+        let hovered = self.hover.get();
+        let pressed = self.pressed.get();
+        let maximized = IsZoomed(host) != 0;
         let dc = GetWindowDC(host);
         if dc.is_null() {
             return;
@@ -178,26 +289,12 @@ impl ContainerFrame {
         }
         // 不写入透明客户区，也不碰原应用的绘制表面
         ExcludeClipRect(dc, 1, layout.caption, layout.width - 1, layout.height - 1);
-        fill(
-            dc,
-            RECT {
-                left: 0,
-                top: 0,
-                right: layout.width,
-                bottom: layout.height,
-            },
-            BORDER,
-        );
-        fill(
-            dc,
-            RECT {
-                left: 1,
-                top: 1,
-                right: layout.width - 1,
-                bottom: layout.caption,
-            },
-            BACKGROUND,
-        );
+        let caption = RECT {
+            left: 0,
+            top: 0,
+            right: layout.width,
+            bottom: layout.caption,
+        };
         let mut metrics: NONCLIENTMETRICSW = zeroed();
         metrics.cbSize = size_of::<NONCLIENTMETRICSW>() as u32;
         let font = if SystemParametersInfoForDpi(
@@ -208,110 +305,170 @@ impl ContainerFrame {
             layout.dpi,
         ) != 0
         {
+            metrics.lfCaptionFont.lfQuality = CLEARTYPE_QUALITY;
             CreateFontIndirectW(&metrics.lfCaptionFont)
         } else {
             null_mut()
         };
-        SelectObject(
-            dc,
-            if font.is_null() {
-                GetStockObject(DEFAULT_GUI_FONT)
-            } else {
-                font
-            },
-        );
-        SetBkMode(dc, TRANSPARENT as i32);
-        SetTextColor(dc, TEXT);
-        let icon_size = GetSystemMetricsForDpi(SM_CXSMICON, layout.dpi).max(1);
-        let left = scaled(8, layout.dpi);
-        let icon = SendMessageW(host, WM_GETICON, ICON_SMALL as usize, 0) as HICON;
-        if !icon.is_null() {
-            DrawIconEx(
+        let draw_caption = |dc: HDC| {
+            fill(dc, caption, BORDER);
+            fill(
                 dc,
-                left,
-                (layout.caption - icon_size) / 2,
-                icon,
-                icon_size,
-                icon_size,
-                0,
-                null_mut(),
-                DI_NORMAL,
+                RECT {
+                    left: 1,
+                    top: 1,
+                    right: layout.width - 1,
+                    bottom: layout.caption,
+                },
+                BACKGROUND,
             );
-        }
-        let mut title = [0u16; 1024];
-        let length = GetWindowTextW(host, title.as_mut_ptr(), title.len() as i32);
-        let mut text_rect = RECT {
-            left: left + icon_size + scaled(6, layout.dpi),
-            top: 1,
-            right: layout.button_rect(HTMINBUTTON).left - scaled(6, layout.dpi),
-            bottom: layout.caption,
-        };
-        if text_rect.right > text_rect.left {
-            DrawTextW(
+            SelectObject(
                 dc,
-                title.as_ptr(),
-                length,
-                &mut text_rect,
-                DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX,
+                if font.is_null() {
+                    GetStockObject(DEFAULT_GUI_FONT)
+                } else {
+                    font
+                },
             );
-        }
-        SelectObject(dc, GetStockObject(NULL_BRUSH));
-        for hit in [HTMINBUTTON, HTMAXBUTTON, HTCLOSE] {
-            let rect = layout.button_rect(hit);
-            let hot = self.hover.get() == hit;
-            let background = if hot && hit == HTCLOSE {
-                CLOSE_HOVER
-            } else if hot && self.pressed.get() == hit {
-                PRESSED
-            } else if hot {
-                HOVER
-            } else {
-                BACKGROUND
+            SetBkMode(dc, TRANSPARENT as i32);
+            SetTextColor(dc, TEXT);
+            let icon_size = GetSystemMetricsForDpi(SM_CXSMICON, layout.dpi).max(1);
+            let left = scaled(8, layout.dpi);
+            if layout.show_title() && !icon.is_null() {
+                DrawIconEx(
+                    dc,
+                    left,
+                    (layout.caption - icon_size) / 2,
+                    icon,
+                    icon_size,
+                    icon_size,
+                    0,
+                    null_mut(),
+                    DI_NORMAL,
+                );
+            }
+            let mut text_rect = RECT {
+                left: left + icon_size + scaled(6, layout.dpi),
+                top: 1,
+                right: layout
+                    .button_rect(HTMINBUTTON)
+                    .or_else(|| layout.button_rect(HTMAXBUTTON))
+                    .or_else(|| layout.button_rect(HTCLOSE))
+                    .map_or(layout.width - 1, |rect| rect.left)
+                    - scaled(6, layout.dpi),
+                bottom: layout.caption,
             };
-            fill(dc, rect, background);
-            let pen = CreatePen(
-                PS_SOLID,
-                scaled(1, layout.dpi).max(1),
-                if hot && hit == HTCLOSE {
+            if layout.show_title() && text_rect.right > text_rect.left {
+                DrawTextW(
+                    dc,
+                    title.as_ptr(),
+                    length,
+                    &mut text_rect,
+                    DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX,
+                );
+            }
+            SelectObject(dc, GetStockObject(NULL_BRUSH));
+            for hit in [HTMINBUTTON, HTMAXBUTTON, HTCLOSE] {
+                let Some(rect) = layout.button_rect(hit) else {
+                    continue;
+                };
+                let hot = hovered == hit;
+                let background = if hot && hit == HTCLOSE {
+                    CLOSE_HOVER
+                } else if hot && pressed == hit {
+                    PRESSED
+                } else if hot {
+                    HOVER
+                } else {
+                    BACKGROUND
+                };
+                if !self.maximize_button {
+                    fill_rounded(dc, rect, background, scaled(4, layout.dpi));
+                } else {
+                    fill(dc, rect, background);
+                }
+                let foreground = if hot && hit == HTCLOSE {
                     0x00ff_ffff
                 } else {
                     TEXT
-                },
-            );
-            if pen.is_null() {
-                continue;
-            }
-            let old = SelectObject(dc, pen);
-            let size = scaled(9, layout.dpi).max(5);
-            let x = (rect.left + rect.right - size) / 2;
-            let y = (rect.top + rect.bottom - size) / 2;
-            match hit {
-                HTMINBUTTON => line(dc, x, y + size / 2, x + size, y + size / 2),
-                HTMAXBUTTON if IsZoomed(host) != 0 => {
-                    let offset = scaled(3, layout.dpi);
-                    Rectangle(dc, x + offset, y, x + size, y + size - offset);
-                    fill(
+                };
+                if hit != HTMAXBUTTON
+                    && crate::ui_theme::draw_caption_button_icon(
                         dc,
-                        RECT {
-                            left: x,
-                            top: y + offset,
-                            right: x + size - offset,
-                            bottom: y + size,
-                        },
-                        background,
-                    );
-                    Rectangle(dc, x, y + offset, x + size - offset, y + size);
+                        rect,
+                        layout.dpi,
+                        foreground,
+                        hit == HTCLOSE,
+                    )
+                {
+                    continue;
                 }
-                HTMAXBUTTON => {
-                    Rectangle(dc, x, y, x + size, y + size);
+                let pen = CreatePen(PS_SOLID, scaled(1, layout.dpi).max(1), foreground);
+                if pen.is_null() {
+                    continue;
                 }
-                _ => {
-                    line(dc, x, y, x + size, y + size);
-                    line(dc, x + size - 1, y, x - 1, y + size);
+                let old = SelectObject(dc, pen);
+                let size = scaled(9, layout.dpi).max(5);
+                let x = (rect.left + rect.right - size) / 2;
+                let y = (rect.top + rect.bottom - size) / 2;
+                match hit {
+                    HTMINBUTTON => line(dc, x, y + size / 2, x + size, y + size / 2),
+                    HTMAXBUTTON if maximized => {
+                        let offset = scaled(3, layout.dpi);
+                        Rectangle(dc, x + offset, y, x + size, y + size - offset);
+                        fill(
+                            dc,
+                            RECT {
+                                left: x,
+                                top: y + offset,
+                                right: x + size - offset,
+                                bottom: y + size,
+                            },
+                            background,
+                        );
+                        Rectangle(dc, x, y + offset, x + size - offset, y + size);
+                    }
+                    HTMAXBUTTON => {
+                        Rectangle(dc, x, y, x + size, y + size);
+                    }
+                    _ => {
+                        line(dc, x, y, x + size, y + size);
+                        line(dc, x + size - 1, y, x - 1, y + size);
+                    }
                 }
+                SelectObject(dc, old);
+                DeleteObject(pen);
             }
-            SelectObject(dc, old);
-            DeleteObject(pen);
+        };
+        // 标题区采用零原点缓冲，避免中间填底闪烁及 GDI+ 原点偏移
+        let presented = crate::ui_theme::PaintBuffer::new(dc, caption).is_some_and(|buffer| {
+            draw_caption(buffer.dc());
+            buffer.present(dc)
+        });
+        if !presented {
+            draw_caption(dc);
+        }
+        for border in [
+            RECT {
+                left: 0,
+                top: layout.caption,
+                right: 1,
+                bottom: layout.height,
+            },
+            RECT {
+                left: layout.width - 1,
+                top: layout.caption,
+                right: layout.width,
+                bottom: layout.height,
+            },
+            RECT {
+                left: 0,
+                top: layout.height - 1,
+                right: layout.width,
+                bottom: layout.height,
+            },
+        ] {
+            fill(dc, border, BORDER);
         }
         RestoreDC(dc, saved);
         if !font.is_null() {
@@ -325,7 +482,8 @@ impl ContainerFrame {
         if GetCursorPos(&mut point) == 0 {
             return HTNOWHERE;
         }
-        Layout::read(host).map_or(HTNOWHERE, |layout| layout.hit(host, point))
+        Layout::read(host, self.minimize_button, self.maximize_button)
+            .map_or(HTNOWHERE, |layout| layout.hit(host, point))
     }
 
     pub unsafe fn process(
@@ -375,12 +533,15 @@ impl ContainerFrame {
                     x: (lp as u16 as i16) as i32,
                     y: ((lp as u32 >> 16) as u16 as i16) as i32,
                 };
-                return Layout::read(host).map(|layout| layout.hit(host, point) as LRESULT);
+                return Layout::read(host, self.minimize_button, self.maximize_button)
+                    .map(|layout| layout.hit(host, point) as LRESULT);
             }
             WM_GETTITLEBARINFOEX if lp != 0 => {
                 let info = &mut *(lp as *mut TITLEBARINFOEX);
                 if info.cbSize == size_of::<TITLEBARINFOEX>() as u32 {
-                    if let Some(layout) = Layout::read(host) {
+                    if let Some(layout) =
+                        Layout::read(host, self.minimize_button, self.maximize_button)
+                    {
                         info.rcTitleBar = RECT {
                             left: layout.window.left + 1,
                             top: layout.window.top + 1,
@@ -394,7 +555,10 @@ impl ContainerFrame {
                         info.rgstate[4] = 0x8001;
                         info.rgrect[0] = info.rcTitleBar;
                         for (index, hit) in [(2, HTMINBUTTON), (3, HTMAXBUTTON), (5, HTCLOSE)] {
-                            let mut rect = layout.button_rect(hit);
+                            let Some(mut rect) = layout.button_rect(hit) else {
+                                info.rgstate[index] = 0x8001;
+                                continue;
+                            };
                             rect.left += layout.window.left;
                             rect.right += layout.window.left;
                             rect.top += layout.window.top;
@@ -427,7 +591,7 @@ impl ContainerFrame {
                 self.paint(host);
                 return Some(0);
             }
-            WM_NCLBUTTONDOWN | WM_NCLBUTTONDBLCLK if is_button(wp as u32) => {
+            WM_NCLBUTTONDOWN | WM_NCLBUTTONDBLCLK if self.is_button(wp as u32) => {
                 self.pressed.set(wp as u32);
                 self.hover.set(wp as u32);
                 SetCapture(host);

@@ -1,13 +1,14 @@
 use std::mem::size_of;
-use std::ptr::null;
+use std::ptr::{null, null_mut};
 
 use windows_sys::Win32::Foundation::{GetLastError, SetLastError, HWND};
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows_sys::Win32::UI::Controls::{LoadIconMetric, LIM_SMALL};
 use windows_sys::Win32::UI::Shell::{
     Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_SHOWTIP, NIF_TIP, NIM_ADD, NIM_DELETE,
     NIM_SETVERSION, NOTIFYICONDATAW, NOTIFYICONDATAW_0, NOTIFYICON_VERSION_4,
 };
-use windows_sys::Win32::UI::WindowsAndMessaging::{LoadIconW, WM_APP};
+use windows_sys::Win32::UI::WindowsAndMessaging::{DestroyIcon, HICON, WM_APP};
 
 use crate::localization::tr;
 
@@ -15,14 +16,29 @@ pub const CALLBACK_MESSAGE: u32 = WM_APP + 2;
 pub const TRAY_ID: u32 = 1;
 const ICON_RESOURCE: usize = 101;
 
+struct OwnedIcon(HICON);
+
+impl Drop for OwnedIcon {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            unsafe { DestroyIcon(self.0) };
+        }
+    }
+}
+
 pub struct TrayIcon {
     hwnd: HWND,
     added: bool,
+    icon: Option<OwnedIcon>,
 }
 
 impl TrayIcon {
     pub fn new(hwnd: HWND) -> Self {
-        Self { hwnd, added: false }
+        Self {
+            hwnd,
+            added: false,
+            icon: None,
+        }
     }
 
     pub unsafe fn add(&mut self) -> Result<(), String> {
@@ -44,14 +60,23 @@ impl TrayIcon {
                 GetLastError(),
             ));
         }
-        SetLastError(0);
-        let icon = LoadIconW(instance, ICON_RESOURCE as *const u16);
-        if icon.is_null() {
-            return Err(api_error(
+        // 按系统小图标尺寸选取资源，避免默认大图标再次缩小
+        let mut icon = OwnedIcon(null_mut());
+        let result = LoadIconMetric(
+            instance,
+            ICON_RESOURCE as *const u16,
+            LIM_SMALL,
+            &mut icon.0,
+        );
+        if result < 0 || icon.0.is_null() {
+            return Err(format!(
+                "{} (HRESULT 0x{:08X})",
                 tr("无法加载托盘图标", "Cannot load the tray icon"),
-                GetLastError(),
+                result as u32,
             ));
         }
+        let icon_handle = icon.0;
+        self.icon = Some(icon);
 
         let mut tip = [0u16; 128];
         for (destination, character) in tip.iter_mut().zip("Trans".encode_utf16()) {
@@ -60,7 +85,7 @@ impl TrayIcon {
         let data = NOTIFYICONDATAW {
             uFlags: NIF_MESSAGE | NIF_ICON | NIF_TIP | NIF_SHOWTIP,
             uCallbackMessage: CALLBACK_MESSAGE,
-            hIcon: icon,
+            hIcon: icon_handle,
             szTip: tip,
             ..self.identity()
         };
@@ -98,6 +123,7 @@ impl TrayIcon {
             Shell_NotifyIconW(NIM_DELETE, &self.identity());
         }
         self.added = false;
+        self.icon = None;
     }
 
     pub fn is_added(&self) -> bool {

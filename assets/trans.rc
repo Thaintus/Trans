@@ -4,3 +4,5 @@ IDI_TRANS ICON "trans.ico"
 
 201 RCDATA "lucide-focus-LICENSE.txt"
 202 RCDATA "lucide-rotate-cw-LICENSE.txt"
+
+#include "trans-version.rc"

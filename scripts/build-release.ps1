@@ -1,7 +1,15 @@
-﻿[CmdletBinding()]
-param([switch]$AllowOnline)
+[CmdletBinding()]
+param(
+    [switch]$AllowOnline,
+    [ValidateNotNullOrEmpty()][string]$Version
+)
 
 $ErrorActionPreference = 'Stop'
+$versionOptions = @{}
+if ($PSBoundParameters.ContainsKey('Version')) {
+    $versionOptions.Version = $Version
+}
+. (Join-Path $PSScriptRoot 'release-version.ps1')
 
 function Assert-WorkspacePath {
     param(
@@ -75,67 +83,88 @@ $targetTriple = 'x86_64-pc-windows-msvc'
 $buildExe = Assert-WorkspacePath -Candidate (Join-Path $workspaceDir "target\$targetTriple\release\Trans.exe") -Workspace $workspaceDir
 $distDir = Assert-WorkspacePath -Candidate (Join-Path $workspaceDir 'dist') -Workspace $workspaceDir
 
-$previousTargetDir = $env:CARGO_TARGET_DIR
-$previousOffline = $env:CARGO_NET_OFFLINE
-$previousPath = $env:PATH
-try {
-    $cargoCommand = Get-Command 'cargo.exe' -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
-    if ($null -ne $cargoCommand) {
-        $cargoPath = $cargoCommand.Source
-    } else {
-        if ([string]::IsNullOrWhiteSpace($env:USERPROFILE)) {
-            throw '未找到 cargo.exe，且 USERPROFILE 未设置，请安装 Rust MSVC 工具链并加入 PATH'
-        }
-        $cargoBinDir = Join-Path $env:USERPROFILE '.cargo\bin'
-        $cargoPath = Join-Path $cargoBinDir 'cargo.exe'
-        if (-not (Test-Path -LiteralPath $cargoPath -PathType Leaf)) {
-            throw '未找到 cargo.exe，请安装 Rust MSVC 工具链并加入 PATH'
-        }
-        $env:PATH = $cargoBinDir + [System.IO.Path]::PathSeparator + $env:PATH
-    }
-    $env:CARGO_TARGET_DIR = Join-Path $workspaceDir 'target'
-    $env:CARGO_NET_OFFLINE = if ($AllowOnline) { 'false' } else { 'true' }
-    Push-Location -LiteralPath $workspaceDir
-    try {
-        Write-Host '开始构建 Windows x64 Release 单体 EXE'
-        & $cargoPath build --release --locked --target $targetTriple
-        if ($LASTEXITCODE -ne 0) {
-            $buildError = "Cargo 构建失败，退出码：$LASTEXITCODE"
-            if (-not $AllowOnline) {
-                $buildError += '；当前为离线模式，若本机缺少依赖缓存，可使用 -AllowOnline 允许联网后重试'
-            }
-            throw $buildError
-        }
-    } finally {
-        Pop-Location
-    }
+Invoke-TransReleaseVersionTransaction -Workspace $workspaceDir @versionOptions -Publish {
+    param($releaseVersion)
 
-    if (-not (Test-Path -LiteralPath $buildExe -PathType Leaf)) {
-        throw "构建结束后未找到预期 EXE：$buildExe"
+    $previousTargetDir = $env:CARGO_TARGET_DIR
+    $previousOffline = $env:CARGO_NET_OFFLINE
+    $previousPath = $env:PATH
+    try {
+        $cargoCommand = Get-Command 'cargo.exe' -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($null -ne $cargoCommand) {
+            $cargoPath = $cargoCommand.Source
+        } else {
+            if ([string]::IsNullOrWhiteSpace($env:USERPROFILE)) {
+                throw '未找到 cargo.exe，且 USERPROFILE 未设置，请安装 Rust MSVC 工具链并加入 PATH'
+            }
+            $cargoBinDir = Join-Path $env:USERPROFILE '.cargo\bin'
+            $cargoPath = Join-Path $cargoBinDir 'cargo.exe'
+            if (-not (Test-Path -LiteralPath $cargoPath -PathType Leaf)) {
+                throw '未找到 cargo.exe，请安装 Rust MSVC 工具链并加入 PATH'
+            }
+            $env:PATH = $cargoBinDir + [System.IO.Path]::PathSeparator + $env:PATH
+        }
+        $env:CARGO_TARGET_DIR = Join-Path $workspaceDir 'target'
+        $env:CARGO_NET_OFFLINE = if ($AllowOnline) { 'false' } else { 'true' }
+        Push-Location -LiteralPath $workspaceDir
+        try {
+            Write-Host "开始构建 Trans v$releaseVersion Windows x64 Release 单体 EXE"
+            & $cargoPath build --release --locked --target $targetTriple
+            if ($LASTEXITCODE -ne 0) {
+                $buildError = "Cargo 构建失败，退出码：$LASTEXITCODE"
+                if (-not $AllowOnline) {
+                    $buildError += '；当前为离线模式，若本机缺少依赖缓存，可使用 -AllowOnline 允许联网后重试'
+                }
+                throw $buildError
+            }
+        } finally {
+            Pop-Location
+        }
+
+        if (-not (Test-Path -LiteralPath $buildExe -PathType Leaf)) {
+            throw "构建结束后未找到预期 EXE：$buildExe"
+        }
+        $buildItem = Get-Item -LiteralPath $buildExe
+        if ($buildItem.Length -le 0) {
+            throw "构建产物为空：$buildExe"
+        }
+        Assert-X64GuiExecutable -Path $buildExe
+        $versionInfo = [System.Diagnostics.FileVersionInfo]::GetVersionInfo($buildExe)
+        if ($versionInfo.FileVersion -cne $releaseVersion -or $versionInfo.ProductVersion -cne $releaseVersion) {
+            throw "构建产物版本与待发布版本不一致：$releaseVersion"
+        }
+        $sourceHash = (Get-FileHash -LiteralPath $buildExe -Algorithm SHA256).Hash
+        $releaseDir = Assert-WorkspacePath -Candidate (Get-TransReleaseDirectory -DistDirectory $distDir) -Workspace $workspaceDir
+        $distExe = Assert-WorkspacePath -Candidate (Join-Path $releaseDir 'Trans.exe') -Workspace $workspaceDir
+        New-Item -ItemType Directory -Path $distDir -Force | Out-Null
+        $stageDir = Assert-WorkspacePath -Candidate (Join-Path $distDir ('.staging-' + [guid]::NewGuid().ToString('N'))) -Workspace $workspaceDir
+        $stageExe = Join-Path $stageDir 'Trans.exe'
+        New-Item -ItemType Directory -Path $stageDir | Out-Null
+        try {
+            [System.IO.File]::Copy($buildExe, $stageExe, $false)
+            Assert-X64GuiExecutable -Path $stageExe
+            $outputHash = (Get-FileHash -LiteralPath $stageExe -Algorithm SHA256).Hash
+            if ($sourceHash -ne $outputHash) {
+                throw '复制后的 EXE 校验失败'
+            }
+            ($outputHash.ToLowerInvariant() + '  Trans.exe') | Set-Content -LiteralPath (Join-Path $stageDir 'Trans.exe.sha256') -Encoding UTF8
+            [System.IO.Directory]::Move($stageDir, $releaseDir)
+        } finally {
+            if (Test-Path -LiteralPath $stageDir) {
+                $resolvedStage = [System.IO.Path]::GetFullPath($stageDir)
+                $distPrefix = [System.IO.Path]::GetFullPath($distDir).TrimEnd('\', '/') + [System.IO.Path]::DirectorySeparatorChar
+                if (-not $resolvedStage.StartsWith($distPrefix, [System.StringComparison]::OrdinalIgnoreCase)) {
+                    throw "临时发布目录不在 dist 内：$resolvedStage"
+                }
+                Remove-Item -LiteralPath $resolvedStage -Recurse -Force
+            }
+        }
+        Write-Host "已生成：$distExe"
+        Write-Host "版本：$releaseVersion"
+        Write-Host "SHA256：$outputHash"
+    } finally {
+        $env:CARGO_TARGET_DIR = $previousTargetDir
+        $env:CARGO_NET_OFFLINE = $previousOffline
+        $env:PATH = $previousPath
     }
-    $buildItem = Get-Item -LiteralPath $buildExe
-    if ($buildItem.Length -le 0) {
-        throw "构建产物为空：$buildExe"
-    }
-    Assert-X64GuiExecutable -Path $buildExe
-    $sourceHash = (Get-FileHash -LiteralPath $buildExe -Algorithm SHA256).Hash
-    $releaseName = 'release-' + (Get-Date -Format 'yyyyMMdd-HHmmss')
-    $releaseDir = Assert-WorkspacePath -Candidate (Join-Path $distDir $releaseName) -Workspace $workspaceDir
-    $distExe = Assert-WorkspacePath -Candidate (Join-Path $releaseDir 'Trans.exe') -Workspace $workspaceDir
-    $hashPath = Assert-WorkspacePath -Candidate (Join-Path $releaseDir 'Trans.exe.sha256') -Workspace $workspaceDir
-    New-Item -ItemType Directory -Path $distDir -Force | Out-Null
-    New-Item -ItemType Directory -Path $releaseDir | Out-Null
-    [System.IO.File]::Copy($buildExe, $distExe, $false)
-    Assert-X64GuiExecutable -Path $distExe
-    $outputHash = (Get-FileHash -LiteralPath $distExe -Algorithm SHA256).Hash
-    if ($sourceHash -ne $outputHash) {
-        throw '复制后的 EXE 校验失败'
-    }
-    ($outputHash.ToLowerInvariant() + '  Trans.exe') | Set-Content -LiteralPath $hashPath -Encoding UTF8
-    Write-Host "已生成：$distExe"
-    Write-Host "SHA256：$outputHash"
-} finally {
-    $env:CARGO_TARGET_DIR = $previousTargetDir
-    $env:CARGO_NET_OFFLINE = $previousOffline
-    $env:PATH = $previousPath
 }

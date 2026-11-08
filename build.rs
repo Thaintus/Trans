@@ -11,6 +11,7 @@ fn main() {
     println!("cargo:rerun-if-changed=assets/trans.ico");
     println!("cargo:rerun-if-changed=assets/lucide-focus-LICENSE.txt");
     println!("cargo:rerun-if-changed=assets/lucide-rotate-cw-LICENSE.txt");
+    println!("cargo:rerun-if-env-changed=CARGO_PKG_VERSION");
     for variable in [
         "RC",
         "WindowsSdkDir",
@@ -50,6 +51,7 @@ fn main() {
         "resource output path must be absolute"
     );
     let resource_output = out_dir.join("trans.res");
+    write_version_resource(&out_dir);
     let compiler = fs::canonicalize(find_resource_compiler())
         .expect("cannot resolve the Windows resource compiler path");
     let status = Command::new(&compiler)
@@ -57,6 +59,8 @@ fn main() {
         .arg("/nologo")
         .arg("/I")
         .arg(&assets_dir)
+        .arg("/I")
+        .arg(&out_dir)
         .arg("/fo")
         .arg(&resource_output)
         .arg(&resource_script)
@@ -77,6 +81,51 @@ fn main() {
         "cargo:rustc-link-arg=/MANIFESTINPUT:{}",
         manifest_path.display()
     );
+}
+
+fn write_version_resource(out_dir: &Path) {
+    let version = env::var("CARGO_PKG_VERSION").expect("CARGO_PKG_VERSION is not set");
+    let parts: Vec<u16> = version
+        .split('.')
+        .map(|part| part.parse().expect("file version components must fit u16"))
+        .collect();
+    assert_eq!(
+        parts.len(),
+        3,
+        "expected a stable major.minor.patch version"
+    );
+    let resource = format!(
+        r#"1 VERSIONINFO
+FILEVERSION {},{},{},0
+PRODUCTVERSION {},{},{},0
+FILEFLAGSMASK 0x3fL
+FILEFLAGS 0x0L
+FILEOS 0x40004L
+FILETYPE 0x1L
+FILESUBTYPE 0x0L
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904b0"
+        BEGIN
+            VALUE "FileDescription", "Trans\0"
+            VALUE "FileVersion", "{version}\0"
+            VALUE "InternalName", "Trans\0"
+            VALUE "OriginalFilename", "Trans.exe\0"
+            VALUE "ProductName", "Trans\0"
+            VALUE "ProductVersion", "{version}\0"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x0409, 1200
+    END
+END
+"#,
+        parts[0], parts[1], parts[2], parts[0], parts[1], parts[2]
+    );
+    fs::write(out_dir.join("trans-version.rc"), resource)
+        .expect("cannot write the Windows version resource");
 }
 
 fn find_resource_compiler() -> PathBuf {

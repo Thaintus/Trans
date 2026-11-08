@@ -208,10 +208,11 @@ impl PanelState {
 
     unsafe fn request_layout(&self) {
         let hwnd = self.hwnd.get();
-        if !hwnd.is_null() && !self.notice_pending.replace(true) {
-            if PostMessageW(hwnd, LAYOUT_NOTICE, 0, 0) == 0 {
-                self.notice_pending.set(false);
-            }
+        if !hwnd.is_null()
+            && !self.notice_pending.replace(true)
+            && PostMessageW(hwnd, LAYOUT_NOTICE, 0, 0) == 0
+        {
+            self.notice_pending.set(false);
         }
     }
 
@@ -334,21 +335,21 @@ impl PanelState {
         if saved == 0 {
             return;
         }
-        SelectObject(dc, GetStockObject(DC_PEN));
-        SelectObject(dc, GetStockObject(NULL_BRUSH));
-        SetDCPenColor(dc, ui_theme::BORDER);
         let dpi = self.dpi.get();
         let offset = self.applied_offset.get();
         let right = self.content_width() - 1;
         for (top, bottom) in [(36, 244), (284, 340), (388, 462), (506, 566)] {
-            RoundRect(
+            ui_theme::draw_rounded_surface(
                 dc,
-                1,
-                pixels(top, dpi) - offset,
-                right,
-                pixels(bottom, dpi) - offset,
-                pixels(12, dpi),
-                pixels(12, dpi),
+                &RECT {
+                    left: 1,
+                    top: pixels(top, dpi) - offset,
+                    right,
+                    bottom: pixels(bottom, dpi) - offset,
+                },
+                pixels(6, dpi),
+                ui_theme::BACKGROUND,
+                Some((ui_theme::BORDER, 1)),
             );
         }
         RestoreDC(dc, saved);
@@ -467,7 +468,7 @@ impl SettingsPanel {
                 y,
                 width.max(0),
                 height.max(0),
-                SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOREDRAW | SWP_NOCOPYBITS,
+                SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOREDRAW,
             ) != 0;
             if positioned {
                 self.state.bounds.set(Some(bounds));
@@ -487,6 +488,10 @@ impl SettingsPanel {
 
     pub fn scroll_offset(&self) -> i32 {
         self.state.offset.get()
+    }
+
+    pub fn layout_is_current(&self) -> bool {
+        self.state.applied_offset.get() == self.state.offset.get()
     }
 
     pub fn commit_layout(&self, applied_offset: i32) {
@@ -689,4 +694,77 @@ unsafe extern "system" fn child_proc(
         state.ensure_visible(hwnd);
     }
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // 仅构造内存状态，不注册窗口或访问桌面
+    fn panel() -> SettingsPanel {
+        SettingsPanel {
+            state: Box::new(PanelState {
+                hwnd: Cell::new(null_mut()),
+                parent: null_mut(),
+                dpi: Cell::new(96),
+                bounds: Cell::new(None),
+                width: Cell::new(320),
+                height: Cell::new(200),
+                offset: Cell::new(0),
+                applied_offset: Cell::new(0),
+                wheel_remainder: Cell::new(0),
+                scrollbar_hovered: Cell::new(false),
+                tracking_mouse: Cell::new(false),
+                drag_anchor: Cell::new(None),
+                updating_metrics: Cell::new(false),
+                notice_pending: Cell::new(false),
+            }),
+            _thread: PhantomData,
+        }
+    }
+
+    #[test]
+    fn committed_layout_consumes_an_already_queued_resize_notice() {
+        let panel = panel();
+        panel.state.notice_pending.set(true);
+        panel.state.offset.set(80);
+        assert!(!panel.layout_is_current());
+
+        panel.commit_layout(panel.scroll_offset());
+        assert!(panel.layout_is_current());
+        assert!(panel.state.notice_pending.get());
+    }
+
+    #[test]
+    fn scrolling_after_commit_or_a_stale_commit_still_requires_layout() {
+        let panel = panel();
+        panel.state.offset.set(120);
+        assert!(!panel.layout_is_current());
+        panel.commit_layout(120);
+        assert!(panel.layout_is_current());
+
+        panel.state.offset.set(144);
+        panel.commit_layout(120);
+        assert!(!panel.layout_is_current());
+        panel.commit_layout(144);
+        assert!(panel.layout_is_current());
+    }
+
+    #[test]
+    fn offset_clamped_after_growing_viewport_requires_a_new_commit() {
+        let panel = panel();
+        panel.state.offset.set(300);
+        panel.commit_layout(300);
+        assert!(panel.layout_is_current());
+
+        panel.state.height.set(CONTENT_HEIGHT);
+        panel
+            .state
+            .offset
+            .set(panel.scroll_offset().clamp(0, panel.state.max_offset()));
+        assert_eq!(panel.scroll_offset(), 0);
+        assert!(!panel.layout_is_current());
+        panel.commit_layout(0);
+        assert!(panel.layout_is_current());
+    }
 }

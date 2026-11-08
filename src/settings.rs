@@ -53,7 +53,11 @@ pub struct Settings {
     pub privacy_mode: bool,
     pub restore_hotkey: Option<Hotkey>,
     pub preset_levels: [u8; 5],
+    pub mini_mode: bool,
+    // 内部布局兼容标记，用于区分旧横向迷你几何，并非用户功能开关
+    pub mini_vertical_layout: bool,
     pub main_window: Option<WindowGeometry>,
+    pub mini_window: Option<WindowGeometry>,
 }
 
 impl Default for Settings {
@@ -68,7 +72,10 @@ impl Default for Settings {
             privacy_mode: false,
             restore_hotkey: Some(Hotkey::default()),
             preset_levels: DEFAULT_PRESET_LEVELS,
+            mini_mode: false,
+            mini_vertical_layout: false,
             main_window: None,
+            mini_window: None,
         }
     }
 }
@@ -107,6 +114,16 @@ impl Settings {
             )
             .into());
         }
+        if self
+            .mini_window
+            .is_some_and(|geometry| !geometry.is_valid())
+        {
+            return Err(tr(
+                "迷你窗口位置或大小无效",
+                "Invalid mini window position or size",
+            )
+            .into());
+        }
         if self.self_transparency > MAX_SELF_TRANSPARENCY {
             return Err(tr(
                 &format!("自身透明度必须在 0 到 {MAX_SELF_TRANSPARENCY} 之间"),
@@ -141,9 +158,10 @@ impl Settings {
             )
             .to_owned()
         })?;
+        preserve_invalid_settings(&path, directory)?;
         let (temporary, mut file) = create_temporary_file(directory)?;
         let mut content = format!(
-            "; Trans settings\nlanguage={}\ndefault_container={}\nclose_to_tray={}\nself_transparency={}\nshow_icons={}\nshow_window_name={}\nprivacy_mode={}\nrestore_hotkey={}\npreset_1={}\npreset_2={}\npreset_3={}\npreset_4={}\npreset_5={}\n",
+            "; Trans settings\nlanguage={}\ndefault_container={}\nclose_to_tray={}\nself_transparency={}\nshow_icons={}\nshow_window_name={}\nprivacy_mode={}\nrestore_hotkey={}\npreset_1={}\npreset_2={}\npreset_3={}\npreset_4={}\npreset_5={}\nmini_mode={}\nmini_vertical_layout={}\n",
             self.language.as_str(),
             self.default_container,
             self.close_to_tray,
@@ -157,10 +175,18 @@ impl Settings {
             self.preset_levels[2],
             self.preset_levels[3],
             self.preset_levels[4],
+            self.mini_mode,
+            self.mini_vertical_layout,
         );
         if let Some(geometry) = self.main_window {
             content.push_str(&format!(
                 "main_window={},{},{},{}\n",
+                geometry.x, geometry.y, geometry.width, geometry.height
+            ));
+        }
+        if let Some(geometry) = self.mini_window {
+            content.push_str(&format!(
+                "mini_window={},{},{},{}\n",
                 geometry.x, geometry.y, geometry.width, geometry.height
             ));
         }
@@ -216,6 +242,81 @@ fn settings_path() -> Result<PathBuf, String> {
     Ok(directory.join("Trans").join("settings.ini"))
 }
 
+fn preserve_invalid_settings(path: &Path, directory: &Path) -> Result<(), String> {
+    let content = match fs::read(path) {
+        Ok(content) => content,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(tr(
+                &format!("无法核对原设置文件 {}，已取消保存：{error}", path.display()),
+                &format!(
+                    "Could not inspect the existing settings file {}; saving was cancelled: {error}",
+                    path.display()
+                ),
+            )
+            .to_owned());
+        }
+    };
+    if std::str::from_utf8(&content).is_ok_and(|text| parse_settings(text).is_ok()) {
+        return Ok(());
+    }
+
+    // 读取失败时应用会使用默认值，覆盖损坏配置前先保留原始字节
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_nanos());
+    for _ in 0..16 {
+        let serial = NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed);
+        let recovery = directory.join(format!(
+            "settings.recovery-{}-{timestamp}-{serial}.ini",
+            std::process::id()
+        ));
+        let mut file = match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&recovery)
+        {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                return Err(tr(
+                    &format!(
+                        "无法创建设置恢复副本 {}，原设置未替换：{error}",
+                        recovery.display()
+                    ),
+                    &format!(
+                        "Could not create settings recovery copy {}; the existing settings were not replaced: {error}",
+                        recovery.display()
+                    ),
+                )
+                .to_owned());
+            }
+        };
+        let saved = file.write_all(&content).and_then(|_| file.sync_all());
+        drop(file);
+        if let Err(error) = saved {
+            let _ = fs::remove_file(&recovery);
+            return Err(tr(
+                &format!(
+                    "无法写入设置恢复副本 {}，原设置未替换：{error}",
+                    recovery.display()
+                ),
+                &format!(
+                    "Could not write settings recovery copy {}; the existing settings were not replaced: {error}",
+                    recovery.display()
+                ),
+            )
+            .to_owned());
+        }
+        return Ok(());
+    }
+    Err(tr(
+        "无法创建唯一的设置恢复副本，原设置未替换，请稍后重试",
+        "Could not create a unique settings recovery copy; the existing settings were not replaced. Please try again later",
+    )
+    .to_owned())
+}
+
 fn parse_settings(content: &str) -> Result<Settings, String> {
     let mut settings = Settings::default();
     let mut found_keys = HashSet::new();
@@ -246,6 +347,11 @@ fn parse_settings(content: &str) -> Result<Settings, String> {
         match key {
             // 位置数据损坏时仅放弃窗口布局，不丢弃用户其他设置
             "main_window" => settings.main_window = WindowGeometry::parse(value),
+            "mini_window" => settings.mini_window = WindowGeometry::parse(value),
+            "mini_mode" => settings.mini_mode = parse_bool(value, key, index + 1)?,
+            "mini_vertical_layout" => {
+                settings.mini_vertical_layout = parse_bool(value, key, index + 1)?;
+            }
             "language" => {
                 settings.language = Language::parse(value).map_err(|error| {
                     tr(
@@ -320,6 +426,9 @@ fn known_key(key: &str) -> bool {
         key,
         "language"
             | "main_window"
+            | "mini_window"
+            | "mini_mode"
+            | "mini_vertical_layout"
             | "default_container"
             | "close_to_tray"
             | "self_transparency"
@@ -383,6 +492,80 @@ fn create_temporary_file(directory: &Path) -> Result<(PathBuf, File), String> {
 mod tests {
     use super::*;
     use windows_sys::Win32::UI::Input::KeyboardAndMouse::{MOD_ALT, MOD_CONTROL, VK_F1};
+
+    struct SettingsDirectory(PathBuf);
+
+    impl SettingsDirectory {
+        fn new() -> Self {
+            let timestamp = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let serial = NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed);
+            let directory = env::temp_dir().join(format!(
+                "trans-settings-recovery-{}-{timestamp}-{serial}",
+                std::process::id()
+            ));
+            fs::create_dir(&directory).unwrap();
+            Self(directory)
+        }
+    }
+
+    impl Drop for SettingsDirectory {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn invalid_settings_are_preserved_byte_for_byte_before_replacement() {
+        for original in [
+            b"language=fr\r\npreset_1=17\r\n".as_slice(),
+            b"language=zh\n\xff\xfe".as_slice(),
+        ] {
+            let directory = SettingsDirectory::new();
+            let path = directory.0.join("settings.ini");
+            fs::write(&path, original).unwrap();
+            preserve_invalid_settings(&path, &directory.0).unwrap();
+            assert_eq!(fs::read(&path).unwrap(), original);
+            let copies: Vec<_> = fs::read_dir(&directory.0)
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .filter(|entry| entry != &path)
+                .collect();
+            assert_eq!(copies.len(), 1);
+            assert!(copies[0]
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("settings.recovery-"));
+            fs::write(&path, b"language=zh\n").unwrap();
+            assert_eq!(fs::read(&copies[0]).unwrap(), original);
+        }
+    }
+
+    #[test]
+    fn absent_and_valid_settings_do_not_create_recovery_copies() {
+        let directory = SettingsDirectory::new();
+        let path = directory.0.join("settings.ini");
+        preserve_invalid_settings(&path, &directory.0).unwrap();
+        assert_eq!(fs::read_dir(&directory.0).unwrap().count(), 0);
+        let original = b"\xef\xbb\xbflanguage=en\r\nshow_icons=true\r\n";
+        fs::write(&path, original).unwrap();
+        preserve_invalid_settings(&path, &directory.0).unwrap();
+        assert_eq!(fs::read_dir(&directory.0).unwrap().count(), 1);
+        assert_eq!(fs::read(&path).unwrap(), original);
+    }
+
+    #[test]
+    fn unreadable_settings_abort_before_creating_a_recovery_copy() {
+        let directory = SettingsDirectory::new();
+        let path = directory.0.join("settings.ini");
+        fs::create_dir(&path).unwrap();
+        assert!(preserve_invalid_settings(&path, &directory.0).is_err());
+        assert!(path.is_dir());
+        assert_eq!(fs::read_dir(&directory.0).unwrap().count(), 1);
+    }
 
     #[test]
     fn empty_configuration_uses_chinese_and_existing_defaults() {

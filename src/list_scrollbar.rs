@@ -32,6 +32,7 @@ struct ScrollGeometry {
 }
 
 struct ScrollState {
+    show_scrollbars: bool,
     alive: Cell<bool>,
     redraw_enabled: Cell<bool>,
     painting: Cell<bool>,
@@ -185,7 +186,8 @@ impl ScrollState {
     }
 
     unsafe fn paint_if_needed(&self, hwnd: HWND, force: bool) {
-        if !self.alive.get()
+        if !self.show_scrollbars
+            || !self.alive.get()
             || !self.redraw_enabled.get()
             || IsWindowVisible(hwnd) == 0
             || self.painting.replace(true)
@@ -339,11 +341,31 @@ impl ScrollState {
 }
 
 pub unsafe fn install(hwnd: HWND) -> bool {
+    install_with_visibility(hwnd, true)
+}
+
+pub unsafe fn install_without_bars(hwnd: HWND) -> bool {
+    if !install_with_visibility(hwnd, false) {
+        return false;
+    }
+    SetWindowPos(
+        hwnd,
+        std::ptr::null_mut(),
+        0,
+        0,
+        0,
+        0,
+        SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+    ) != 0
+}
+
+unsafe fn install_with_visibility(hwnd: HWND, show_scrollbars: bool) -> bool {
     let mut existing = 0usize;
     if GetWindowSubclass(hwnd, Some(scrollbar_proc), SUBCLASS_ID, &mut existing) != 0 {
         return true;
     }
     let state = Rc::new(ScrollState {
+        show_scrollbars,
         alive: Cell::new(true),
         redraw_enabled: Cell::new(true),
         painting: Cell::new(false),
@@ -374,6 +396,25 @@ unsafe extern "system" fn scrollbar_proc(
     Rc::increment_strong_count(raw);
     let state = Rc::from_raw(raw);
     match message {
+        WM_NCCALCSIZE if !state.show_scrollbars && lparam != 0 => {
+            // 保留原生滚动范围，让客户区占满列表，不为滚动条留下非客户区
+            return 0;
+        }
+        WM_NCHITTEST if !state.show_scrollbars => {
+            let hit = DefSubclassProc(hwnd, message, wparam, lparam);
+            return if hit == HTVSCROLL as isize || hit == HTHSCROLL as isize {
+                HTCLIENT as isize
+            } else {
+                hit
+            };
+        }
+        WM_WINDOWPOSCHANGING if lparam != 0 => {
+            crate::list_layout::prepare_resize(
+                hwnd,
+                &*(lparam as *const WINDOWPOS),
+                state.show_scrollbars,
+            );
+        }
         WM_NCDESTROY => {
             state.alive.set(false);
             state.drag_anchor.set(None);
@@ -388,7 +429,7 @@ unsafe extern "system" fn scrollbar_proc(
             }
         }
         WM_NCPAINT => {
-            // 列表没有原生边框，仅替换实际存在的非客户区纵向滚动条
+            // 普通列表自绘纵向滚动条，迷你列表不绘制非客户区
             state.paint(hwnd);
             return 0;
         }

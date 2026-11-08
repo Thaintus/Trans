@@ -4,6 +4,9 @@ use std::mem::{size_of, zeroed};
 use std::ptr::{null, null_mut};
 
 use windows_sys::Win32::Foundation::*;
+use windows_sys::Win32::Graphics::Dwm::{
+    DwmSetWindowAttribute, DWMNCRP_DISABLED, DWMWA_NCRENDERING_POLICY,
+};
 use windows_sys::Win32::Graphics::Gdi::*;
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::System::SystemServices::{
@@ -29,6 +32,7 @@ use crate::tray::{self, TrayIcon};
 use crate::ui_theme::{self, ButtonStyle, ACCENT, MUTED, TEXT};
 use crate::window_control::{self, ChangedWindowInfo, WindowController, WindowInfo};
 use crate::window_events::WindowEvents;
+use crate::window_redraw::{position_affects_surface, WindowRedraw};
 use crate::window_search::{display_title, filter_windows};
 
 const CLASS_NAME: &str = "Trans.MainWindow.1";
@@ -65,6 +69,9 @@ const EVENT_TARGET_ACTIVITY: usize = 27;
 const EVENT_ESCAPE: usize = 28;
 const EVENT_TOPMOST_COMPLETED: usize = 29;
 const EVENT_ABOUT_LINK: usize = 30;
+const EVENT_MINI_SELECT: usize = 31;
+const EVENT_MINI_SLIDER: usize = 32;
+const EVENT_MINI_ACTIVATE: usize = 33;
 const HOTKEY_RESTORE: i32 = 1;
 const TIMER_TARGET_ACTIVITY: usize = 2;
 const ICON_RESOURCE: usize = 101;
@@ -74,6 +81,7 @@ const ID_REFRESH: i32 = 102;
 const ID_TARGET: i32 = 103;
 const ID_VALUE: i32 = 105;
 const ID_SLIDER: i32 = 106;
+const ID_MINI_SLIDER: i32 = 107;
 const ID_PRESET: i32 = 110;
 const ID_RESTORE: i32 = 120;
 const ID_RESTORE_ALL: i32 = 121;
@@ -84,6 +92,11 @@ const ID_CHANGED_LIST: i32 = 128;
 const ID_SETTINGS: i32 = 130;
 const ID_SELF_LABEL: i32 = 131;
 const ID_SELF_SLIDER: i32 = 132;
+const ID_MINI_MODE: i32 = 133;
+const ID_MINI_LIST: i32 = 134;
+const ID_MINI_BACK: i32 = 135;
+const ID_MINI_TITLE: i32 = 136;
+const ID_MINI_OPEN: i32 = 137;
 const ID_SETTINGS_TITLE: i32 = 140;
 const ID_SETTINGS_BACK: i32 = 141;
 const ID_CLOSE_TO_TRAY: i32 = 142;
@@ -111,8 +124,6 @@ const ID_PRESET_LABEL: i32 = 170;
 const ID_PRESET_INPUT: i32 = 180;
 const MENU_RESTORE_WINDOW: u32 = 200;
 const MENU_OPEN: u32 = 201;
-const MENU_SETTINGS: u32 = 202;
-const MENU_RESTORE_ALL: u32 = 203;
 const MENU_EXIT: u32 = 204;
 const MENU_HIDE_TASKBAR: u32 = 205;
 const MENU_SHOW_TASKBAR: u32 = 206;
@@ -120,17 +131,32 @@ const MENU_ENABLE_CONTAINER: u32 = 207;
 const MENU_DISABLE_CONTAINER: u32 = 208;
 const MENU_TOPMOST_WINDOW: u32 = 209;
 const MENU_CANCEL_TOPMOST: u32 = 210;
+const MENU_TOGGLE_MODE: u32 = 211;
 // windows-sys 未导出该别名，Windows SDK 将 TBM_GETPOS 定义为 WM_USER
 const TBM_GETPOS: u32 = WM_USER;
 const WIDTH: i32 = 340;
 const HEIGHT: i32 = 364;
-const MIN_WIDTH: i32 = 320;
+const MIN_WIDTH: i32 = 305;
+const MINI_WIDTH: i32 = 168;
+const MINI_MIN_WIDTH: i32 = 40;
+const MINI_HEIGHT: i32 = 340;
+const MINI_MIN_HEIGHT: i32 = 150;
+const MINI_DETAIL_TITLE_MIN_HEIGHT: i32 = 190;
+const MINI_DETAIL_TITLE_MIN_WIDTH: i32 = 100;
+const SELF_SLIDER_WIDTH: i32 = 88;
+const MINI_SELF_HORIZONTAL_MIN_WIDTH: i32 = SELF_SLIDER_WIDTH + 36;
+const PICKER_BUTTON_SIZE: i32 = 32;
+const MINI_ACTION_BUTTON_SIZE: i32 = 24;
 const MIN_MAIN_BODY_HEIGHT: i32 = 262;
 const DEFAULT_HEADER_HEIGHT: i32 = 18;
 const MAIN_STYLE: u32 = (WS_OVERLAPPEDWINDOW & !WS_MAXIMIZEBOX) | WS_CLIPCHILDREN;
 const BUTTON_SELECTED_PROP: &str = "Trans.Ui.Selected";
 
 thread_local! {
+    static MAIN_FRAME: crate::container_frame::ContainerFrame = const { crate::container_frame::ContainerFrame::without_maximize() };
+    static MINI_FRAME: crate::container_frame::ContainerFrame = const { crate::container_frame::ContainerFrame::close_only() };
+    // 同步窗口消息可在 App 已借用时读取模式，避免尺寸切换重入
+    static MINI_MODE: Cell<bool> = const { Cell::new(false) };
     static DEFERRED_EVENTS: RefCell<VecDeque<(HWND, usize, isize)>> = const { RefCell::new(VecDeque::new()) };
     static INTERACTION_VERSION: Cell<usize> = const { Cell::new(0) };
     static PICKER_VERSION: Cell<usize> = const { Cell::new(0) };
@@ -142,6 +168,7 @@ thread_local! {
     static COMBO_UPDATING: Cell<bool> = const { Cell::new(false) };
     static LAYOUT_PENDING: Cell<bool> = const { Cell::new(false) };
     static LAYOUT_IN_PROGRESS: Cell<bool> = const { Cell::new(false) };
+    static MAIN_REDRAW: WindowRedraw = const { WindowRedraw::new() };
     static LIST_COLUMNS_SIZING: Cell<bool> = const { Cell::new(false) };
     static LIST_COLUMN_WEIGHTS: Cell<[u32; 3]> = const { Cell::new([3, 1, 1]) };
     static LIST_COLUMN_REQUEST: Cell<Option<(usize, i32)>> = const { Cell::new(None) };
@@ -251,6 +278,7 @@ unsafe fn release_picker_capture(hwnd: HWND) {
 struct DeferredEventFlush {
     hwnd: HWND,
     state: *const RefCell<App>,
+    flush_redraw: bool,
 }
 
 struct LayoutScope(bool);
@@ -290,6 +318,10 @@ impl Drop for DeferredEventFlush {
                 }
                 *events = remaining;
             });
+            // 重投队列后再补绘，绘制回调不能重入队列或应用状态借用
+            if valid && self.flush_redraw {
+                flush_main_redraw(self.hwnd, self.state);
+            }
         }
     }
 }
@@ -307,6 +339,87 @@ unsafe fn read_text(hwnd: HWND) -> String {
 
 fn pixel(value: i32, dpi: u32) -> i32 {
     (value * dpi as i32 + 48) / 96
+}
+
+fn main_footer_bounds(client: RECT, dpi: u32) -> [(i32, [i32; 4]); 5] {
+    // 直接锚定物理客户区，避免先取整逻辑宽高再缩放造成边距跳变
+    let button_side = pixel(32, dpi);
+    let button_top = client.bottom - pixel(5, dpi) - button_side;
+    let right = client.right - pixel(12, dpi);
+    let exit_width = pixel(86, dpi);
+    let label_width = pixel(22, dpi);
+    let label_height = pixel(14, dpi);
+    let label_left = right - label_width;
+    let slider_width = pixel(SELF_SLIDER_WIDTH, dpi);
+    let slider_height = pixel(26, dpi);
+    [
+        (
+            ID_SETTINGS,
+            [
+                client.left + pixel(12, dpi),
+                button_top,
+                button_side,
+                button_side,
+            ],
+        ),
+        (
+            ID_MINI_MODE,
+            [
+                client.left + pixel(50, dpi),
+                button_top,
+                button_side,
+                button_side,
+            ],
+        ),
+        (
+            ID_EXIT,
+            [right - exit_width, button_top, exit_width, button_side],
+        ),
+        (
+            ID_SELF_LABEL,
+            [
+                label_left,
+                client.bottom - pixel(14, dpi) - label_height,
+                label_width,
+                label_height,
+            ],
+        ),
+        (
+            ID_SELF_SLIDER,
+            [
+                label_left - slider_width,
+                client.bottom - pixel(8, dpi) - slider_height,
+                slider_width,
+                slider_height,
+            ],
+        ),
+    ]
+}
+
+fn mini_footer_bounds(client: RECT, dpi: u32) -> [(i32, [i32; 4]); 3] {
+    let button_side = pixel(MINI_ACTION_BUTTON_SIZE, dpi);
+    let bottom = client.bottom - pixel(4, dpi);
+    let show_slider = client.right - client.left >= pixel(MINI_SELF_HORIZONTAL_MIN_WIDTH, dpi);
+    let button_left = if show_slider {
+        client.left + pixel(4, dpi)
+    } else {
+        client.left + (client.right - client.left - button_side) / 2
+    };
+    let button = [button_left, bottom - button_side, button_side, button_side];
+    let slider_width = pixel(SELF_SLIDER_WIDTH, dpi);
+    [
+        (ID_MINI_BACK, button),
+        (ID_MINI_MODE, button),
+        (
+            ID_SELF_SLIDER,
+            [
+                client.right - pixel(4, dpi) - slider_width,
+                bottom - button_side,
+                slider_width,
+                button_side,
+            ],
+        ),
+    ]
 }
 
 unsafe fn main_window_active(hwnd: HWND) -> bool {
@@ -329,8 +442,22 @@ unsafe fn list_header_height(hwnd: HWND, dpi: u32) -> i32 {
 }
 
 unsafe fn minimum_client_height(hwnd: HWND, dpi: u32) -> i32 {
+    if MINI_MODE.with(Cell::get) {
+        return pixel(MINI_MIN_HEIGHT, dpi);
+    }
     // 两个页面共用主界面最小尺寸，设置内容在中间区域滚动
     pixel(MIN_MAIN_BODY_HEIGHT, dpi) + list_header_height(hwnd, dpi)
+}
+
+fn minimum_client_width(dpi: u32) -> i32 {
+    pixel(
+        if MINI_MODE.with(Cell::get) {
+            MINI_MIN_WIDTH
+        } else {
+            MIN_WIDTH
+        },
+        dpi,
+    )
 }
 
 fn settings_body_control(id: i32) -> bool {
@@ -366,6 +493,11 @@ fn control_caption(id: i32) -> Option<&'static str> {
         ID_TARGET => tr("未选择窗口", "No selection"),
         ID_TOPMOST => tr("置顶", "On top"),
         ID_SHOW_WINDOW_NAME => tr("显示名称", "Show name"),
+        ID_MINI_MODE => tr("迷你模式", "Mini mode"),
+        ID_MINI_SLIDER => tr("透明度（上拉增加）", "Transparency (up to increase)"),
+        ID_SELF_SLIDER => tr("Trans 自身透明度", "Trans window transparency"),
+        ID_MINI_BACK => tr("返回项目列表", "Back to windows"),
+        ID_MINI_OPEN => tr("打开该应用窗口", "Open this app window"),
         5 => tr("透明度", "Transparency"),
         ID_RESTORE => tr("恢复当前", "Restore current"),
         ID_RESTORE_ALL | ID_HOTKEY_LABEL => tr("恢复全部", "Restore all"),
@@ -392,6 +524,10 @@ fn control_caption(id: i32) -> Option<&'static str> {
 
 unsafe fn set_button_selected(hwnd: HWND, selected: bool) {
     let key = wide(BUTTON_SELECTED_PROP);
+    let current = !GetPropW(hwnd, key.as_ptr()).is_null();
+    if current == selected {
+        return;
+    }
     if selected {
         SetPropW(hwnd, key.as_ptr(), 1usize as HANDLE);
     } else {
@@ -420,30 +556,36 @@ unsafe fn paint_chrome(hwnd: HWND) {
 
 unsafe fn draw_chrome(hwnd: HWND, dc: HDC, rect: &RECT) {
     FillRect(dc, rect, GetStockObject(WHITE_BRUSH));
+    if MINI_MODE.with(Cell::get) {
+        return;
+    }
     let saved = SaveDC(dc);
     if saved == 0 {
         return;
     }
     let dpi = GetDpiForWindow(hwnd).max(96);
-    let width = rect.right * 96 / dpi as i32;
-    let height = rect.bottom * 96 / dpi as i32;
     SelectObject(dc, GetStockObject(DC_PEN));
     SelectObject(dc, GetStockObject(NULL_BRUSH));
     SetDCPenColor(dc, ui_theme::BORDER);
-    MoveToEx(dc, pixel(12, dpi), pixel(height - 40, dpi), null_mut());
-    LineTo(dc, pixel(width - 12, dpi), pixel(height - 40, dpi));
+    let footer_line = rect.bottom - pixel(40, dpi);
+    let content_right = rect.right - pixel(12, dpi);
+    MoveToEx(dc, pixel(12, dpi), footer_line, null_mut());
+    LineTo(dc, content_right, footer_line);
     if IsWindowVisible(GetDlgItem(hwnd, ID_SETTINGS_TITLE)) != 0 {
         MoveToEx(dc, pixel(12, dpi), pixel(48, dpi), null_mut());
-        LineTo(dc, pixel(width - 12, dpi), pixel(48, dpi));
+        LineTo(dc, content_right, pixel(48, dpi));
     } else {
-        RoundRect(
+        ui_theme::draw_rounded_surface(
             dc,
-            pixel(12, dpi),
-            pixel(215, dpi),
-            pixel(width - 12, dpi),
-            pixel(height - 45, dpi),
-            pixel(8, dpi),
-            pixel(8, dpi),
+            &RECT {
+                left: pixel(12, dpi),
+                top: pixel(215, dpi),
+                right: rect.right - pixel(12, dpi),
+                bottom: rect.bottom - pixel(45, dpi),
+            },
+            pixel(4, dpi),
+            ui_theme::BACKGROUND,
+            Some((ui_theme::BORDER, 1)),
         );
     }
     RestoreDC(dc, saved);
@@ -529,7 +671,93 @@ fn screen_point(value: usize) -> POINT {
     }
 }
 
+unsafe fn main_resize_hit(hwnd: HWND, point: POINT) -> Option<LRESULT> {
+    if IsIconic(hwnd) != 0 || IsZoomed(hwnd) != 0 {
+        return None;
+    }
+    let mut bounds: RECT = zeroed();
+    if GetWindowRect(hwnd, &mut bounds) == 0
+        || point.x < bounds.left
+        || point.x >= bounds.right
+        || point.y < bounds.top
+        || point.y >= bounds.bottom
+    {
+        return None;
+    }
+    // 平面细边框保留足够的缩放命中范围，不占用按钮或内容布局
+    let edge = pixel(5, GetDpiForWindow(hwnd).max(96));
+    let left = point.x < bounds.left + edge;
+    let right = point.x >= bounds.right - edge;
+    let top = point.y < bounds.top + edge;
+    let bottom = point.y >= bounds.bottom - edge;
+    let hit = match (left, right, top, bottom) {
+        (true, _, true, _) => HTTOPLEFT,
+        (_, true, true, _) => HTTOPRIGHT,
+        (true, _, _, true) => HTBOTTOMLEFT,
+        (_, true, _, true) => HTBOTTOMRIGHT,
+        (true, _, _, _) => HTLEFT,
+        (_, true, _, _) => HTRIGHT,
+        (_, _, true, _) => HTTOP,
+        (_, _, _, true) => HTBOTTOM,
+        _ => return None,
+    };
+    Some(hit as LRESULT)
+}
+
+unsafe fn vertical_mini_geometry(
+    mut geometry: WindowGeometry,
+    dpi: u32,
+    already_vertical: bool,
+) -> WindowGeometry {
+    if !already_vertical {
+        // 旧版迷你窗口保留屏幕位置，按目标显示器缩放换成竖向默认尺寸
+        let mut bounds = RECT {
+            right: pixel(MINI_WIDTH, dpi),
+            bottom: pixel(MINI_HEIGHT, dpi),
+            ..zeroed()
+        };
+        crate::container_frame::expand_client(&mut bounds, dpi);
+        geometry.width = bounds.right - bounds.left;
+        geometry.height = bounds.bottom - bounds.top;
+    }
+    geometry
+}
+
 unsafe fn in_transparency_controls(parent: HWND, point: POINT) -> bool {
+    let padding = pixel(4, GetDpiForWindow(parent).max(96));
+    let self_slider = GetDlgItem(parent, ID_SELF_SLIDER);
+    let mut bounds: RECT = zeroed();
+    if IsWindowVisible(self_slider) != 0 && GetWindowRect(self_slider, &mut bounds) != 0 {
+        let mut origin = POINT {
+            x: bounds.left,
+            y: bounds.top,
+        };
+        if ScreenToClient(parent, &mut origin) != 0
+            && point.x >= origin.x - padding
+            && point.x < origin.x + bounds.right - bounds.left + padding
+            && point.y >= origin.y - padding
+            && point.y < origin.y + bounds.bottom - bounds.top + padding
+        {
+            return true;
+        }
+    }
+    if MINI_MODE.with(Cell::get) {
+        let slider = GetDlgItem(parent, ID_MINI_SLIDER);
+        let mut bounds: RECT = zeroed();
+        if IsWindowVisible(slider) == 0 || GetWindowRect(slider, &mut bounds) == 0 {
+            return false;
+        }
+        let mut origin = POINT {
+            x: bounds.left,
+            y: bounds.top,
+        };
+        if ScreenToClient(parent, &mut origin) == 0 {
+            return false;
+        }
+        let padding = pixel(4, GetDpiForWindow(parent).max(96));
+        return point.y >= origin.y - padding
+            && point.y < origin.y + bounds.bottom - bounds.top + padding;
+    }
     let value = GetDlgItem(parent, ID_VALUE);
     let restore = GetDlgItem(parent, ID_RESTORE_ALL);
     if value.is_null()
@@ -581,14 +809,6 @@ enum PopupRequest {
     },
 }
 
-struct PopupMenu(HMENU);
-
-impl Drop for PopupMenu {
-    fn drop(&mut self) {
-        unsafe { DestroyMenu(self.0) };
-    }
-}
-
 unsafe fn show_popup(hwnd: HWND, request: &PopupRequest) -> Result<u32, String> {
     let (items, point) = match request {
         PopupRequest::Window {
@@ -600,15 +820,9 @@ unsafe fn show_popup(hwnd: HWND, request: &PopupRequest) -> Result<u32, String> 
         } => (
             vec![
                 if *container_mode {
-                    (
-                        MENU_DISABLE_CONTAINER,
-                        tr("取消独立容器", "Disable container"),
-                    )
+                    (MENU_DISABLE_CONTAINER, tr("取消容器", "Disable container"))
                 } else {
-                    (
-                        MENU_ENABLE_CONTAINER,
-                        tr("启用独立容器", "Enable container"),
-                    )
+                    (MENU_ENABLE_CONTAINER, tr("启用容器", "Enable container"))
                 },
                 if *topmost == Some(true) {
                     (MENU_CANCEL_TOPMOST, tr("取消置顶", "Cancel always on top"))
@@ -626,10 +840,8 @@ unsafe fn show_popup(hwnd: HWND, request: &PopupRequest) -> Result<u32, String> 
         ),
         PopupRequest::Tray { point } => (
             vec![
-                (MENU_OPEN, tr("打开 Trans", "Open Trans")),
-                (MENU_SETTINGS, tr("设置", "Settings")),
-                (MENU_RESTORE_ALL, tr("恢复全部窗口", "Restore all windows")),
-                (0, ""),
+                (MENU_OPEN, tr("打开", "Open")),
+                (MENU_TOGGLE_MODE, tr("切换", "Switch")),
                 (MENU_EXIT, tr("退出", "Exit")),
             ],
             *point,
@@ -660,48 +872,7 @@ unsafe fn show_popup(hwnd: HWND, request: &PopupRequest) -> Result<u32, String> 
         ];
         return compact_menu::show(hwnd, &items, point, &disabled, &icons);
     }
-    let menu = CreatePopupMenu();
-    if menu.is_null() {
-        return Err(format!(
-            "{} {}",
-            tr(
-                "无法创建菜单，Windows 错误码",
-                "Cannot create the menu; Windows error"
-            ),
-            GetLastError()
-        ));
-    }
-    let _menu = PopupMenu(menu);
-    for (id, label) in items {
-        if AppendMenuW(
-            menu,
-            if id == 0 { MF_SEPARATOR } else { MF_STRING },
-            id as usize,
-            wide(label).as_ptr(),
-        ) == 0
-        {
-            return Err(format!(
-                "{} {}",
-                tr(
-                    "无法创建菜单项，Windows 错误码",
-                    "Cannot create the menu item; Windows error"
-                ),
-                GetLastError()
-            ));
-        }
-    }
-    SetForegroundWindow(hwnd);
-    let command = TrackPopupMenuEx(
-        menu,
-        TPM_RETURNCMD | TPM_NONOTIFY | TPM_RIGHTBUTTON,
-        point.x,
-        point.y,
-        hwnd,
-        null(),
-    );
-    // 托盘菜单结束后投递空消息，让系统正确关闭菜单焦点
-    PostMessageW(hwnd, WM_NULL, 0, 0);
-    Ok(command as u32)
+    compact_menu::show(hwnd, &items, point, &[], &[])
 }
 
 unsafe fn set_list_cell(list: HWND, row: i32, column: i32, value: &str) {
@@ -804,6 +975,7 @@ unsafe fn fit_list_columns(list: HWND) {
     let header = SendMessageW(list, LVM_GETHEADER, 0, 0) as HWND;
     if header.is_null()
         || SendMessageW(header, HDM_GETITEMCOUNT, 0, 0) != 3
+        || crate::list_layout::is_preparing(list)
         || LIST_COLUMNS_SIZING.with(|sizing| sizing.replace(true))
     {
         return;
@@ -818,8 +990,9 @@ unsafe fn fit_list_columns(list: HWND) {
         if width <= 0 {
             break;
         }
+        let capacity = crate::list_layout::report_column_capacity(list, width);
         let widths = proportional_list_columns(
-            width,
+            capacity,
             GetDpiForWindow(list).max(96),
             LIST_COLUMN_WEIGHTS.with(Cell::get),
         );
@@ -840,8 +1013,14 @@ unsafe fn fit_list_columns(list: HWND) {
             ShowScrollBar(list, SB_HORZ, 0);
         }
         let mut updated: RECT = zeroed();
-        GetClientRect(list, &mut updated);
-        if updated.right - updated.left == width {
+        if GetClientRect(list, &mut updated) == 0 {
+            break;
+        }
+        let updated_width = updated.right - updated.left;
+        // 隐藏横滚也会改变可见行数，宽度不变时仍需复核纵滚预留
+        if updated_width == width
+            && crate::list_layout::report_column_capacity(list, updated_width) == capacity
+        {
             break;
         }
     }
@@ -867,21 +1046,53 @@ unsafe fn queue_layout(hwnd: HWND) {
 unsafe fn layout_window(hwnd: HWND, state: *const RefCell<App>) {
     if !state.is_null() {
         if let Ok(mut app) = (*state).try_borrow_mut() {
-            if !app.exiting {
-                app.layout();
+            if app.exiting {
+                return;
             }
+            app.layout();
+            // 即使尺寸缓存命中，窗口表面仍可能因边框变化而失效
+            MAIN_REDRAW.with(WindowRedraw::request);
             return;
         }
     }
     queue_layout(hwnd);
 }
 
+unsafe fn flush_main_redraw(hwnd: HWND, state: *const RefCell<App>) {
+    if hwnd.is_null()
+        || state.is_null()
+        || LAYOUT_PENDING.with(Cell::get)
+        || LAYOUT_IN_PROGRESS.with(Cell::get)
+    {
+        return;
+    }
+    let Ok(app) = (*state).try_borrow() else {
+        return;
+    };
+    let exiting = app.exiting;
+    drop(app);
+    if exiting {
+        MAIN_REDRAW.with(WindowRedraw::clear);
+        return;
+    }
+    if IsIconic(hwnd) != 0 || IsWindowVisible(hwnd) == 0 {
+        return;
+    }
+    MAIN_REDRAW.with(|redraw| {
+        let painted = redraw.flush(|flags| RedrawWindow(hwnd, null(), null_mut(), flags) != 0);
+        // 同步绘制期间新增的请求留到下一轮，不递归绘制或在失败时忙重试
+        if painted && redraw.pending() {
+            queue_layout(hwnd);
+        }
+    });
+}
+
 unsafe fn position_controls(positions: &[(HWND, [i32; 4])]) -> bool {
     if positions.is_empty() {
         return true;
     }
-    // 禁止移动中间态重绘及旧像素拷贝，完成布局后统一刷新
-    let flags = SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOREDRAW | SWP_NOCOPYBITS;
+    // 各父窗口批次完成前禁止中间重绘，统一由主窗同步刷新整棵控件树
+    let flags = SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOREDRAW;
     let mut batch = BeginDeferWindowPos(positions.len() as i32);
     if !batch.is_null() {
         for &(hwnd, [x, y, width, height]) in positions {
@@ -894,7 +1105,7 @@ unsafe fn position_controls(positions: &[(HWND, [i32; 4])]) -> bool {
             return true;
         }
     }
-    // 批量操作失败时保留相同的无重绘策略，逐个补齐布局
+    // 逐个补齐失败批次，已露出区域也由布局结束后的整窗刷新修复
     let mut complete = true;
     for &(hwnd, [x, y, width, height]) in positions {
         complete &= SetWindowPos(hwnd, null_mut(), x, y, width, height, flags) != 0;
@@ -915,6 +1126,10 @@ unsafe fn set_extended_style(hwnd: HWND, style: isize) -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+unsafe fn apply_main_window_corners(hwnd: HWND) {
+    crate::container_frame::apply_window_corners(hwnd);
 }
 
 unsafe fn apply_self_transparency(hwnd: HWND, percent: u8, previous: u8) -> Result<(), String> {
@@ -957,12 +1172,10 @@ unsafe fn apply_self_transparency(hwnd: HWND, percent: u8, previous: u8) -> Resu
             ));
         }
     }
-    RedrawWindow(
-        hwnd,
-        null(),
-        null_mut(),
-        RDW_INVALIDATE | RDW_ERASE | RDW_FRAME | RDW_ALLCHILDREN,
-    );
+    if style != original_style {
+        apply_main_window_corners(hwnd);
+    }
+    MAIN_REDRAW.with(WindowRedraw::request);
     Ok(())
 }
 
@@ -1061,17 +1274,29 @@ pub fn run() -> Result<(), String> {
         }
 
         let state = Box::new(RefCell::new(App::new()));
+        let mini = state.borrow().mini_mode;
+        let already_vertical = state.borrow().settings.mini_vertical_layout;
+        MINI_MODE.with(|mode| mode.set(mini));
         let dpi = GetDpiForSystem().max(96);
         let style = MAIN_STYLE;
         let mut rect = RECT {
             left: 0,
             top: 0,
-            right: pixel(WIDTH, dpi),
-            bottom: pixel(HEIGHT, dpi),
+            right: pixel(if mini { MINI_WIDTH } else { WIDTH }, dpi),
+            bottom: pixel(if mini { MINI_HEIGHT } else { HEIGHT }, dpi),
         };
-        AdjustWindowRectExForDpi(&mut rect, style, 0, WS_EX_CONTROLPARENT, dpi);
-        let saved_geometry = state.borrow().settings.main_window;
+        crate::container_frame::expand_client(&mut rect, dpi);
+        let saved_geometry = if mini {
+            state
+                .borrow()
+                .settings
+                .mini_window
+                .map(|saved| vertical_mini_geometry(saved, dpi, already_vertical))
+        } else {
+            state.borrow().settings.main_window
+        };
         let geometry = saved_geometry.and_then(|saved| fit_main_window_geometry(saved, 1, 1));
+        // 自绘边框使用窗口 DC，各控件通过自己的缓冲提交画面
         let hwnd = CreateWindowExW(
             WS_EX_CONTROLPARENT,
             name.as_ptr(),
@@ -1102,15 +1327,40 @@ pub fn run() -> Result<(), String> {
                     )
                 }));
         }
+        if SetWindowPos(
+            hwnd,
+            null_mut(),
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED,
+        ) == 0
+        {
+            let code = GetLastError();
+            DestroyWindow(hwnd);
+            return Err(format!(
+                "{} {code}",
+                tr(
+                    "无法更新主窗口标题栏，Windows 错误码",
+                    "Cannot update the main window title bar; Windows error"
+                )
+            ));
+        }
         if let Some(saved) = geometry {
             // 创建在目标显示器后按其实际 DPI 校验最小尺寸，再显示窗口
             let dpi = GetDpiForWindow(hwnd).max(96);
+            let saved = if mini {
+                vertical_mini_geometry(saved, dpi, already_vertical)
+            } else {
+                saved
+            };
             let mut minimum = RECT {
-                right: pixel(MIN_WIDTH, dpi),
+                right: minimum_client_width(dpi),
                 bottom: minimum_client_height(hwnd, dpi),
                 ..zeroed()
             };
-            AdjustWindowRectExForDpi(&mut minimum, style, 0, WS_EX_CONTROLPARENT, dpi);
+            crate::container_frame::expand_client(&mut minimum, dpi);
             if let Some(saved) = fit_main_window_geometry(
                 saved,
                 minimum.right - minimum.left,
@@ -1177,6 +1427,18 @@ pub fn run() -> Result<(), String> {
             }
             if message.message == WM_KEYDOWN && message.wParam == VK_RETURN as usize {
                 let mut app = state.borrow_mut();
+                if message.hwnd == app.control(ID_MINI_LIST) && app.mini_mode {
+                    if message.lParam & (1 << 30) == 0 {
+                        let index = SendMessageW(
+                            app.control(ID_MINI_LIST),
+                            LVM_GETNEXTITEM,
+                            usize::MAX,
+                            LVNI_SELECTED as isize,
+                        );
+                        app.queue_mini_selection(index as i32);
+                    }
+                    continue;
+                }
                 if !search_composing()
                     && (message.hwnd == app.combo_edit
                         || message.hwnd == app.combo_list
@@ -1316,6 +1578,8 @@ struct App {
     picker_tooltip: Option<ControlTooltip>,
     refresh_tooltip: Option<ControlTooltip>,
     name_tooltip: Option<ControlTooltip>,
+    mini_tooltip: Option<ControlTooltip>,
+    mini_open_tooltip: Option<ControlTooltip>,
     picker_overlay: Option<PickerOverlay>,
     picker_warning: Option<String>,
     hotkey: bool,
@@ -1327,6 +1591,13 @@ struct App {
     pending_error: Option<String>,
     settings: Settings,
     last_main_window: Option<WindowGeometry>,
+    last_mini_window: Option<WindowGeometry>,
+    mini_geometry_vertical: bool,
+    mini_mode: bool,
+    mini_detail: Option<(WindowInfo, usize)>,
+    pending_mini_selection: Option<(WindowInfo, usize)>,
+    pending_mini_activation: Option<(WindowInfo, usize)>,
+    mini_list: Option<crate::mini_list::MiniList>,
     settings_page: bool,
     settings_panel: Option<SettingsPanel>,
     self_transparency: u8,
@@ -1373,6 +1644,8 @@ impl App {
             picker_tooltip: None,
             refresh_tooltip: None,
             name_tooltip: None,
+            mini_tooltip: None,
+            mini_open_tooltip: None,
             picker_overlay: None,
             picker_warning: None,
             hotkey: false,
@@ -1383,6 +1656,13 @@ impl App {
             initialization_error: None,
             pending_error: None,
             last_main_window: settings.main_window,
+            last_mini_window: settings.mini_window,
+            mini_geometry_vertical: settings.mini_vertical_layout,
+            mini_mode: settings.mini_mode,
+            mini_detail: None,
+            pending_mini_selection: None,
+            pending_mini_activation: None,
+            mini_list: None,
             settings,
             settings_page: false,
             settings_panel: None,
@@ -1458,11 +1738,42 @@ impl App {
         {
             return Err(tr("无法初始化按钮样式", "Cannot initialize the button style").into());
         }
+        if class == "msctls_trackbar32"
+            && !ui_theme::install_trackbar_theme(hwnd, id == ID_SELF_SLIDER)
+        {
+            return Err(tr(
+                "无法初始化透明度滑块",
+                "Cannot initialize the transparency slider",
+            )
+            .into());
+        }
         Ok(())
     }
 
     unsafe fn initialize(&mut self, hwnd: HWND) -> Result<(), String> {
         self.hwnd = hwnd;
+        let policy = DWMNCRP_DISABLED;
+        let result = DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_NCRENDERING_POLICY as u32,
+            &policy as *const _ as _,
+            size_of::<i32>() as u32,
+        );
+        if result < 0 {
+            return Err(format!(
+                "{} (HRESULT 0x{:08X})",
+                tr(
+                    "无法初始化主窗口标题栏",
+                    "Cannot initialize the main window title bar"
+                ),
+                result as u32
+            ));
+        }
+        apply_main_window_corners(hwnd);
+        let menu = GetSystemMenu(hwnd, 0);
+        if !menu.is_null() {
+            DeleteMenu(menu, SC_MAXIMIZE, MF_BYCOMMAND);
+        }
         crate::window_topmost::configure(hwnd, APP_EVENT, EVENT_TOPMOST_COMPLETED);
         self.add(
             "BUTTON",
@@ -1520,6 +1831,12 @@ impl App {
             ID_SLIDER,
             WS_TABSTOP | TBS_NOTICKS | TBS_FIXEDLENGTH,
         )?;
+        self.add(
+            "msctls_trackbar32",
+            "",
+            ID_MINI_SLIDER,
+            WS_TABSTOP | TBS_VERT | TBS_NOTICKS | TBS_FIXEDLENGTH,
+        )?;
         for (index, percent) in self.settings.preset_levels.into_iter().enumerate() {
             self.add(
                 "BUTTON",
@@ -1554,6 +1871,32 @@ impl App {
             WS_TABSTOP | BS_OWNERDRAW as u32,
         )?;
         self.add("STATIC", "0%", ID_SELF_LABEL, SS_LEFT)?;
+        self.add(
+            "BUTTON",
+            "迷你模式",
+            ID_MINI_MODE,
+            WS_TABSTOP | BS_OWNERDRAW as u32,
+        )?;
+        self.add("BUTTON", "", ID_MINI_BACK, WS_TABSTOP | BS_OWNERDRAW as u32)?;
+        self.add("BUTTON", "", ID_MINI_OPEN, WS_TABSTOP | BS_OWNERDRAW as u32)?;
+        self.add(
+            "STATIC",
+            "",
+            ID_MINI_TITLE,
+            SS_CENTER | SS_CENTERIMAGE | SS_ENDELLIPSIS | SS_NOPREFIX,
+        )?;
+        self.add(
+            "SysListView32",
+            "",
+            ID_MINI_LIST,
+            WS_TABSTOP
+                | LVS_REPORT
+                | LVS_NOCOLUMNHEADER
+                | LVS_SINGLESEL
+                | LVS_SHOWSELALWAYS
+                | LVS_SHAREIMAGELISTS,
+        )?;
+        self.mini_list = Some(crate::mini_list::MiniList::new(self.control(ID_MINI_LIST))?);
         self.add(
             "msctls_trackbar32",
             "",
@@ -1753,14 +2096,13 @@ impl App {
             if matches!(
                 item.id,
                 5 | ID_TARGET | ID_VALUE | ID_CHANGED_TITLE | ID_SELF_LABEL
-            ) {
-                if SetWindowSubclass(item.hwnd, Some(background_proc), 4, hwnd as usize) == 0 {
-                    return Err(tr(
-                        "无法初始化界面选择状态",
-                        "Cannot initialize the UI selection state",
-                    )
-                    .into());
-                }
+            ) && SetWindowSubclass(item.hwnd, Some(background_proc), 4, hwnd as usize) == 0
+            {
+                return Err(tr(
+                    "无法初始化界面选择状态",
+                    "Cannot initialize the UI selection state",
+                )
+                .into());
             }
         }
         let list = self.control(ID_CHANGED_LIST);
@@ -1794,7 +2136,7 @@ impl App {
             let mut text = wide(name);
             let column = LVCOLUMNW {
                 mask: LVCF_TEXT | LVCF_WIDTH | LVCF_FMT,
-                fmt: LVCFMT_LEFT as i32,
+                fmt: LVCFMT_LEFT,
                 cx: 100,
                 pszText: text.as_mut_ptr(),
                 ..zeroed()
@@ -1844,9 +2186,23 @@ impl App {
             self.control(ID_SHOW_WINDOW_NAME),
             tr("隐藏顶部窗口名称", "Hide the window name above"),
         );
+        self.mini_tooltip = ControlTooltip::new(
+            hwnd,
+            self.control(ID_MINI_MODE),
+            tr("切换到迷你模式", "Switch to mini mode"),
+        );
+        self.mini_open_tooltip = ControlTooltip::new(
+            hwnd,
+            self.control(ID_MINI_OPEN),
+            tr("打开该应用窗口", "Open this app window"),
+        );
         SendMessageW(self.control(ID_SLIDER), TBM_SETRANGEMIN, 0, 0);
         SendMessageW(self.control(ID_SLIDER), TBM_SETRANGEMAX, 1, 100);
         SendMessageW(self.control(ID_SLIDER), TBM_SETPAGESIZE, 0, 5);
+        SendMessageW(self.control(ID_MINI_SLIDER), TBM_SETRANGEMIN, 0, 0);
+        SendMessageW(self.control(ID_MINI_SLIDER), TBM_SETRANGEMAX, 1, 100);
+        SendMessageW(self.control(ID_MINI_SLIDER), TBM_SETPAGESIZE, 0, 5);
+        SendMessageW(self.control(ID_MINI_SLIDER), TBM_SETPOS, 1, 100);
         SendMessageW(self.control(ID_SELF_SLIDER), TBM_SETRANGEMIN, 0, 0);
         SendMessageW(
             self.control(ID_SELF_SLIDER),
@@ -1981,9 +2337,10 @@ impl App {
                     ID_VALUE | ID_TARGET | ID_SETTINGS_TITLE => fonts[1],
                     ID_SETTINGS => fonts[2],
                     ID_SELF_LABEL => fonts[3],
-                    ID_VERSION | ID_VERSION_LABEL | ID_PROJECT_LABEL | ID_PROJECT_LINK => fonts[5],
+                    ID_VERSION | ID_VERSION_LABEL | ID_PROJECT_LABEL | ID_PROJECT_LINK
+                    | ID_MINI_LIST => fonts[5],
                     5 | ID_CHANGED_TITLE | ID_BASIC_TITLE | ID_HOTKEY_TITLE | ID_PRESETS_TITLE
-                    | ID_VERSION_TITLE => fonts[4],
+                    | ID_VERSION_TITLE | ID_MINI_TITLE => fonts[4],
                     _ => fonts[0],
                 };
                 let font = if font.is_null() {
@@ -2002,6 +2359,8 @@ impl App {
                 self.picker_tooltip.as_ref(),
                 self.refresh_tooltip.as_ref(),
                 self.name_tooltip.as_ref(),
+                self.mini_tooltip.as_ref(),
+                self.mini_open_tooltip.as_ref(),
             ]
             .into_iter()
             .flatten()
@@ -2030,6 +2389,12 @@ impl App {
                 pixel(32, dpi) as usize,
                 0,
             );
+            SendMessageW(
+                self.control(ID_MINI_SLIDER),
+                TBM_SETTHUMBLENGTH,
+                pixel(32, dpi) as usize,
+                0,
+            );
             ui_theme::update_combo_metrics(self.control(ID_WINDOWS), dpi);
             ui_theme::update_combo_metrics(self.control(ID_LANGUAGE), dpi);
             ui_theme::update_hotkey_metrics(self.control(ID_HOTKEY_INPUT));
@@ -2037,7 +2402,40 @@ impl App {
                 ui_theme::update_input_metrics(self.control(ID_PRESET_INPUT + index));
             }
         }
+        let value_font = self.fonts[if self.mini_mode { 0 } else { 1 }];
+        let value_font = if value_font.is_null() {
+            GetStockObject(DEFAULT_GUI_FONT)
+        } else {
+            value_font
+        };
+        let value = self.control(ID_VALUE);
+        if SendMessageW(value, WM_GETFONT, 0, 0) as HFONT != value_font {
+            SendMessageW(value, WM_SETFONT, value_font as usize, 0);
+        }
+        let value_style = GetWindowLongPtrW(value, GWL_STYLE);
+        let aligned_style = (value_style & !((SS_CENTER | SS_RIGHT) as isize))
+            | if self.mini_mode {
+                SS_CENTER as isize
+            } else {
+                SS_RIGHT as isize
+            };
+        if value_style != aligned_style {
+            SetWindowLongPtrW(value, GWL_STYLE, aligned_style);
+        }
+        if self.mini_mode {
+            self.layout_mini(rect, dpi);
+            if dpi_changed {
+                self.refresh_changed_list(false);
+            }
+            return;
+        }
         let width = (rect.right * 96 / dpi as i32).max(MIN_WIDTH);
+        SendMessageW(
+            self.control(ID_WINDOWS),
+            CB_SETDROPPEDWIDTH,
+            pixel(width - 104, dpi) as usize,
+            0,
+        );
         let height = (rect.bottom * 96 / dpi as i32).max(MIN_MAIN_BODY_HEIGHT);
         let panel = self.settings_panel.as_ref().unwrap();
         let panel_positioned = panel.set_bounds(
@@ -2099,7 +2497,7 @@ impl App {
         let list_height = height - list_y - 46;
         let restore_width = (width - 30) / 2;
         let mut positions = vec![
-            (ID_PICK, 12, 8, 32, 32),
+            (ID_PICK, 12, 8, PICKER_BUTTON_SIZE, PICKER_BUTTON_SIZE),
             (ID_WINDOWS, 52, 8, width - 104, 280),
             (ID_REFRESH, width - 44, 8, 32, 32),
             (5, 12, 80, width - 100, 18),
@@ -2113,9 +2511,6 @@ impl App {
                 width - 30 - restore_width,
                 26,
             ),
-            (ID_SETTINGS, 12, height - 37, 32, 32),
-            (ID_SELF_LABEL, width - 34, height - 28, 22, 14),
-            (ID_SELF_SLIDER, width - 122, height - 34, 88, 26),
             (ID_SETTINGS_TITLE, 12, 8, width - 64, 32),
             (ID_SETTINGS_BACK, width - 44, 8, 32, 32),
             (ID_BASIC_TITLE, 0, 8, body_width, 20),
@@ -2156,7 +2551,6 @@ impl App {
                 preset_save_width,
                 28,
             ),
-            (ID_EXIT, width - 98, height - 37, 86, 32),
             (ID_VERSION_TITLE, 0, 478, body_width, 20),
             (ID_VERSION_LABEL, 12, 514, about_value_left - 16, 20),
             (
@@ -2222,7 +2616,10 @@ impl App {
                 (control.bounds != Some(bounds)).then_some((control.hwnd, bounds))
             })
             .collect();
-        for (id, bounds) in name_row_bounds {
+        for (id, bounds) in name_row_bounds
+            .into_iter()
+            .chain(main_footer_bounds(rect, dpi))
+        {
             if let Some(control) = self.controls.iter().find(|control| control.id == id) {
                 if control.bounds != Some(bounds) {
                     positions.push((control.hwnd, bounds));
@@ -2265,12 +2662,461 @@ impl App {
         if dpi_changed {
             self.refresh_changed_list(false);
         }
-        RedrawWindow(
-            self.hwnd,
-            null(),
-            null_mut(),
-            RDW_INVALIDATE | RDW_ALLCHILDREN | RDW_ERASE | RDW_FRAME,
-        );
+        MAIN_REDRAW.with(WindowRedraw::request);
+    }
+
+    unsafe fn mini_detail_title_visible(&self) -> bool {
+        if !self.mini_mode || self.mini_detail.is_none() {
+            return false;
+        }
+        let mut bounds: RECT = zeroed();
+        let dpi = GetDpiForWindow(self.hwnd).max(96);
+        GetClientRect(self.hwnd, &mut bounds) != 0
+            && bounds.bottom - bounds.top >= pixel(MINI_DETAIL_TITLE_MIN_HEIGHT, dpi)
+            && bounds.right - bounds.left >= pixel(MINI_DETAIL_TITLE_MIN_WIDTH, dpi)
+    }
+
+    unsafe fn self_slider_visible(&self) -> bool {
+        if self.settings_page {
+            return false;
+        }
+        if !self.mini_mode {
+            return true;
+        }
+        let mut bounds: RECT = zeroed();
+        GetClientRect(self.hwnd, &mut bounds) != 0
+            && bounds.right - bounds.left
+                >= pixel(
+                    MINI_SELF_HORIZONTAL_MIN_WIDTH,
+                    GetDpiForWindow(self.hwnd).max(96),
+                )
+    }
+
+    unsafe fn update_self_slider_visibility(&self) {
+        let visible = self.self_slider_visible();
+        let slider = self.control(ID_SELF_SLIDER);
+        let focused = GetFocus() == slider;
+        if !visible && GetCapture() == slider {
+            let percent =
+                SendMessageW(slider, TBM_GETPOS, 0, 0).clamp(0, MAX_SELF_TRANSPARENCY as isize);
+            ReleaseCapture();
+            post(self.hwnd, EVENT_SELF_SLIDER, percent | 0x100);
+        }
+        if (GetWindowLongPtrW(slider, GWL_STYLE) as u32 & WS_VISIBLE != 0) != visible {
+            ShowWindow(slider, if visible { SW_SHOW } else { SW_HIDE });
+        }
+        if !visible
+            && focused
+            && self.mini_mode
+            && !self.settings_page
+            && main_window_active(self.hwnd)
+        {
+            SetFocus(self.control(self.mini_focus_control()));
+        }
+    }
+
+    unsafe fn layout_mini(&mut self, rect: RECT, dpi: u32) {
+        let width = (rect.right * 96 / dpi as i32).max(MINI_MIN_WIDTH);
+        let height = (rect.bottom * 96 / dpi as i32).max(MINI_MIN_HEIGHT);
+        let show_title = self.mini_detail_title_visible();
+        let title = self.control(ID_MINI_TITLE);
+        if (GetWindowLongPtrW(title, GWL_STYLE) as u32 & WS_VISIBLE != 0) != show_title {
+            ShowWindow(title, if show_title { SW_SHOW } else { SW_HIDE });
+        }
+        let top_button_size = if self.mini_detail.is_some() {
+            MINI_ACTION_BUTTON_SIZE
+        } else {
+            PICKER_BUTTON_SIZE
+        };
+        let content_y = 4 + top_button_size + 4;
+        let bottom_button_y = height - MINI_ACTION_BUTTON_SIZE - 4;
+        let list_bottom = bottom_button_y - 4;
+        let footer_bounds = mini_footer_bounds(rect, dpi);
+        // 按相邻控件的实际边缘延长滑块，避免 DPI 分别取整造成重叠
+        let slider_top = if show_title {
+            pixel(content_y, dpi) + pixel(18, dpi)
+        } else {
+            pixel(4, dpi) + pixel(top_button_size, dpi)
+        };
+        let slider_width = pixel(32, dpi);
+        let slider_bounds = [
+            rect.left + (rect.right - rect.left - slider_width) / 2,
+            slider_top,
+            slider_width,
+            (footer_bounds[0].1[1] - slider_top).max(0),
+        ];
+        self.update_self_slider_visibility();
+        let positions: Vec<_> = [
+            (
+                ID_PICK,
+                (width - PICKER_BUTTON_SIZE) / 2,
+                4,
+                PICKER_BUTTON_SIZE,
+                PICKER_BUTTON_SIZE,
+            ),
+            (
+                ID_MINI_OPEN,
+                (width - MINI_ACTION_BUTTON_SIZE) / 2,
+                4,
+                MINI_ACTION_BUTTON_SIZE,
+                MINI_ACTION_BUTTON_SIZE,
+            ),
+            (ID_MINI_TITLE, 4, content_y, width - 8, 18),
+            (
+                ID_MINI_LIST,
+                4,
+                content_y,
+                width - 8,
+                list_bottom - content_y,
+            ),
+        ]
+        .into_iter()
+        .map(|(id, x, y, width, height)| {
+            (
+                id,
+                [
+                    pixel(x, dpi),
+                    pixel(y, dpi),
+                    pixel(width, dpi),
+                    pixel(height, dpi),
+                ],
+            )
+        })
+        .chain([(ID_MINI_SLIDER, slider_bounds)])
+        .chain(footer_bounds)
+        .filter_map(|(id, bounds)| {
+            let control = self.controls.iter().find(|control| control.id == id)?;
+            (control.bounds != Some(bounds)).then_some((control.hwnd, bounds))
+        })
+        .collect();
+        if position_controls(&positions) {
+            for (hwnd, bounds) in positions {
+                if let Some(control) = self
+                    .controls
+                    .iter_mut()
+                    .find(|control| control.hwnd == hwnd)
+                {
+                    control.bounds = Some(bounds);
+                }
+            }
+            self.layout_size = Some((rect.right, rect.bottom, dpi));
+        } else {
+            self.layout_size = None;
+            for control in &mut self.controls {
+                control.bounds = None;
+            }
+        }
+        if let Some(list) = &self.mini_list {
+            list.fit_columns();
+        }
+        MAIN_REDRAW.with(WindowRedraw::request);
+    }
+
+    unsafe fn set_mini_mode(&mut self, mini: bool) -> bool {
+        if self.mini_mode == mini {
+            return true;
+        }
+        self.cancel_picker();
+        MAIN_FRAME.with(|frame| frame.cancel_interaction(self.hwnd));
+        MINI_FRAME.with(|frame| frame.cancel_interaction(self.hwnd));
+        invalidate_window_search();
+        set_combo_updating(true);
+        SendMessageW(self.control(ID_WINDOWS), CB_SHOWDROPDOWN, 0, 0);
+        set_combo_updating(false);
+        self.remember_main_window_geometry();
+        let current = main_window_geometry(self.hwnd);
+        let dpi = GetDpiForWindow(self.hwnd).max(96);
+        let mut bounds = RECT {
+            right: pixel(if mini { MINI_WIDTH } else { WIDTH }, dpi),
+            bottom: pixel(if mini { MINI_HEIGHT } else { HEIGHT }, dpi),
+            ..zeroed()
+        };
+        crate::container_frame::expand_client(&mut bounds, dpi);
+        let saved = if mini {
+            self.last_mini_window
+        } else {
+            self.last_main_window
+        };
+        let target = saved.unwrap_or(WindowGeometry {
+            x: current.map_or(0, |geometry| geometry.x),
+            y: current.map_or(0, |geometry| geometry.y),
+            width: bounds.right - bounds.left,
+            height: bounds.bottom - bounds.top,
+        });
+        let target = if mini {
+            vertical_mini_geometry(target, dpi, self.mini_geometry_vertical)
+        } else {
+            target
+        };
+        // 先切换尺寸约束快照，SetWindowPos 同步回调不能借用 App
+        self.mini_mode = mini;
+        MINI_MODE.with(|mode| mode.set(mini));
+        let moved = fit_main_window_geometry(target, 1, 1).is_some_and(|initial| {
+            if SetWindowPos(
+                self.hwnd,
+                null_mut(),
+                initial.x,
+                initial.y,
+                initial.width,
+                initial.height,
+                SWP_NOZORDER | SWP_NOACTIVATE,
+            ) == 0
+            {
+                return false;
+            }
+            // 到达目标显示器后再按实际 DPI 恢复原始快照，避免跨屏反复放大
+            let target_dpi = GetDpiForWindow(self.hwnd).max(96);
+            let target = if mini {
+                vertical_mini_geometry(target, target_dpi, self.mini_geometry_vertical)
+            } else {
+                target
+            };
+            let mut minimum = RECT {
+                right: minimum_client_width(target_dpi),
+                bottom: minimum_client_height(self.hwnd, target_dpi),
+                ..zeroed()
+            };
+            crate::container_frame::expand_client(&mut minimum, target_dpi);
+            let Some(fitted) = fit_main_window_geometry(
+                target,
+                minimum.right - minimum.left,
+                minimum.bottom - minimum.top,
+            ) else {
+                return false;
+            };
+            SetWindowPos(
+                self.hwnd,
+                null_mut(),
+                fitted.x,
+                fitted.y,
+                fitted.width,
+                fitted.height,
+                SWP_NOZORDER | SWP_NOACTIVATE,
+            ) != 0
+        });
+        if !moved {
+            MAIN_FRAME.with(|frame| frame.cancel_interaction(self.hwnd));
+            MINI_FRAME.with(|frame| frame.cancel_interaction(self.hwnd));
+            self.mini_mode = !mini;
+            MINI_MODE.with(|mode| mode.set(!mini));
+            if let Some(current) = current {
+                SetWindowPos(
+                    self.hwnd,
+                    null_mut(),
+                    current.x,
+                    current.y,
+                    current.width,
+                    current.height,
+                    SWP_NOZORDER | SWP_NOACTIVATE,
+                );
+            }
+            self.layout_size = None;
+            self.layout();
+            self.report_error(tr(
+                "无法切换窗口模式，请重试",
+                "Could not switch window mode; try again",
+            ));
+            return false;
+        }
+        self.settings_page = false;
+        set_button_selected(self.control(ID_SETTINGS), false);
+        self.mini_detail = None;
+        self.pending_mini_selection = None;
+        self.pending_mini_activation = None;
+        self.window_query.clear();
+        self.layout_size = None;
+        self.sync_mini_button();
+        self.update_page_visibility();
+        self.layout();
+        self.refresh_changed_list(false);
+        self.update_mini_view();
+        self.update_enabled();
+        SetFocus(self.control(ID_MINI_MODE));
+        if let Err(error) = self.save_current_settings() {
+            self.report_error(&error);
+        }
+        true
+    }
+
+    unsafe fn sync_mini_button(&mut self) {
+        let button = self.control(ID_MINI_MODE);
+        let caption = if self.mini_mode {
+            tr("展开完整界面", "Expand full interface")
+        } else {
+            tr("切换到迷你模式", "Switch to mini mode")
+        };
+        set_text(button, caption);
+        set_button_selected(button, self.mini_mode);
+        if let Some(tooltip) = &mut self.mini_tooltip {
+            tooltip.update_caption(self.hwnd, button, caption);
+        }
+    }
+
+    fn mini_focus_control(&self) -> i32 {
+        if self.mini_detail.is_some() {
+            ID_MINI_SLIDER
+        } else if self.changed_windows.is_empty() {
+            ID_PICK
+        } else {
+            ID_MINI_LIST
+        }
+    }
+
+    unsafe fn sync_mini_list(&mut self) {
+        if !self.mini_mode {
+            return;
+        }
+        let entries = self
+            .changed_windows
+            .clone()
+            .into_iter()
+            .map(|row| {
+                let title = self.display_name(&row.window, row.token);
+                let image = self.icons.as_mut().map_or(I_IMAGENONE, |icons| {
+                    icons.icon_index(&row.window, row.token)
+                });
+                crate::mini_list::Entry {
+                    window: row.window,
+                    token: row.token,
+                    title,
+                    transparency: row.transparency,
+                    image,
+                }
+            })
+            .collect();
+        if let Some(list) = &mut self.mini_list {
+            if let Err(error) = list.sync(entries) {
+                self.report_error(&error);
+            }
+        }
+    }
+
+    unsafe fn update_mini_view(&mut self) {
+        if !self.mini_mode {
+            return;
+        }
+        let invalid = self.mini_detail.as_ref().is_some_and(|(window, token)| {
+            !self.selected_valid
+                || !self
+                    .selected
+                    .as_ref()
+                    .is_some_and(|selected| same_window(selected, window))
+                || !self
+                    .changed_windows
+                    .iter()
+                    .any(|row| row.token == *token && same_window(&row.window, window))
+        });
+        if invalid {
+            if GetCapture() == self.control(ID_MINI_SLIDER) {
+                ReleaseCapture();
+            }
+            self.mini_detail = None;
+            self.pending_mini_activation = None;
+            self.layout_size = None;
+        }
+        let detail = self
+            .mini_detail
+            .as_ref()
+            .and_then(|(window, token)| {
+                self.changed_windows
+                    .iter()
+                    .find(|row| row.token == *token && same_window(&row.window, window))
+            })
+            .cloned();
+        let title = if let Some(row) = detail {
+            self.display_name(&row.window, row.token)
+        } else {
+            String::new()
+        };
+        set_text(self.control(ID_MINI_TITLE), &title);
+        let focused = GetFocus();
+        if (self.mini_detail.is_some() || self.changed_windows.is_empty())
+            && GetCapture() == self.control(ID_MINI_LIST)
+        {
+            ReleaseCapture();
+        }
+        self.update_page_visibility();
+        self.layout();
+        let hidden_focus =
+            !focused.is_null() && IsChild(self.hwnd, focused) != 0 && IsWindowVisible(focused) == 0;
+        if (invalid || hidden_focus) && main_window_active(self.hwnd) {
+            SetFocus(self.control(self.mini_focus_control()));
+        }
+    }
+
+    unsafe fn show_mini_list(&mut self) {
+        if !self.mini_mode || self.picking {
+            return;
+        }
+        next_interaction();
+        self.pending_mini_selection = None;
+        self.pending_mini_activation = None;
+        if GetCapture() == self.control(ID_MINI_SLIDER) {
+            ReleaseCapture();
+        }
+        self.mini_detail = None;
+        self.layout_size = None;
+        self.sync_mini_list();
+        if let Some(list) = &self.mini_list {
+            list.select(self.selected.as_ref());
+        }
+        self.update_mini_view();
+        SetFocus(self.control(self.mini_focus_control()));
+    }
+
+    unsafe fn show_mini_detail(&mut self, window: &WindowInfo, token: usize) {
+        if !self.mini_mode
+            || self.picking
+            || !self.selected_valid
+            || !self
+                .selected
+                .as_ref()
+                .is_some_and(|selected| same_window(selected, window))
+        {
+            return;
+        }
+        let Some(row) = self
+            .changed_windows
+            .iter()
+            .find(|row| row.token == token && same_window(&row.window, window))
+        else {
+            return;
+        };
+        self.mini_detail = Some((row.window.clone(), row.token));
+        self.layout_size = None;
+        self.update_mini_view();
+        if main_window_active(self.hwnd) {
+            SetFocus(self.control(self.mini_focus_control()));
+        }
+    }
+
+    unsafe fn queue_mini_selection(&mut self, index: i32) {
+        if !self.mini_mode || self.mini_detail.is_some() || self.picking || index < 0 {
+            return;
+        }
+        self.pending_mini_selection = self
+            .mini_list
+            .as_ref()
+            .and_then(|list| list.entry(index as usize))
+            .map(|entry| (entry.window.clone(), entry.token));
+        if self.pending_mini_selection.is_some() {
+            post(self.hwnd, EVENT_MINI_SELECT, next_interaction() as isize);
+        }
+    }
+
+    unsafe fn queue_mini_activation(&mut self) {
+        self.pending_mini_activation = None;
+        if !self.mini_mode || self.settings_page || self.picking || !self.selected_valid {
+            return;
+        }
+        self.pending_mini_activation = self.mini_detail.clone();
+        if self.pending_mini_activation.is_some() {
+            post(
+                self.hwnd,
+                EVENT_MINI_ACTIVATE,
+                interaction_version() as isize,
+            );
+        }
     }
 
     unsafe fn report_error(&mut self, message: &str) {
@@ -2291,38 +3137,82 @@ impl App {
 
     unsafe fn update_page_visibility(&self) {
         if let Some(tooltip) = &self.name_tooltip {
-            tooltip.set_active(!self.settings_page && !self.picking);
+            tooltip.set_active(!self.settings_page && !self.mini_mode && !self.picking);
+        }
+        if let Some(tooltip) = &self.mini_tooltip {
+            tooltip.set_active(
+                !self.settings_page
+                    && !self.picking
+                    && (!self.mini_mode || self.mini_detail.is_none()),
+            );
         }
         if let Some(tooltip) = &self.picker_tooltip {
-            tooltip.set_active(!self.settings_page && !self.picking);
+            tooltip.set_active(
+                !self.settings_page
+                    && !self.picking
+                    && (!self.mini_mode || self.mini_detail.is_none()),
+            );
+        }
+        if let Some(tooltip) = &self.mini_open_tooltip {
+            tooltip.set_active(
+                self.mini_mode
+                    && self.mini_detail.is_some()
+                    && !self.settings_page
+                    && !self.picking,
+            );
         }
         if let Some(tooltip) = &self.refresh_tooltip {
-            tooltip.set_active(!self.settings_page && !self.picking);
+            tooltip.set_active(!self.settings_page && !self.mini_mode && !self.picking);
         }
+        let mini_title_visible = self.mini_detail_title_visible();
         for control in &self.controls {
-            let visible = match control.id {
-                ID_TARGET => !self.settings_page && self.settings.show_window_name,
-                ID_SETTINGS => true,
-                ID_SELF_LABEL | ID_SELF_SLIDER => !self.settings_page,
-                ID_SETTINGS_TITLE..=ID_HOTKEY_ENABLED => self.settings_page,
-                ID_BASIC_TITLE | ID_PRESETS_TITLE | ID_PRESETS_SAVE | ID_LANGUAGE_LABEL
-                | ID_LANGUAGE | ID_DEFAULT_CONTAINER | ID_VERSION_TITLE | ID_VERSION
-                | ID_VERSION_LABEL | ID_PROJECT_LABEL | ID_PROJECT_LINK => self.settings_page,
-                id if (ID_PRESET_LABEL..ID_PRESET_LABEL + 5).contains(&id)
-                    || (ID_PRESET_INPUT..ID_PRESET_INPUT + 5).contains(&id) =>
-                {
-                    self.settings_page
+            if control.id == ID_SELF_SLIDER {
+                continue;
+            }
+            let visible = if self.mini_mode {
+                match control.id {
+                    ID_PICK => self.mini_detail.is_none(),
+                    ID_MINI_MODE => self.mini_detail.is_none(),
+                    ID_MINI_LIST => self.mini_detail.is_none() && !self.changed_windows.is_empty(),
+                    ID_MINI_TITLE => mini_title_visible,
+                    ID_MINI_BACK | ID_MINI_SLIDER | ID_MINI_OPEN => self.mini_detail.is_some(),
+                    _ => false,
                 }
-                _ => !self.settings_page,
+            } else {
+                match control.id {
+                    ID_MINI_SLIDER | ID_MINI_LIST | ID_MINI_BACK | ID_MINI_TITLE | ID_MINI_OPEN => {
+                        false
+                    }
+                    ID_TARGET => !self.settings_page && self.settings.show_window_name,
+                    ID_SETTINGS => true,
+                    ID_SELF_LABEL => !self.settings_page,
+                    ID_SETTINGS_TITLE..=ID_HOTKEY_ENABLED => self.settings_page,
+                    ID_BASIC_TITLE | ID_PRESETS_TITLE | ID_PRESETS_SAVE | ID_LANGUAGE_LABEL
+                    | ID_LANGUAGE | ID_DEFAULT_CONTAINER | ID_VERSION_TITLE | ID_VERSION
+                    | ID_VERSION_LABEL | ID_PROJECT_LABEL | ID_PROJECT_LINK => self.settings_page,
+                    id if (ID_PRESET_LABEL..ID_PRESET_LABEL + 5).contains(&id)
+                        || (ID_PRESET_INPUT..ID_PRESET_INPUT + 5).contains(&id) =>
+                    {
+                        self.settings_page
+                    }
+                    _ => !self.settings_page,
+                }
             };
-            ShowWindow(control.hwnd, if visible { SW_SHOW } else { SW_HIDE });
+            let shown = GetWindowLongPtrW(control.hwnd, GWL_STYLE) as u32 & WS_VISIBLE != 0;
+            if shown != visible {
+                ShowWindow(control.hwnd, if visible { SW_SHOW } else { SW_HIDE });
+            }
         }
+        self.update_self_slider_visibility();
         if let Some(panel) = &self.settings_panel {
-            panel.show(self.settings_page);
+            panel.show(self.settings_page && !self.mini_mode);
         }
     }
 
     unsafe fn show_page(&mut self, settings: bool) {
+        if settings && self.mini_mode && !self.set_mini_mode(false) {
+            return;
+        }
         self.cancel_picker();
         if settings {
             self.clear_current_selection();
@@ -2338,13 +3228,14 @@ impl App {
         self.layout();
         set_button_selected(self.control(ID_SETTINGS), settings);
         self.update_page_visibility();
-        SetFocus(self.control(if settings { ID_LANGUAGE } else { ID_PICK }));
-        RedrawWindow(
-            self.hwnd,
-            null(),
-            null_mut(),
-            RDW_INVALIDATE | RDW_ALLCHILDREN | RDW_ERASE | RDW_FRAME,
-        );
+        SetFocus(self.control(if settings {
+            ID_LANGUAGE
+        } else if self.mini_mode {
+            self.mini_focus_control()
+        } else {
+            ID_PICK
+        }));
+        MAIN_REDRAW.with(WindowRedraw::request);
     }
 
     unsafe fn apply_language_text(&mut self) {
@@ -2398,8 +3289,18 @@ impl App {
                 tr("刷新窗口列表", "Refresh window list"),
             );
         }
+        let mini_open = self.control(ID_MINI_OPEN);
+        if let Some(tooltip) = &mut self.mini_open_tooltip {
+            tooltip.update_caption(
+                self.hwnd,
+                mini_open,
+                tr("打开该应用窗口", "Open this app window"),
+            );
+        }
         self.sync_language_selection();
         self.sync_name_button();
+        self.sync_mini_button();
+        self.update_mini_view();
         InvalidateRect(self.control(ID_HOTKEY_INPUT), null(), 0);
     }
 
@@ -2453,6 +3354,15 @@ impl App {
         self.layout();
     }
 
+    unsafe fn show_window_mode(&mut self, mini: bool) {
+        // 先还原最小化窗口，再按指定模式恢复各自的窗口几何
+        ShowWindow(self.hwnd, SW_RESTORE);
+        SetForegroundWindow(self.hwnd);
+        if self.set_mini_mode(mini) {
+            self.show_page(false);
+        }
+    }
+
     unsafe fn show_window(&mut self, settings: bool) {
         ShowWindow(self.hwnd, SW_RESTORE);
         SetForegroundWindow(self.hwnd);
@@ -2479,7 +3389,12 @@ impl App {
 
     unsafe fn remember_main_window_geometry(&mut self) {
         if let Some(geometry) = main_window_geometry(self.hwnd) {
-            self.last_main_window = Some(geometry);
+            if self.mini_mode {
+                self.last_mini_window = Some(geometry);
+                self.mini_geometry_vertical = true;
+            } else {
+                self.last_main_window = Some(geometry);
+            }
         }
     }
 
@@ -2488,6 +3403,9 @@ impl App {
         let mut settings = self.settings.clone();
         settings.self_transparency = self.self_transparency;
         settings.main_window = self.last_main_window;
+        settings.mini_window = self.last_mini_window;
+        settings.mini_mode = self.mini_mode;
+        settings.mini_vertical_layout = self.mini_geometry_vertical;
         settings.save()?;
         self.settings = settings;
         Ok(())
@@ -2882,6 +3800,8 @@ impl App {
         }
         if self.settings_page {
             self.show_page(false);
+        } else if self.mini_mode && self.mini_detail.is_some() {
+            self.show_mini_list();
         } else {
             self.close(false);
         }
@@ -2896,6 +3816,9 @@ impl App {
         self.remember_main_window_geometry();
         if self.settings.self_transparency != self.self_transparency
             || self.settings.main_window != self.last_main_window
+            || self.settings.mini_window != self.last_mini_window
+            || self.settings.mini_mode != self.mini_mode
+            || self.settings.mini_vertical_layout != self.mini_geometry_vertical
         {
             if let Err(error) = self.save_current_settings() {
                 // 配置写入失败不能阻止用户通过明确的退出入口关闭应用
@@ -2913,6 +3836,12 @@ impl App {
                         tooltip.set_active(false);
                     }
                     if let Some(tooltip) = &self.refresh_tooltip {
+                        tooltip.set_active(false);
+                    }
+                    if let Some(tooltip) = &self.mini_tooltip {
+                        tooltip.set_active(false);
+                    }
+                    if let Some(tooltip) = &self.mini_open_tooltip {
                         tooltip.set_active(false);
                     }
                     ShowWindow(self.hwnd, SW_HIDE);
@@ -2949,14 +3878,22 @@ impl App {
     }
 
     unsafe fn queue_window_menu(&mut self, source: HWND, coordinates: isize) {
-        if source != self.control(ID_CHANGED_LIST)
-            || self.settings_page
+        if self.settings_page
             || self.picking
             || self.changed_list_dirty
+            || self.popup_open
+            || self.pending_menu.is_some()
         {
             return;
         }
-        let list = self.control(ID_CHANGED_LIST);
+        let mini_list =
+            source == self.control(ID_MINI_LIST) && self.mini_mode && self.mini_detail.is_none();
+        if (!mini_list && (self.mini_mode || source != self.control(ID_CHANGED_LIST)))
+            || IsWindowVisible(source) == 0
+        {
+            return;
+        }
+        let list = source;
         let mut point = screen_point(coordinates as usize);
         let index = if coordinates == -1 {
             let selected = SendMessageW(list, LVM_GETNEXTITEM, usize::MAX, LVNI_SELECTED as isize);
@@ -3008,20 +3945,40 @@ impl App {
         if index < 0 {
             return;
         }
-        if let Some(row) = self.changed_windows.get(index as usize) {
-            let container_mode = self.controller.is_container_mode(&row.window);
+        let window = if mini_list {
+            self.mini_list
+                .as_ref()
+                .and_then(|list| list.entry(index as usize))
+                .filter(|entry| {
+                    self.changed_windows.iter().any(|row| {
+                        row.token == entry.token && same_window(&row.window, &entry.window)
+                    })
+                })
+                .map(|entry| entry.window.clone())
+        } else {
+            self.changed_windows
+                .get(index as usize)
+                .map(|row| row.window.clone())
+        };
+        if let Some(window) = window {
+            if mini_list {
+                // 右击保持在列表页，取消尚未消费的左击或回车选择
+                self.pending_mini_selection = None;
+                next_interaction();
+            }
+            let container_mode = self.controller.is_container_mode(&window);
             let container_available = container_mode
                 || self
                     .controller
-                    .can_enable_container(&row.window)
+                    .can_enable_container(&window)
                     .unwrap_or(false);
             // 弹出菜单前保存完整窗口身份，刷新和行索引变化不能改变操作目标
             self.queue_menu(PopupRequest::Window {
-                window: row.window.clone(),
-                taskbar_hidden: self.controller.is_taskbar_hidden(&row.window),
+                taskbar_hidden: self.controller.is_taskbar_hidden(&window),
                 container_mode,
                 container_available,
-                topmost: self.controller.is_topmost(&row.window).ok(),
+                topmost: self.controller.is_topmost(&window).ok(),
+                window,
                 point,
             });
         }
@@ -3091,26 +4048,32 @@ impl App {
                 self.refresh_changed_list(false);
                 self.update_enabled();
             }
-            (PopupRequest::Tray { .. }, MENU_OPEN) => self.show_window(false),
-            (PopupRequest::Tray { .. }, MENU_SETTINGS) => self.show_window(true),
-            (PopupRequest::Tray { .. }, MENU_RESTORE_ALL) => {
-                self.cancel_picker();
-                if !self.restore_all() {
-                    self.show_window(false);
-                }
-            }
+            (PopupRequest::Tray { .. }, MENU_OPEN) => self.show_window_mode(false),
+            (PopupRequest::Tray { .. }, MENU_TOGGLE_MODE) => self.show_window_mode(!self.mini_mode),
             (PopupRequest::Tray { .. }, MENU_EXIT) => self.close(true),
             _ => {}
         }
     }
 
     unsafe fn update_enabled(&self) {
+        EnableWindow(self.control(ID_MINI_MODE), (!self.picking) as i32);
+        EnableWindow(self.control(ID_MINI_LIST), (!self.picking) as i32);
+        EnableWindow(self.control(ID_MINI_BACK), (!self.picking) as i32);
+        if let Some(tooltip) = &self.mini_tooltip {
+            tooltip.set_active(
+                !self.settings_page
+                    && !self.picking
+                    && (!self.mini_mode || self.mini_detail.is_none()),
+            );
+        }
         EnableWindow(self.control(ID_SHOW_WINDOW_NAME), (!self.picking) as i32);
         if let Some(tooltip) = &self.name_tooltip {
-            tooltip.set_active(!self.settings_page && !self.picking);
+            tooltip.set_active(!self.settings_page && !self.mini_mode && !self.picking);
         }
         let available = self.selected_valid && !self.picking;
         EnableWindow(self.control(ID_SLIDER), available as i32);
+        EnableWindow(self.control(ID_MINI_SLIDER), available as i32);
+        EnableWindow(self.control(ID_MINI_OPEN), available as i32);
         for id in ID_PRESET..ID_PRESET + 5 {
             EnableWindow(self.control(id), available as i32);
         }
@@ -3130,10 +4093,22 @@ impl App {
         EnableWindow(self.control(ID_SELF_SLIDER), (!self.picking) as i32);
         SendMessageW(self.control(ID_PICK), BM_SETSTATE, self.picking as usize, 0);
         if let Some(tooltip) = &self.picker_tooltip {
-            tooltip.set_active(!self.settings_page && !self.picking);
+            tooltip.set_active(
+                !self.settings_page
+                    && !self.picking
+                    && (!self.mini_mode || self.mini_detail.is_none()),
+            );
+        }
+        if let Some(tooltip) = &self.mini_open_tooltip {
+            tooltip.set_active(
+                self.mini_mode
+                    && self.mini_detail.is_some()
+                    && !self.settings_page
+                    && !self.picking,
+            );
         }
         if let Some(tooltip) = &self.refresh_tooltip {
-            tooltip.set_active(!self.settings_page && !self.picking);
+            tooltip.set_active(!self.settings_page && !self.mini_mode && !self.picking);
         }
         for (index, percent) in self.settings.preset_levels.iter().enumerate() {
             set_button_selected(
@@ -3142,6 +4117,7 @@ impl App {
             );
         }
         InvalidateRect(self.control(ID_SLIDER), null(), 0);
+        InvalidateRect(self.control(ID_MINI_SLIDER), null(), 0);
         InvalidateRect(self.control(ID_SELF_SLIDER), null(), 0);
     }
 
@@ -3295,6 +4271,7 @@ impl App {
             self.show_percent(0);
             self.sync_changed_selection();
             self.update_enabled();
+            self.update_mini_view();
         }
         let same_order = rows.len() == self.changed_windows.len()
             && rows.iter().zip(&self.changed_windows).all(|(left, right)| {
@@ -3309,6 +4286,8 @@ impl App {
                     && left.topmost == right.topmost
             });
         if !force && unchanged && !self.changed_list_dirty {
+            self.sync_mini_list();
+            self.update_mini_view();
             return;
         }
         let mut rebuild = force || self.changed_list_dirty || !same_order;
@@ -3317,6 +4296,12 @@ impl App {
         let top_window = self.changed_windows.get(top).map(|row| row.window.clone());
         if !self.settings.show_icons || force || self.changed_list_dirty {
             SendMessageW(list, LVM_SETIMAGELIST, LVSIL_SMALL as usize, 0);
+            SendMessageW(
+                self.control(ID_MINI_LIST),
+                LVM_SETIMAGELIST,
+                LVSIL_SMALL as usize,
+                0,
+            );
             self.icons = None;
         }
         if self.settings.show_icons && self.icons.is_none() {
@@ -3325,6 +4310,12 @@ impl App {
                     rebuild = true;
                     SendMessageW(
                         list,
+                        LVM_SETIMAGELIST,
+                        LVSIL_SMALL as usize,
+                        icons.image_list(),
+                    );
+                    SendMessageW(
+                        self.control(ID_MINI_LIST),
                         LVM_SETIMAGELIST,
                         LVSIL_SMALL as usize,
                         icons.image_list(),
@@ -3421,10 +4412,12 @@ impl App {
                 }
             }
         }
+        // 先按新行数收敛列宽，避免恢复重绘时原生列表先生成横向滚动条
+        fit_list_columns(list);
         if suspend_redraw {
             SendMessageW(list, WM_SETREDRAW, 1, 0);
+            fit_list_columns(list);
         }
-        fit_list_columns(list);
         InvalidateRect(list, null(), 1);
         set_text(
             self.control(ID_CHANGED_TITLE),
@@ -3449,11 +4442,16 @@ impl App {
             }
             let title = display_title(&row.window);
             set_text(self.control(ID_TARGET), &title);
-            if !self.picking && GetCapture() != self.control(ID_SLIDER) {
+            if !self.picking
+                && GetCapture() != self.control(ID_SLIDER)
+                && GetCapture() != self.control(ID_MINI_SLIDER)
+            {
                 self.show_percent(row.transparency);
             }
         }
         self.update_enabled();
+        self.sync_mini_list();
+        self.update_mini_view();
         if !same_order {
             self.rebuild_window_options(false);
         }
@@ -3543,6 +4541,7 @@ impl App {
         invalidate_window_search();
         self.pending_changed_selection = None;
         self.pending_changed_activation = None;
+        self.pending_mini_activation = None;
         WINDOW_CHOICE.with(|pending| {
             pending.borrow_mut().take();
         });
@@ -3619,11 +4618,18 @@ impl App {
         self.refresh_changed_list(false);
         self.sync_changed_selection();
         self.update_enabled();
+        self.update_mini_view();
     }
 
     unsafe fn show_percent(&mut self, percent: u8) {
         self.last_percent = percent;
         SendMessageW(self.control(ID_SLIDER), TBM_SETPOS, 1, percent as isize);
+        SendMessageW(
+            self.control(ID_MINI_SLIDER),
+            TBM_SETPOS,
+            1,
+            (100 - percent) as isize,
+        );
         set_text(self.control(ID_VALUE), &format!("{percent}%"));
         for (index, preset) in self.settings.preset_levels.iter().enumerate() {
             set_button_selected(
@@ -3740,11 +4746,23 @@ impl App {
                     ));
                 }
             }
-            EVENT_LAYOUT => {
-                LAYOUT_PENDING.with(|pending| pending.set(false));
-                self.layout();
-            }
             EVENT_SETTINGS_SCROLL => {
+                let mut client: RECT = zeroed();
+                let layout_current = GetClientRect(self.hwnd, &mut client) != 0
+                    && self.layout_size
+                        == Some((
+                            client.right,
+                            client.bottom,
+                            GetDpiForWindow(self.hwnd).max(96),
+                        ));
+                if layout_current
+                    && self
+                        .settings_panel
+                        .as_ref()
+                        .is_some_and(|panel| panel.layout_is_current())
+                {
+                    return;
+                }
                 self.layout_size = None;
                 self.layout();
             }
@@ -3768,8 +4786,15 @@ impl App {
             {
                 if let Some(requested) = WINDOW_CHOICE.with(|pending| pending.borrow_mut().take()) {
                     invalidate_window_search();
-                    let current = window_control::describe_window(requested.hwnd)
-                        .filter(|current| same_window(current, &requested));
+                    let current = self
+                        .changed_windows
+                        .iter()
+                        .find(|row| same_window(&row.window, &requested))
+                        .map(|row| row.window.clone())
+                        .or_else(|| {
+                            window_control::describe_window(requested.hwnd)
+                                .filter(|current| same_window(current, &requested))
+                        });
                     self.window_query.clear();
                     set_combo_updating(true);
                     SendMessageW(self.control(ID_WINDOWS), CB_SHOWDROPDOWN, 0, 0);
@@ -3791,7 +4816,9 @@ impl App {
                 GetWindowThreadProcessId(foreground, &mut process_id);
                 if !foreground.is_null() && process_id != GetCurrentProcessId() {
                     self.cancel_picker();
-                    self.clear_current_selection();
+                    if !self.mini_mode {
+                        self.clear_current_selection();
+                    }
                 }
             }
             EVENT_HOTKEY_FOCUS => {
@@ -3865,6 +4892,26 @@ impl App {
                     }
                 }
             }
+            EVENT_MINI_SELECT
+                if parameter as usize == interaction_version()
+                    && self.mini_mode
+                    && self.mini_detail.is_none()
+                    && !self.picking
+                    && !self.settings_page =>
+            {
+                if let Some((requested, token)) = self.pending_mini_selection.take() {
+                    self.refresh_changed_list(false);
+                    let row = self
+                        .changed_windows
+                        .iter()
+                        .find(|row| row.token == token && same_window(&row.window, &requested))
+                        .cloned();
+                    if let Some(row) = row {
+                        self.select(Some(row.window.clone()), true);
+                        self.show_mini_detail(&row.window, row.token);
+                    }
+                }
+            }
             EVENT_CHANGED_ACTIVATE if !self.picking && !self.settings_page => {
                 if let Some(window) = self.pending_changed_activation.take() {
                     match self.controller.activate(&window) {
@@ -3872,6 +4919,34 @@ impl App {
                         Err(error) => self.report_error(&error),
                     }
                     self.refresh_changed_list(false);
+                }
+            }
+            EVENT_MINI_ACTIVATE if parameter as usize == interaction_version() => {
+                if let Some((window, token)) = self.pending_mini_activation.take() {
+                    let current = self.mini_mode
+                        && !self.settings_page
+                        && !self.picking
+                        && self.selected_valid
+                        && self
+                            .selected
+                            .as_ref()
+                            .is_some_and(|selected| same_window(selected, &window))
+                        && self
+                            .mini_detail
+                            .as_ref()
+                            .is_some_and(|(detail, detail_token)| {
+                                *detail_token == token && same_window(detail, &window)
+                            })
+                        && self
+                            .changed_windows
+                            .iter()
+                            .any(|row| row.token == token && same_window(&row.window, &window));
+                    if current {
+                        if let Err(error) = self.controller.activate(&window) {
+                            self.report_error(&error);
+                        }
+                        self.refresh_changed_list(false);
+                    }
                 }
             }
             EVENT_PICK_START
@@ -3882,6 +4957,8 @@ impl App {
                 invalidate_window_search();
                 self.pending_changed_selection = None;
                 self.pending_changed_activation = None;
+                self.pending_mini_selection = None;
+                self.pending_mini_activation = None;
                 WINDOW_CHOICE.with(|pending| {
                     pending.borrow_mut().take();
                 });
@@ -3940,8 +5017,22 @@ impl App {
                 release_picker_capture(self.hwnd);
                 SetCursor(LoadCursorW(null_mut(), IDC_ARROW));
                 if let Some(window) = target {
-                    self.select(Some(window), true);
+                    if self.mini_mode {
+                        invalidate_window_search();
+                        self.window_query.clear();
+                    }
+                    self.select(Some(window.clone()), true);
                     self.refresh();
+                    if self.mini_mode {
+                        if let Some(token) = self
+                            .changed_windows
+                            .iter()
+                            .find(|row| same_window(&row.window, &window))
+                            .map(|row| row.token)
+                        {
+                            self.show_mini_detail(&window, token);
+                        }
+                    }
                 } else {
                     self.update_enabled();
                 }
@@ -3954,6 +5045,16 @@ impl App {
             }
             EVENT_PICK_CANCEL if parameter as usize == picker_version() => self.cancel_picker(),
             EVENT_SLIDER => self.apply_percent(parameter.clamp(0, 100) as u8),
+            EVENT_MINI_SLIDER
+                if self.mini_mode
+                    && self.mini_detail.is_some()
+                    && (parameter as usize >> 8) == (interaction_version() & (usize::MAX >> 8)) =>
+            {
+                self.update_mini_view();
+                if self.mini_detail.is_some() {
+                    self.apply_percent((parameter as usize & 0xff).min(100) as u8);
+                }
+            }
             EVENT_SELF_SLIDER => self.set_self_transparency(
                 (parameter as u32 & 0xff) as u8,
                 parameter as u32 & 0x100 != 0,
@@ -3961,6 +5062,10 @@ impl App {
             EVENT_COMMAND => {
                 let id = parameter as u32 & 0xffff;
                 match id as i32 {
+                    ID_MINI_MODE => {
+                        self.set_mini_mode(!self.mini_mode);
+                    }
+                    ID_MINI_BACK => self.show_mini_list(),
                     ID_SETTINGS => self.show_page(!self.settings_page),
                     ID_SETTINGS_BACK => self.show_page(false),
                     ID_CLOSE_TO_TRAY => self.set_close_to_tray(),
@@ -4037,6 +5142,9 @@ impl Drop for App {
             self.picker_tooltip = None;
             self.refresh_tooltip = None;
             self.name_tooltip = None;
+            self.mini_tooltip = None;
+            self.mini_open_tooltip = None;
+            self.mini_list = None;
             self.settings_panel = None;
             ui_theme::set_window_badges(std::iter::empty());
             PICK_FINISH.with(|pending| {
@@ -4045,6 +5153,14 @@ impl Drop for App {
             if IsWindow(self.control(ID_CHANGED_LIST)) != 0 {
                 SendMessageW(
                     self.control(ID_CHANGED_LIST),
+                    LVM_SETIMAGELIST,
+                    LVSIL_SMALL as usize,
+                    0,
+                );
+            }
+            if IsWindow(self.control(ID_MINI_LIST)) != 0 {
+                SendMessageW(
+                    self.control(ID_MINI_LIST),
                     LVM_SETIMAGELIST,
                     LVSIL_SMALL as usize,
                     0,
@@ -4094,7 +5210,10 @@ unsafe extern "system" fn list_theme_proc(
                     }
                     return 0;
                 }
-                HDN_ITEMCHANGINGA | HDN_ITEMCHANGINGW if !LIST_COLUMNS_SIZING.with(Cell::get) => {
+                HDN_ITEMCHANGINGA | HDN_ITEMCHANGINGW
+                    if !LIST_COLUMNS_SIZING.with(Cell::get)
+                        && !crate::list_layout::is_preparing(hwnd) =>
+                {
                     if let Some((index, width)) = header_column_resize(lparam) {
                         // 先拒绝单列默认改宽，退出原生通知后再联动修改相邻列
                         queue_list_column_resize(hwnd, index, width);
@@ -4259,11 +5378,51 @@ unsafe extern "system" fn window_proc(
         _ => (message, wparam, lparam),
     };
     let state = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const RefCell<App>;
-    let _deferred_flush = DeferredEventFlush { hwnd, state };
+    let _deferred_flush = DeferredEventFlush {
+        hwnd,
+        state,
+        // 绘制与文本查询回调不启动整窗补绘，避免重入原生按钮的 WM_PAINT
+        flush_redraw: matches!(
+            message,
+            APP_EVENT
+                | WM_SIZE
+                | WM_WINDOWPOSCHANGED
+                | WM_DPICHANGED
+                | WM_EXITSIZEMOVE
+                | WM_CANCELMODE
+                | WM_SHOWWINDOW
+        ),
+    };
     if message == APP_EVENT && !state.is_null() && (*state).try_borrow_mut().is_err() {
         // COM 可能嵌套调度消息，状态释放后再投递，避免丢事件或立即重投形成忙循环
         DEFERRED_EVENTS.with(|events| events.borrow_mut().push_back((hwnd, wparam, lparam)));
         return 0;
+    }
+    // 提前恢复交互状态，避免标题栏或选窗逻辑消费取消消息后遗漏收尾
+    match message {
+        WM_CANCELMODE => MAIN_REDRAW.with(WindowRedraw::end_resize),
+        WM_SHOWWINDOW if wparam == 0 => MAIN_REDRAW.with(WindowRedraw::end_resize),
+        WM_DESTROY => MAIN_REDRAW.with(WindowRedraw::clear),
+        _ => {}
+    }
+    if message == WM_NCHITTEST {
+        if let Some(hit) = main_resize_hit(hwnd, screen_point(lparam as usize)) {
+            return hit;
+        }
+    }
+    if matches!(message, WM_THEMECHANGED | WM_DWMCOMPOSITIONCHANGED) {
+        apply_main_window_corners(hwnd);
+    }
+    // 标题栏状态独立于 App，绘制和鼠标捕获不依赖可重入的状态借用
+    if message != WM_GETMINMAXINFO {
+        let result = if MINI_MODE.with(Cell::get) {
+            MINI_FRAME.with(|frame| frame.process(hwnd, message, wparam, lparam))
+        } else {
+            MAIN_FRAME.with(|frame| frame.process(hwnd, message, wparam, lparam))
+        };
+        if let Some(result) = result {
+            return result;
+        }
     }
     match message {
         WM_NCCREATE => {
@@ -4328,8 +5487,10 @@ unsafe extern "system" fn window_proc(
                     ID_PICK => ButtonStyle::Picker,
                     ID_REFRESH => ButtonStyle::Refresh,
                     ID_SHOW_WINDOW_NAME => ButtonStyle::NameVisibility,
+                    ID_MINI_MODE => ButtonStyle::MiniMode,
                     ID_SETTINGS => ButtonStyle::Icon,
-                    ID_SETTINGS_BACK => ButtonStyle::Back,
+                    ID_SETTINGS_BACK | ID_MINI_BACK => ButtonStyle::Back,
+                    ID_MINI_OPEN => ButtonStyle::OpenWindow,
                     ID_EXIT => ButtonStyle::Primary,
                     _ => ButtonStyle::Secondary,
                 };
@@ -4342,6 +5503,16 @@ unsafe extern "system" fn window_proc(
         WM_COMMAND => {
             let id = (wparam & 0xffff) as i32;
             let notification = ((wparam >> 16) & 0xffff) as u32;
+            if id == ID_MINI_OPEN {
+                if notification == BN_CLICKED && !state.is_null() {
+                    if let Ok(mut app) = (*state).try_borrow_mut() {
+                        if lparam as HWND == app.control(ID_MINI_OPEN) {
+                            app.queue_mini_activation();
+                        }
+                    }
+                }
+                return 0;
+            }
             if id == ID_WINDOWS {
                 if !combo_updating() && !state.is_null() {
                     match notification {
@@ -4366,11 +5537,16 @@ unsafe extern "system" fn window_proc(
             post(hwnd, EVENT_COMMAND, wparam as isize);
             return 0;
         }
-        WM_HSCROLL if lparam != 0 => {
+        WM_HSCROLL | WM_VSCROLL if lparam != 0 => {
             let percent = SendMessageW(lparam as HWND, TBM_GETPOS, 0, 0);
             match GetDlgCtrlID(lparam as HWND) {
                 ID_SLIDER => post(hwnd, EVENT_SLIDER, percent),
-                ID_SELF_SLIDER => {
+                ID_MINI_SLIDER if IsWindowVisible(lparam as HWND) != 0 => {
+                    let parameter =
+                        (interaction_version() << 8) | (100 - percent.clamp(0, 100)) as usize;
+                    post(hwnd, EVENT_MINI_SLIDER, parameter as isize);
+                }
+                ID_SELF_SLIDER if IsWindowVisible(lparam as HWND) != 0 => {
                     // 拖动时实时预览，松开或键盘调整结束后才写入配置
                     let save = (wparam as u32 & 0xffff) != TB_THUMBTRACK;
                     let parameter = percent.clamp(0, MAX_SELF_TRANSPARENCY as isize)
@@ -4401,17 +5577,41 @@ unsafe extern "system" fn window_proc(
             }
             if header.code == NM_CUSTOMDRAW {
                 match header.idFrom as i32 {
-                    ID_SLIDER | ID_SELF_SLIDER => {
-                        return ui_theme::draw_trackbar(
-                            &*(lparam as *const NMCUSTOMDRAW),
-                            header.idFrom == ID_SELF_SLIDER as usize,
-                        );
-                    }
-                    ID_CHANGED_LIST => {
+                    ID_CHANGED_LIST | ID_MINI_LIST => {
                         return ui_theme::draw_list(&mut *(lparam as *mut NMLVCUSTOMDRAW));
                     }
                     _ => {}
                 }
+            }
+            if header.idFrom == ID_MINI_LIST as usize
+                && matches!(header.code, NM_DBLCLK | NM_RETURN)
+            {
+                let index = if header.code == NM_DBLCLK {
+                    let notification = &*(lparam as *const NMITEMACTIVATE);
+                    let mut hit = LVHITTESTINFO {
+                        pt: notification.ptAction,
+                        ..zeroed()
+                    };
+                    SendMessageW(
+                        header.hwndFrom,
+                        LVM_SUBITEMHITTEST,
+                        0,
+                        &mut hit as *mut LVHITTESTINFO as isize,
+                    )
+                } else {
+                    SendMessageW(
+                        header.hwndFrom,
+                        LVM_GETNEXTITEM,
+                        usize::MAX,
+                        LVNI_SELECTED as isize,
+                    )
+                };
+                if !state.is_null() {
+                    if let Ok(mut app) = (*state).try_borrow_mut() {
+                        app.queue_mini_selection(index as i32);
+                    }
+                }
+                return 0;
             }
             if header.idFrom == ID_CHANGED_LIST as usize && header.code == LVN_ITEMCHANGED {
                 let notification = &*(lparam as *const NMLISTVIEW);
@@ -4453,7 +5653,9 @@ unsafe extern "system" fn window_proc(
                     post(hwnd, EVENT_CLEAR_SELECTION, next_interaction() as isize);
                 }
             }
-            if header.idFrom == ID_CHANGED_LIST as usize && header.code == NM_RCLICK {
+            if matches!(header.idFrom as i32, ID_CHANGED_LIST | ID_MINI_LIST)
+                && header.code == NM_RCLICK
+            {
                 let pointer = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const RefCell<App>;
                 if !pointer.is_null() {
                     if let Ok(mut app) = (*pointer).try_borrow_mut() {
@@ -4529,13 +5731,36 @@ unsafe extern "system" fn window_proc(
             post(hwnd, EVENT_HOTKEY_RESTORE, lparam);
             return 0;
         }
+        WM_WINDOWPOSCHANGED if lparam != 0 => {
+            let flags = (*(lparam as *const WINDOWPOS)).flags;
+            // 默认处理会同步发送 WM_SIZE，整轮尺寸与控件更新完成后才补绘
+            let result = MAIN_REDRAW
+                .with(|redraw| redraw.defer(|| DefWindowProcW(hwnd, message, wparam, lparam)));
+            if !state.is_null() && GetWindowLongPtrW(hwnd, GWLP_USERDATA) == state as isize {
+                if let Ok(mut app) = (*state).try_borrow_mut() {
+                    app.remember_main_window_geometry();
+                }
+                if position_affects_surface(flags) && IsIconic(hwnd) == 0 {
+                    layout_window(hwnd, state);
+                }
+            }
+            return result;
+        }
         WM_SIZE => {
             if wparam != SIZE_MINIMIZED as usize {
                 layout_window(hwnd, state);
+            } else {
+                MAIN_REDRAW.with(WindowRedraw::end_resize);
             }
             return 0;
         }
+        WM_ENTERSIZEMOVE => {
+            MAIN_REDRAW.with(WindowRedraw::begin_resize);
+            return 0;
+        }
         WM_EXITSIZEMOVE => {
+            MAIN_REDRAW.with(WindowRedraw::end_resize);
+            // 拖动结束后完整刷新一次，清理边框及子控件的最终画面
             layout_window(hwnd, state);
             return 0;
         }
@@ -4545,16 +5770,20 @@ unsafe extern "system" fn window_proc(
         }
         WM_DPICHANGED => {
             let rect = &*(lparam as *const RECT);
-            SetWindowPos(
-                hwnd,
-                null_mut(),
-                rect.left,
-                rect.top,
-                rect.right - rect.left,
-                rect.bottom - rect.top,
-                SWP_NOZORDER | SWP_NOACTIVATE,
-            );
-            layout_window(hwnd, state);
+            MAIN_REDRAW.with(|redraw| {
+                redraw.defer(|| {
+                    SetWindowPos(
+                        hwnd,
+                        null_mut(),
+                        rect.left,
+                        rect.top,
+                        rect.right - rect.left,
+                        rect.bottom - rect.top,
+                        SWP_NOZORDER | SWP_NOACTIVATE,
+                    );
+                    layout_window(hwnd, state);
+                });
+            });
             return 0;
         }
         WM_GETMINMAXINFO => {
@@ -4562,10 +5791,10 @@ unsafe extern "system" fn window_proc(
             let mut rect = RECT {
                 left: 0,
                 top: 0,
-                right: pixel(MIN_WIDTH, dpi),
+                right: minimum_client_width(dpi),
                 bottom: minimum_client_height(hwnd, dpi),
             };
-            AdjustWindowRectExForDpi(&mut rect, MAIN_STYLE, 0, WS_EX_CONTROLPARENT, dpi);
+            crate::container_frame::expand_client(&mut rect, dpi);
             let info = &mut *(lparam as *mut MINMAXINFO);
             info.ptMinTrackSize = POINT {
                 x: rect.right - rect.left,
@@ -4606,7 +5835,7 @@ unsafe extern "system" fn window_proc(
                     }
                 }
                 ID_TARGET | ID_CHANGED_TITLE | ID_SETTINGS_TITLE | ID_BASIC_TITLE
-                | ID_HOTKEY_TITLE | ID_PRESETS_TITLE | ID_VERSION_TITLE => TEXT,
+                | ID_MINI_TITLE | ID_HOTKEY_TITLE | ID_PRESETS_TITLE | ID_VERSION_TITLE => TEXT,
                 _ => MUTED,
             };
             SetTextColor(hdc, color);
@@ -4619,6 +5848,11 @@ unsafe extern "system" fn window_proc(
         }
         APP_EVENT if wparam == EVENT_DESTROY => {
             DestroyWindow(hwnd);
+            return 0;
+        }
+        APP_EVENT if wparam == EVENT_LAYOUT => {
+            LAYOUT_PENDING.with(|pending| pending.set(false));
+            layout_window(hwnd, state);
             return 0;
         }
         _ => {}
@@ -4682,7 +5916,10 @@ unsafe extern "system" fn window_proc(
                     app.event(wparam, lparam);
                     return 0;
                 }
-                WM_CONTEXTMENU if wparam as HWND == app.control(ID_CHANGED_LIST) => {
+                WM_CONTEXTMENU
+                    if wparam as HWND == app.control(ID_CHANGED_LIST)
+                        || wparam as HWND == app.control(ID_MINI_LIST) =>
+                {
                     app.queue_window_menu(wparam as HWND, lparam);
                     return 0;
                 }
@@ -4718,12 +5955,367 @@ unsafe extern "system" fn window_proc(
                     app.controller.restore_all();
                     return 0;
                 }
-                WM_WINDOWPOSCHANGED => {
-                    app.remember_main_window_geometry();
-                }
                 _ => {}
             }
         }
     }
     DefWindowProcW(hwnd, message, wparam, lparam)
+}
+
+#[cfg(test)]
+mod resize_tests {
+    use super::*;
+
+    struct RestoreMiniMode(bool);
+
+    impl Drop for RestoreMiniMode {
+        fn drop(&mut self) {
+            MINI_MODE.with(|mode| mode.set(self.0));
+        }
+    }
+
+    fn rect_values(rect: RECT) -> [i32; 4] {
+        [rect.left, rect.top, rect.right, rect.bottom]
+    }
+
+    #[test]
+    fn footer_right_anchors_follow_every_physical_pixel_at_fractional_dpi() {
+        for dpi in [96, 110, 120, 137, 144, 168, 192, 240] {
+            let minimum = pixel(MIN_WIDTH, dpi);
+            let mut previous: Option<[(i32, [i32; 4]); 5]> = None;
+            for width in minimum..minimum + 128 {
+                let client = RECT {
+                    left: 0,
+                    top: 0,
+                    right: width,
+                    bottom: pixel(HEIGHT, dpi),
+                };
+                let footer = main_footer_bounds(client, dpi);
+                let exit = footer.iter().find(|(id, _)| *id == ID_EXIT).unwrap().1;
+                let label = footer
+                    .iter()
+                    .find(|(id, _)| *id == ID_SELF_LABEL)
+                    .unwrap()
+                    .1;
+                let slider = footer
+                    .iter()
+                    .find(|(id, _)| *id == ID_SELF_SLIDER)
+                    .unwrap()
+                    .1;
+                assert_eq!(width - exit[0] - exit[2], pixel(12, dpi));
+                assert_eq!(width - label[0] - label[2], pixel(12, dpi));
+                assert_eq!(slider[0] + slider[2], label[0]);
+                if let Some(previous) = previous {
+                    for ((id, bounds), (_, old)) in footer.iter().zip(previous) {
+                        let delta = if matches!(*id, ID_EXIT | ID_SELF_LABEL | ID_SELF_SLIDER) {
+                            1
+                        } else {
+                            0
+                        };
+                        assert_eq!(
+                            bounds[0] - old[0],
+                            delta,
+                            "dpi={dpi}, width={width}, id={id}"
+                        );
+                        assert_eq!(bounds[2..], old[2..]);
+                    }
+                }
+                previous = Some(footer);
+            }
+        }
+    }
+
+    #[test]
+    fn footer_buttons_keep_the_same_baseline_and_bottom_gap_during_resize() {
+        for dpi in [96, 110, 120, 137, 144, 168, 192, 240] {
+            let minimum = pixel(HEIGHT, dpi);
+            let mut previous: Option<[(i32, [i32; 4]); 5]> = None;
+            for height in minimum..minimum + 128 {
+                let footer = main_footer_bounds(
+                    RECT {
+                        left: 0,
+                        top: 0,
+                        right: pixel(WIDTH, dpi),
+                        bottom: height,
+                    },
+                    dpi,
+                );
+                let mut button_top = None;
+                for (id, bounds) in footer {
+                    if matches!(id, ID_SETTINGS | ID_MINI_MODE | ID_EXIT) {
+                        assert_eq!(height - bounds[1] - bounds[3], pixel(5, dpi));
+                        if let Some(top) = button_top {
+                            assert_eq!(bounds[1], top);
+                        }
+                        button_top = Some(bounds[1]);
+                    }
+                }
+                if let Some(previous) = previous {
+                    for ((id, bounds), (_, old)) in footer.iter().zip(previous) {
+                        assert_eq!(bounds[1] - old[1], 1, "dpi={dpi}, height={height}, id={id}");
+                        assert_eq!(bounds[2..], old[2..]);
+                    }
+                }
+                previous = Some(footer);
+            }
+        }
+    }
+
+    #[test]
+    fn resize_cancel_and_hide_restore_normal_redraw_through_window_messages() {
+        struct ResetRedraw;
+        impl Drop for ResetRedraw {
+            fn drop(&mut self) {
+                MAIN_REDRAW.with(WindowRedraw::clear);
+            }
+        }
+        let _reset = ResetRedraw;
+        unsafe {
+            for message in [WM_CANCELMODE, WM_SHOWWINDOW] {
+                MAIN_REDRAW.with(WindowRedraw::clear);
+                window_proc(null_mut(), WM_ENTERSIZEMOVE, 0, 0);
+                MAIN_REDRAW.with(|redraw| {
+                    redraw.request();
+                    assert!(redraw.flush(|flags| {
+                        assert_ne!(flags & RDW_UPDATENOW, 0);
+                        true
+                    }));
+                });
+                window_proc(null_mut(), message, 0, 0);
+                MAIN_REDRAW.with(|redraw| {
+                    assert!(redraw.flush(|flags| {
+                        assert_eq!(flags, crate::window_redraw::FULL_REPAINT_FLAGS);
+                        true
+                    }));
+                });
+            }
+        }
+    }
+
+    #[test]
+    fn resizing_and_frame_changes_preserve_the_requested_copy_policy() {
+        unsafe {
+            for flags in [
+                0,
+                SWP_NOZORDER | SWP_NOACTIVATE,
+                SWP_NOMOVE | SWP_NOZORDER,
+                SWP_NOSIZE | SWP_NOMOVE | SWP_FRAMECHANGED,
+                SWP_NOSIZE | SWP_FRAMECHANGED | SWP_NOREDRAW,
+                SWP_NOCOPYBITS | SWP_NOOWNERZORDER,
+            ] {
+                let mut position = WINDOWPOS {
+                    hwndInsertAfter: HWND_TOPMOST,
+                    x: -1920,
+                    y: -117,
+                    cx: 512,
+                    cy: 364,
+                    flags,
+                    ..zeroed()
+                };
+                window_proc(
+                    null_mut(),
+                    WM_WINDOWPOSCHANGING,
+                    0,
+                    &mut position as *mut _ as LPARAM,
+                );
+                assert_eq!(position.flags, flags);
+                assert_eq!(
+                    [position.x, position.y, position.cx, position.cy],
+                    [-1920, -117, 512, 364]
+                );
+                assert_eq!(position.hwndInsertAfter, HWND_TOPMOST);
+            }
+        }
+    }
+
+    #[test]
+    fn move_only_and_z_order_changes_keep_the_original_copy_policy() {
+        unsafe {
+            for flags in [
+                SWP_NOSIZE,
+                SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+                SWP_NOSIZE | SWP_NOMOVE,
+                SWP_NOSIZE | SWP_NOMOVE | SWP_NOACTIVATE | SWP_SHOWWINDOW,
+                SWP_NOSIZE | SWP_NOCOPYBITS,
+            ] {
+                let mut position = WINDOWPOS {
+                    x: -640,
+                    y: 120,
+                    flags,
+                    ..zeroed()
+                };
+                window_proc(
+                    null_mut(),
+                    WM_WINDOWPOSCHANGING,
+                    0,
+                    &mut position as *mut _ as LPARAM,
+                );
+                assert_eq!(position.flags, flags);
+                assert_eq!([position.x, position.y], [-640, 120]);
+            }
+        }
+    }
+
+    #[test]
+    fn resize_preserves_client_pixels_and_geometry_inputs() {
+        let _restore = RestoreMiniMode(MINI_MODE.with(Cell::get));
+        // 空句柄仅使用系统尺寸与 96 DPI 回退，不创建窗口或启动应用
+        unsafe {
+            for mini in [false, true] {
+                MINI_MODE.with(|mode| mode.set(mini));
+                for (x, y) in [(-1920, -640), (0, 0), (83, 117)] {
+                    for (width, height) in [(50, 150), (100, 190), (340, 364), (1920, 1080)] {
+                        let client = RECT {
+                            left: x,
+                            top: y,
+                            right: x + width,
+                            bottom: y + height,
+                        };
+                        let mut window = client;
+                        crate::container_frame::expand_client(&mut window, 96);
+                        let old_window = RECT {
+                            left: -200,
+                            top: -100,
+                            right: 600,
+                            bottom: 500,
+                        };
+                        let old_client = RECT {
+                            left: -199,
+                            top: -60,
+                            right: 599,
+                            bottom: 499,
+                        };
+                        let mut position = WINDOWPOS {
+                            x: window.left,
+                            y: window.top,
+                            cx: window.right - window.left,
+                            cy: window.bottom - window.top,
+                            flags: SWP_NOACTIVATE | SWP_NOZORDER,
+                            ..zeroed()
+                        };
+                        let mut params = NCCALCSIZE_PARAMS {
+                            rgrc: [window, old_window, old_client],
+                            lppos: &mut position,
+                        };
+                        let result = window_proc(
+                            null_mut(),
+                            WM_NCCALCSIZE,
+                            1,
+                            &mut params as *mut _ as LPARAM,
+                        );
+                        assert_eq!(result, 0);
+                        assert_eq!(rect_values(params.rgrc[0]), rect_values(client));
+                        assert_eq!(rect_values(params.rgrc[1]), rect_values(old_window));
+                        assert_eq!(rect_values(params.rgrc[2]), rect_values(old_client));
+                        assert_eq!(params.lppos, &mut position as *mut _);
+                        assert_eq!(
+                            [position.x, position.y, position.cx, position.cy],
+                            [
+                                window.left,
+                                window.top,
+                                width + 2,
+                                window.bottom - window.top
+                            ]
+                        );
+                        assert_eq!(position.flags, SWP_NOACTIVATE | SWP_NOZORDER);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn simple_client_calculation_returns_zero_for_normal_and_mini_frames() {
+        let _restore = RestoreMiniMode(MINI_MODE.with(Cell::get));
+        unsafe {
+            for mini in [false, true] {
+                MINI_MODE.with(|mode| mode.set(mini));
+                let client = RECT {
+                    left: -640,
+                    top: -200,
+                    right: -320,
+                    bottom: 300,
+                };
+                let mut window = client;
+                crate::container_frame::expand_client(&mut window, 96);
+                assert_eq!(
+                    window_proc(
+                        null_mut(),
+                        WM_NCCALCSIZE,
+                        0,
+                        &mut window as *mut _ as LPARAM,
+                    ),
+                    0
+                );
+                assert_eq!(rect_values(window), rect_values(client));
+            }
+        }
+    }
+
+    #[test]
+    fn collapsed_client_rects_stay_inside_the_requested_window() {
+        let _restore = RestoreMiniMode(MINI_MODE.with(Cell::get));
+        unsafe {
+            for mini in [false, true] {
+                MINI_MODE.with(|mode| mode.set(mini));
+                for width in [0, 1, 2, 24, 50] {
+                    for height in [0, 1, 2, 24, 50] {
+                        let window = RECT {
+                            left: -83,
+                            top: -117,
+                            right: -83 + width,
+                            bottom: -117 + height,
+                        };
+                        let mut params = NCCALCSIZE_PARAMS {
+                            rgrc: [window, zeroed(), zeroed()],
+                            lppos: null_mut(),
+                        };
+                        assert_eq!(
+                            window_proc(
+                                null_mut(),
+                                WM_NCCALCSIZE,
+                                1,
+                                &mut params as *mut _ as LPARAM,
+                            ),
+                            0
+                        );
+                        let client = params.rgrc[0];
+                        assert!(window.left <= client.left && client.left <= client.right);
+                        assert!(client.right <= window.right);
+                        assert!(window.top <= client.top && client.top <= client.bottom);
+                        assert!(client.bottom <= window.bottom);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn main_resize_policy_does_not_change_independent_container_preservation() {
+        unsafe {
+            let frame = crate::container_frame::ContainerFrame::default();
+            let client = RECT {
+                left: -640,
+                top: 120,
+                right: 640,
+                bottom: 840,
+            };
+            let mut window = client;
+            crate::container_frame::expand_client(&mut window, 96);
+            let mut params = NCCALCSIZE_PARAMS {
+                rgrc: [window, zeroed(), zeroed()],
+                lppos: null_mut(),
+            };
+            assert_eq!(
+                frame.process(
+                    null_mut(),
+                    WM_NCCALCSIZE,
+                    1,
+                    &mut params as *mut _ as LPARAM,
+                ),
+                Some(0)
+            );
+            assert_eq!(rect_values(params.rgrc[0]), rect_values(client));
+        }
+    }
 }
