@@ -35,9 +35,10 @@ impl Drop for ActiveScope<'_> {
     }
 }
 
-// 画面失效独立于布局尺寸缓存，完整布局提交后同步绘制控件树
+// 画面失效独立于布局缓存，交互缩放等待原生可见区域提交后再绘制
 pub struct WindowRedraw {
     pending: Cell<bool>,
+    queued: Cell<bool>,
     deferred: Cell<bool>,
     painting: Cell<bool>,
     resizing: Cell<bool>,
@@ -47,6 +48,7 @@ impl WindowRedraw {
     pub const fn new() -> Self {
         Self {
             pending: Cell::new(false),
+            queued: Cell::new(false),
             deferred: Cell::new(false),
             painting: Cell::new(false),
             resizing: Cell::new(false),
@@ -63,7 +65,32 @@ impl WindowRedraw {
 
     pub fn clear(&self) {
         self.pending.set(false);
+        self.queued.set(false);
         self.resizing.set(false);
+    }
+
+    pub fn finish_notification(&self) {
+        self.queued.set(false);
+    }
+
+    pub fn queue(&self, post: impl FnOnce() -> bool) -> bool {
+        if self.deferred.get()
+            || self.painting.get()
+            || !self.pending.get()
+            || self.queued.replace(true)
+        {
+            return false;
+        }
+        if post() {
+            true
+        } else {
+            self.finish_notification();
+            false
+        }
+    }
+
+    pub fn is_resizing(&self) -> bool {
+        self.resizing.get()
     }
 
     pub fn begin_resize(&self) {
@@ -81,12 +108,22 @@ impl WindowRedraw {
         action()
     }
 
+    pub fn dispatch(&self, post: impl FnOnce() -> bool, repaint: impl FnOnce(u32) -> bool) -> bool {
+        if self.resizing.get() {
+            // WM_WINDOWPOSCHANGED 返回前，可见裁剪仍可能停在旧尺寸
+            self.queue(post);
+            false
+        } else {
+            self.flush(repaint)
+        }
+    }
+
     pub fn flush(&self, repaint: impl FnOnce(u32) -> bool) -> bool {
         if self.deferred.get() || self.painting.get() || !self.pending.replace(false) {
             return false;
         }
         let _scope = ActiveScope::new(&self.painting);
-        // 交互期间同步呈现完整客户区，结束后再补绘非客户区
+        // 排队通知中同步呈现完整客户区，结束后再补绘非客户区
         let flags = if self.resizing.get() {
             RESIZE_REPAINT_FLAGS
         } else {
@@ -241,13 +278,32 @@ mod tests {
     }
 
     #[test]
-    fn continuous_resize_presents_each_completed_layout_before_returning() {
+    fn continuous_resize_waits_for_the_new_visible_clip_before_painting() {
         let redraw = WindowRedraw::new();
         let mut synchronous_paints = 0;
+        let queued = Cell::new(0);
+        let clip_ready = Cell::new(false);
         redraw.begin_resize();
         for _ in 0..100 {
+            clip_ready.set(false);
             redraw.request();
+            for _ in 0..3 {
+                assert!(!redraw.dispatch(
+                    || {
+                        queued.set(queued.get() + 1);
+                        true
+                    },
+                    |_| panic!("painted before the native resize returned"),
+                ));
+            }
+            assert_eq!(queued.get(), 1);
+            assert!(redraw.pending());
+            // 模拟原生尺寸调用返回后可见区域才扩展，再分派合并通知
+            clip_ready.set(true);
+            queued.set(queued.get() - 1);
+            redraw.finish_notification();
             assert!(redraw.flush(|flags| {
+                assert!(clip_ready.get());
                 assert_ne!(flags & RDW_UPDATENOW, 0);
                 assert_eq!(flags & RDW_FRAME, 0);
                 assert_ne!(flags & RDW_INVALIDATE, 0);
@@ -265,6 +321,112 @@ mod tests {
         }));
         assert_eq!(synchronous_paints, 101);
         assert!(!redraw.flush(|_| panic!("duplicate final repaint")));
+    }
+
+    #[test]
+    fn failed_notification_retains_damage_without_reposting_itself() {
+        let redraw = WindowRedraw::new();
+        let posts = Cell::new(0);
+        redraw.begin_resize();
+        redraw.request();
+        assert!(!redraw.dispatch(
+            || {
+                posts.set(posts.get() + 1);
+                false
+            },
+            |_| panic!("synchronous fallback painted against the old clip"),
+        ));
+        assert_eq!(posts.get(), 1);
+        assert!(redraw.pending());
+        assert!(!redraw.queued.get());
+        // 下一真实事件可以重新排队，失败通知不占住唯一的队列标记
+        assert!(redraw.queue(|| true));
+        redraw.finish_notification();
+        assert!(redraw.flush(|_| true));
+        assert!(!redraw.pending());
+    }
+
+    #[test]
+    fn deferred_notification_repost_failure_does_not_lose_damage_or_block_a_retry() {
+        let redraw = WindowRedraw::new();
+        redraw.begin_resize();
+        redraw.request();
+        assert!(redraw.queue(|| true));
+        // App 借用冲突使原通知进入延期队列，期间仍只允许一个通知
+        redraw.request();
+        assert!(!redraw.queue(|| panic!("duplicated a deferred notification")));
+        // 延期重投失败与实际消费通知都会释放队列标记，但不能清除脏状态
+        redraw.finish_notification();
+        assert!(redraw.pending());
+        assert!(redraw.queue(|| true));
+        redraw.finish_notification();
+        assert!(redraw.flush(|_| true));
+    }
+
+    #[test]
+    fn ending_resize_before_notification_paints_once_and_old_notification_is_empty() {
+        let redraw = WindowRedraw::new();
+        redraw.begin_resize();
+        redraw.request();
+        assert!(redraw.queue(|| true));
+        redraw.end_resize();
+        assert!(redraw.dispatch(
+            || panic!("resize end must paint synchronously"),
+            |flags| {
+                assert_eq!(flags, FULL_REPAINT_FLAGS);
+                true
+            },
+        ));
+        assert!(redraw.queued.get());
+        redraw.finish_notification();
+        assert!(!redraw.flush(|_| panic!("stale notification painted twice")));
+        assert!(!redraw.queue(|| panic!("stale notification started an idle loop")));
+    }
+
+    #[test]
+    fn repaint_reentry_queues_one_later_notification_without_recursive_painting() {
+        let redraw = WindowRedraw::new();
+        redraw.begin_resize();
+        redraw.request();
+        assert!(redraw.queue(|| true));
+        redraw.finish_notification();
+        assert!(redraw.flush(|_| {
+            redraw.request();
+            assert!(!redraw.dispatch(
+                || panic!("queued a repaint inside painting"),
+                |_| panic!("recursive repaint"),
+            ));
+            true
+        }));
+        assert!(redraw.pending());
+        assert!(redraw.queue(|| true));
+        assert!(!redraw.queue(|| panic!("duplicate notification")));
+        redraw.finish_notification();
+        assert!(!redraw.flush(|_| false));
+        assert!(redraw.pending());
+        assert!(!redraw.queued.get());
+    }
+
+    #[test]
+    fn hidden_damage_survives_notification_and_shutdown_clears_queue_state() {
+        let redraw = WindowRedraw::new();
+        redraw.begin_resize();
+        redraw.request();
+        assert!(redraw.queue(|| true));
+        redraw.end_resize();
+        redraw.finish_notification();
+        // 隐藏检查跳过绘制，重新显示时仍保留完整补绘请求
+        assert!(redraw.pending());
+        assert!(redraw.dispatch(
+            || panic!("hidden resize should already have ended"),
+            |flags| flags == FULL_REPAINT_FLAGS,
+        ));
+        redraw.request();
+        assert!(redraw.queue(|| true));
+        redraw.clear();
+        assert!(!redraw.queued.get());
+        assert!(!redraw.queue(|| panic!("queued after shutdown")));
+        assert!(!redraw.flush(|_| panic!("painted after shutdown")));
     }
 
     #[test]

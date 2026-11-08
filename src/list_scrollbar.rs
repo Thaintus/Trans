@@ -451,7 +451,8 @@ unsafe extern "system" fn scrollbar_proc(
             };
         }
         WM_HSCROLL | WM_MOUSEHWHEEL => return 0,
-        WM_WINDOWPOSCHANGING if lparam != 0 => {
+        WM_WINDOWPOSCHANGING if !state.show_scrollbars && lparam != 0 => {
+            // 普通列表由最终布局分配列宽，避免缩放前预收窄后又扩回
             crate::list_layout::prepare_resize(
                 hwnd,
                 &*(lparam as *const WINDOWPOS),

@@ -72,6 +72,7 @@ const EVENT_ABOUT_LINK: usize = 30;
 const EVENT_MINI_SELECT: usize = 31;
 const EVENT_MINI_SLIDER: usize = 32;
 const EVENT_MINI_ACTIVATE: usize = 33;
+const EVENT_REDRAW: usize = 34;
 const HOTKEY_RESTORE: i32 = 1;
 const TIMER_TARGET_ACTIVITY: usize = 2;
 const ICON_RESOURCE: usize = 101;
@@ -136,7 +137,7 @@ const MENU_TOGGLE_MODE: u32 = 211;
 const TBM_GETPOS: u32 = WM_USER;
 const WIDTH: i32 = 340;
 const HEIGHT: i32 = 364;
-const MIN_WIDTH: i32 = 305;
+const MIN_WIDTH: i32 = 300;
 const MINI_WIDTH: i32 = 168;
 const MINI_MIN_WIDTH: i32 = 40;
 const MINI_HEIGHT: i32 = 340;
@@ -301,11 +302,12 @@ impl Drop for DeferredEventFlush {
             return;
         }
         unsafe {
-            if (*self.state).try_borrow().is_err() {
+            if (*self.state).try_borrow_mut().is_err() {
                 return;
             }
             let valid = IsWindow(self.hwnd) != 0
                 && GetWindowLongPtrW(self.hwnd, GWLP_USERDATA) == self.state as isize;
+            let mut notification_post_failed = false;
             DEFERRED_EVENTS.with(|events| {
                 let mut events = events.borrow_mut();
                 let mut remaining = VecDeque::new();
@@ -313,13 +315,27 @@ impl Drop for DeferredEventFlush {
                     if hwnd != self.hwnd {
                         remaining.push_back((hwnd, event, parameter));
                     } else if valid {
-                        post(hwnd, event, parameter);
+                        if PostMessageW(hwnd, APP_EVENT, event, parameter) == 0 {
+                            match event {
+                                EVENT_LAYOUT => {
+                                    // 失败通知不占住布局队列，保留失效状态供后续真实事件重试
+                                    LAYOUT_PENDING.with(|pending| pending.set(false));
+                                    MAIN_REDRAW.with(WindowRedraw::request);
+                                    notification_post_failed = true;
+                                }
+                                EVENT_REDRAW => {
+                                    MAIN_REDRAW.with(WindowRedraw::finish_notification);
+                                    notification_post_failed = true;
+                                }
+                                _ => {}
+                            }
+                        }
                     }
                 }
                 *events = remaining;
             });
             // 重投队列后再补绘，绘制回调不能重入队列或应用状态借用
-            if valid && self.flush_redraw {
+            if valid && self.flush_redraw && !notification_post_failed {
                 flush_main_redraw(self.hwnd, self.state);
             }
         }
@@ -1041,6 +1057,15 @@ unsafe fn queue_layout(hwnd: HWND) {
     }
 }
 
+unsafe fn layout_for_window_size(hwnd: HWND, state: *const RefCell<App>) {
+    if MAIN_REDRAW.with(WindowRedraw::is_resizing) {
+        // 父窗原生尺寸提交后再按最新客户区定位控件
+        queue_layout(hwnd);
+    } else {
+        layout_window(hwnd, state);
+    }
+}
+
 unsafe fn layout_window(hwnd: HWND, state: *const RefCell<App>) {
     if !state.is_null() {
         if let Ok(mut app) = (*state).try_borrow_mut() {
@@ -1057,6 +1082,10 @@ unsafe fn layout_window(hwnd: HWND, state: *const RefCell<App>) {
 }
 
 unsafe fn flush_main_redraw(hwnd: HWND, state: *const RefCell<App>) {
+    flush_main_redraw_impl(hwnd, state, false);
+}
+
+unsafe fn flush_main_redraw_impl(hwnd: HWND, state: *const RefCell<App>, notified: bool) {
     if hwnd.is_null()
         || state.is_null()
         || LAYOUT_PENDING.with(Cell::get)
@@ -1077,10 +1106,16 @@ unsafe fn flush_main_redraw(hwnd: HWND, state: *const RefCell<App>) {
         return;
     }
     MAIN_REDRAW.with(|redraw| {
-        let painted = redraw.flush(|flags| RedrawWindow(hwnd, null(), null_mut(), flags) != 0);
+        let repaint = |flags| RedrawWindow(hwnd, null(), null_mut(), flags) != 0;
+        let notify = || PostMessageW(hwnd, APP_EVENT, EVENT_REDRAW, 0) != 0;
+        let painted = if notified {
+            redraw.flush(repaint)
+        } else {
+            redraw.dispatch(notify, repaint)
+        };
         // 同步绘制期间新增的请求留到下一轮，不递归绘制或在失败时忙重试
         if painted && redraw.pending() {
-            queue_layout(hwnd);
+            redraw.queue(notify);
         }
     });
 }
@@ -5377,16 +5412,17 @@ unsafe extern "system" fn window_proc(
         hwnd,
         state,
         // 绘制与文本查询回调不启动整窗补绘，避免重入原生按钮的 WM_PAINT
-        flush_redraw: matches!(
-            message,
-            APP_EVENT
-                | WM_SIZE
-                | WM_WINDOWPOSCHANGED
-                | WM_DPICHANGED
-                | WM_EXITSIZEMOVE
-                | WM_CANCELMODE
-                | WM_SHOWWINDOW
-        ),
+        flush_redraw: !(message == APP_EVENT && matches!(wparam, EVENT_LAYOUT | EVENT_REDRAW))
+            && matches!(
+                message,
+                APP_EVENT
+                    | WM_SIZE
+                    | WM_WINDOWPOSCHANGED
+                    | WM_DPICHANGED
+                    | WM_EXITSIZEMOVE
+                    | WM_CANCELMODE
+                    | WM_SHOWWINDOW
+            ),
     };
     if message == APP_EVENT && !state.is_null() && (*state).try_borrow_mut().is_err() {
         // COM 可能嵌套调度消息，状态释放后再投递，避免丢事件或立即重投形成忙循环
@@ -5453,7 +5489,15 @@ unsafe extern "system" fn window_proc(
             return 0;
         }
         WM_ERASEBKGND => {
-            // WM_PAINT 已完整填底，避免窗口缩放时先擦白再显示界面
+            if MAIN_REDRAW.with(WindowRedraw::is_resizing) {
+                // 原生缩放提供的 DC 可覆盖新增区域，先补齐父窗底色再提交控件布局
+                let dc = wparam as HDC;
+                let mut client: RECT = zeroed();
+                if !dc.is_null() && GetClientRect(hwnd, &mut client) != 0 {
+                    draw_chrome(hwnd, dc, &client);
+                }
+            }
+            // 普通绘制由 WM_PAINT 完整填底，避免重复擦底
             return 1;
         }
         WM_MEASUREITEM if lparam != 0 => {
@@ -5736,14 +5780,14 @@ unsafe extern "system" fn window_proc(
                     app.remember_main_window_geometry();
                 }
                 if position_affects_surface(flags) && IsIconic(hwnd) == 0 {
-                    layout_window(hwnd, state);
+                    layout_for_window_size(hwnd, state);
                 }
             }
             return result;
         }
         WM_SIZE => {
             if wparam != SIZE_MINIMIZED as usize {
-                layout_window(hwnd, state);
+                layout_for_window_size(hwnd, state);
             } else {
                 MAIN_REDRAW.with(WindowRedraw::end_resize);
             }
@@ -5848,6 +5892,14 @@ unsafe extern "system" fn window_proc(
         APP_EVENT if wparam == EVENT_LAYOUT => {
             LAYOUT_PENDING.with(|pending| pending.set(false));
             layout_window(hwnd, state);
+            // 排队布局已离开父窗原生尺寸处理，同一轮提交完整控件画面
+            flush_main_redraw_impl(hwnd, state, true);
+            return 0;
+        }
+        APP_EVENT if wparam == EVENT_REDRAW => {
+            // 通过状态借用保护后才消费通知，不让本事件再次排队自身
+            MAIN_REDRAW.with(WindowRedraw::finish_notification);
+            flush_main_redraw_impl(hwnd, state, true);
             return 0;
         }
         _ => {}
