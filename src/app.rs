@@ -423,11 +423,28 @@ fn mini_footer_slider_visible(client: RECT, dpi: u32) -> bool {
             + 4 * pixel(4, dpi)
 }
 
-fn mini_footer_bounds(client: RECT, dpi: u32) -> [(i32, [i32; 4]); 4] {
+fn mini_footer_bounds(client: RECT, dpi: u32, detail: bool) -> [(i32, [i32; 4]); 4] {
     let button_side = pixel(MINI_ACTION_BUTTON_SIZE, dpi);
     let gap = pixel(4, dpi);
     let bottom = client.bottom - gap;
     let width = client.right - client.left;
+    if detail {
+        // 调节页底部始终只保留居中的返回按钮
+        return [
+            (
+                ID_MINI_BACK,
+                [
+                    client.left + (width - button_side) / 2,
+                    bottom - button_side,
+                    button_side,
+                    button_side,
+                ],
+            ),
+            (ID_MINI_MODE, [0, 0, 0, 0]),
+            (ID_TOPMOST, [0, 0, 0, 0]),
+            (ID_SELF_SLIDER, [0, 0, 0, 0]),
+        ];
+    }
     let show_action = mini_footer_action_visible(client, dpi);
     let show_slider = mini_footer_slider_visible(client, dpi);
     let slider_width = pixel(SELF_SLIDER_WIDTH, dpi);
@@ -449,7 +466,7 @@ fn mini_footer_bounds(client: RECT, dpi: u32) -> [(i32, [i32; 4]); 4] {
         [0, 0, 0, 0]
     };
     [
-        (ID_MINI_BACK, button),
+        (ID_MINI_BACK, [0, 0, 0, 0]),
         (ID_MINI_MODE, button),
         (
             ID_TOPMOST,
@@ -2754,13 +2771,14 @@ impl App {
             return;
         }
         let fits = self.mini_footer_action_visible();
+        let detail = self.mini_detail.is_some();
         let mut restore_focus = false;
-        for (id, active) in [
-            (ID_MINI_MODE, self.mini_detail.is_none()),
-            (ID_MINI_BACK, self.mini_detail.is_some()),
+        for (id, visible) in [
+            (ID_MINI_MODE, fits && !detail),
+            (ID_MINI_BACK, detail),
+            (ID_TOPMOST, !detail),
         ] {
             let control = self.control(id);
-            let visible = fits && active;
             if !visible {
                 restore_focus |= GetFocus() == control;
                 if GetCapture() == control {
@@ -2775,7 +2793,7 @@ impl App {
             tooltip.set_active(self.mini_mode_button_visible() && !self.picking);
         }
         if restore_focus && main_window_active(self.hwnd) {
-            SetFocus(self.control(ID_TOPMOST));
+            SetFocus(self.control(if detail { ID_MINI_BACK } else { ID_TOPMOST }));
         }
     }
 
@@ -2785,6 +2803,9 @@ impl App {
         }
         if !self.mini_mode {
             return true;
+        }
+        if self.mini_detail.is_some() {
+            return false;
         }
         let mut bounds: RECT = zeroed();
         GetClientRect(self.hwnd, &mut bounds) != 0
@@ -2827,7 +2848,7 @@ impl App {
             PICKER_BUTTON_SIZE
         };
         let content_y = 4 + top_button_size + 4;
-        let footer_bounds = mini_footer_bounds(rect, dpi);
+        let footer_bounds = mini_footer_bounds(rect, dpi, self.mini_detail.is_some());
         let footer_top = footer_bounds
             .iter()
             .filter(|(_, bounds)| bounds[3] > 0)
@@ -3244,7 +3265,11 @@ impl App {
 
     unsafe fn update_page_visibility(&self) {
         if let Some(tooltip) = &self.topmost_tooltip {
-            tooltip.set_active(!self.settings_page && !self.picking);
+            tooltip.set_active(
+                !self.settings_page
+                    && !self.picking
+                    && (!self.mini_mode || self.mini_detail.is_none()),
+            );
         }
         if let Some(tooltip) = &self.name_tooltip {
             tooltip.set_active(!self.settings_page && !self.mini_mode && !self.picking);
@@ -3273,13 +3298,13 @@ impl App {
         let mini_title_visible = self.mini_detail_title_visible();
         for control in &self.controls {
             if control.id == ID_SELF_SLIDER
-                || (self.mini_mode && matches!(control.id, ID_MINI_MODE | ID_MINI_BACK))
+                || (self.mini_mode
+                    && matches!(control.id, ID_MINI_MODE | ID_MINI_BACK | ID_TOPMOST))
             {
                 continue;
             }
             let visible = if self.mini_mode {
                 match control.id {
-                    ID_TOPMOST => true,
                     ID_PICK => self.mini_detail.is_none(),
                     ID_MINI_LIST => self.mini_detail.is_none() && !self.changed_windows.is_empty(),
                     ID_MINI_TITLE => mini_title_visible,
@@ -4227,7 +4252,11 @@ impl App {
 
     unsafe fn update_enabled(&self) {
         if let Some(tooltip) = &self.topmost_tooltip {
-            tooltip.set_active(!self.settings_page && !self.picking);
+            tooltip.set_active(
+                !self.settings_page
+                    && !self.picking
+                    && (!self.mini_mode || self.mini_detail.is_none()),
+            );
         }
         EnableWindow(self.control(ID_MINI_MODE), (!self.picking) as i32);
         EnableWindow(self.control(ID_MINI_LIST), (!self.picking) as i32);
