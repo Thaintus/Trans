@@ -188,6 +188,7 @@ pub enum ButtonStyle {
     Picker,
     Refresh,
     NameVisibility,
+    Topmost,
     MiniMode,
     Back,
     OpenWindow,
@@ -618,28 +619,6 @@ unsafe fn paint_compact_checkbox(hwnd: HWND, dc: HDC, hovered: bool) {
         }
     }
     draw_compact_checkbox(hwnd, dc, rect, hovered);
-}
-
-pub unsafe fn compact_checkbox_width(hwnd: HWND) -> Option<i32> {
-    let dc = GetDC(hwnd);
-    if dc.is_null() {
-        return None;
-    }
-    let width = (|| {
-        let _saved = SavedDc::new(dc)?;
-        font_for(dc, hwnd);
-        let length = GetWindowTextLengthW(hwnd).max(0) as usize;
-        let mut text = vec![0_u16; length + 1];
-        let copied = GetWindowTextW(hwnd, text.as_mut_ptr(), text.len() as i32);
-        let mut size: SIZE = zeroed();
-        if copied <= 0 || GetTextExtentPoint32W(dc, text.as_ptr(), copied, &mut size) == 0 {
-            return None;
-        }
-        let dpi = GetDpiForWindow(hwnd).max(96);
-        Some(size.cx + pixels(12, dpi) + pixels(4, dpi))
-    })();
-    ReleaseDC(hwnd, dc);
-    width
 }
 
 unsafe fn draw_compact_checkbox(hwnd: HWND, dc: HDC, rect: RECT, hovered: bool) -> bool {
@@ -2508,6 +2487,57 @@ unsafe fn draw_button_content(item: &DRAWITEMSTRUCT, style: ButtonStyle, selecte
     let hot = !disabled && hovered(item.hwndItem);
     let focused =
         !disabled && item.itemState & ODS_FOCUS != 0 && item.itemState & ODS_NOFOCUSRECT == 0;
+    if matches!(style, ButtonStyle::Topmost) {
+        fill(item.hDC, &item.rcItem, BACKGROUND);
+        if selected || (!disabled && (hot || pressed || focused)) {
+            let background = if disabled {
+                SUBTLE
+            } else if pressed {
+                PRESSED
+            } else if selected {
+                if hot {
+                    PICKER_HOVER
+                } else {
+                    ACCENT_SOFT
+                }
+            } else {
+                HOVER
+            };
+            draw_rounded_surface(
+                item.hDC,
+                &inset(item.rcItem, pixels(1, dpi)),
+                pixels(5, dpi),
+                background,
+                focused.then_some((ACCENT, pixels(1, dpi))),
+            );
+        }
+        let foreground = if disabled {
+            DISABLED_TEXT
+        } else if selected || hot || pressed || focused {
+            ACCENT
+        } else {
+            MUTED
+        };
+        let side = pixels(16, dpi)
+            .min((item.rcItem.right - item.rcItem.left).max(0))
+            .min((item.rcItem.bottom - item.rcItem.top).max(0));
+        if side > 0 {
+            let left = item.rcItem.left + (item.rcItem.right - item.rcItem.left - side) / 2;
+            let top = item.rcItem.top + (item.rcItem.bottom - item.rcItem.top - side) / 2;
+            draw_window_action_icon(
+                item.hDC,
+                RECT {
+                    left,
+                    top,
+                    right: left + side,
+                    bottom: top + side,
+                },
+                foreground,
+                WindowActionIcon::Topmost,
+            );
+        }
+        return true;
+    }
     // 名称行使用轻量图标按钮，常态不绘制外框或选中底色
     if matches!(style, ButtonStyle::NameVisibility) {
         fill(item.hDC, &item.rcItem, BACKGROUND);
@@ -2527,12 +2557,8 @@ unsafe fn draw_button_content(item: &DRAWITEMSTRUCT, style: ButtonStyle, selecte
         } else {
             MUTED
         };
-        // 轮廓向右靠近复选框，点击区域仍保持独立
-        let icon_rect = RECT {
-            left: item.rcItem.left + pixels(6, dpi),
-            ..item.rcItem
-        };
-        name_visibility_icon(item.hDC, icon_rect, dpi, foreground, selected);
+        // 与相邻置顶图标一样在独立点击区域内居中
+        name_visibility_icon(item.hDC, item.rcItem, dpi, foreground, selected);
         return true;
     }
     let picker = matches!(style, ButtonStyle::Picker);
@@ -2666,13 +2692,21 @@ unsafe extern "system" fn trackbar_theme_proc(
             // 绘制仅消费已有失效区，避免在合成控件树时再次触发祖先重绘
             let mut paint: PAINTSTRUCT = zeroed();
             let dc = BeginPaint(hwnd, &mut paint);
-            if !dc.is_null() && !paint_trackbar(hwnd, dc, compact != 0) {
+            // 隐藏滑块只消费失效区，避免残留消息覆盖同位置的可见控件
+            if !dc.is_null()
+                && IsWindowVisible(hwnd) != 0
+                && !paint_trackbar(hwnd, dc, compact != 0)
+            {
                 DefSubclassProc(hwnd, WM_PRINTCLIENT, dc as usize, PRF_CLIENT as isize);
             }
             EndPaint(hwnd, &paint);
             return 0;
         }
         WM_PRINTCLIENT => {
+            // 尊重调用方的可见性约束，未指定时仍支持离屏绘制
+            if lparam & PRF_CHECKVISIBLE as isize != 0 && IsWindowVisible(hwnd) == 0 {
+                return 0;
+            }
             if paint_trackbar(hwnd, wparam as HDC, compact != 0) {
                 return 0;
             }
@@ -2715,7 +2749,7 @@ unsafe extern "system" fn trackbar_theme_proc(
         | TBM_SETPOSNOTIFY => true,
         _ => false,
     };
-    if redraw {
+    if redraw && IsWindowVisible(hwnd) != 0 {
         InvalidateRect(hwnd, null(), 0);
     }
     DefSubclassProc(hwnd, message, wparam, lparam)
@@ -2723,12 +2757,12 @@ unsafe extern "system" fn trackbar_theme_proc(
 
 unsafe fn paint_trackbar(hwnd: HWND, dc: HDC, compact: bool) -> bool {
     let mut client: RECT = zeroed();
-    if dc.is_null()
-        || GetClientRect(hwnd, &mut client) == 0
-        || client.right <= 0
-        || client.bottom <= 0
-    {
+    if dc.is_null() || GetClientRect(hwnd, &mut client) == 0 {
         return false;
+    }
+    // 零尺寸控件无需绘制，作为已处理避免回退原生路径
+    if client.right <= client.left || client.bottom <= client.top {
+        return true;
     }
     let dpi = GetDpiForWindow(hwnd).max(96);
     let enabled = IsWindowEnabled(hwnd) != 0;

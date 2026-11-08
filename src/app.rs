@@ -73,6 +73,7 @@ const EVENT_MINI_SELECT: usize = 31;
 const EVENT_MINI_SLIDER: usize = 32;
 const EVENT_MINI_ACTIVATE: usize = 33;
 const EVENT_REDRAW: usize = 34;
+const EVENT_TOPMOST_SYNC: usize = 35;
 const HOTKEY_RESTORE: i32 = 1;
 const TIMER_TARGET_ACTIVITY: usize = 2;
 const ICON_RESOURCE: usize = 101;
@@ -145,7 +146,6 @@ const MINI_MIN_HEIGHT: i32 = 150;
 const MINI_DETAIL_TITLE_MIN_HEIGHT: i32 = 190;
 const MINI_DETAIL_TITLE_MIN_WIDTH: i32 = 100;
 const SELF_SLIDER_WIDTH: i32 = 88;
-const MINI_SELF_HORIZONTAL_MIN_WIDTH: i32 = SELF_SLIDER_WIDTH + 36;
 const PICKER_BUTTON_SIZE: i32 = 32;
 const MINI_ACTION_BUTTON_SIZE: i32 = 24;
 const MIN_MAIN_BODY_HEIGHT: i32 = 262;
@@ -412,28 +412,57 @@ fn main_footer_bounds(client: RECT, dpi: u32) -> [(i32, [i32; 4]); 5] {
     ]
 }
 
-fn mini_footer_bounds(client: RECT, dpi: u32) -> [(i32, [i32; 4]); 3] {
+fn mini_footer_action_visible(client: RECT, dpi: u32) -> bool {
+    client.right - client.left >= 2 * pixel(MINI_ACTION_BUTTON_SIZE, dpi) + 3 * pixel(4, dpi)
+}
+
+fn mini_footer_slider_visible(client: RECT, dpi: u32) -> bool {
+    client.right - client.left
+        >= pixel(SELF_SLIDER_WIDTH, dpi)
+            + 2 * pixel(MINI_ACTION_BUTTON_SIZE, dpi)
+            + 4 * pixel(4, dpi)
+}
+
+fn mini_footer_bounds(client: RECT, dpi: u32) -> [(i32, [i32; 4]); 4] {
     let button_side = pixel(MINI_ACTION_BUTTON_SIZE, dpi);
-    let bottom = client.bottom - pixel(4, dpi);
-    let show_slider = client.right - client.left >= pixel(MINI_SELF_HORIZONTAL_MIN_WIDTH, dpi);
-    let button_left = if show_slider {
-        client.left + pixel(4, dpi)
-    } else {
-        client.left + (client.right - client.left - button_side) / 2
-    };
-    let button = [button_left, bottom - button_side, button_side, button_side];
+    let gap = pixel(4, dpi);
+    let bottom = client.bottom - gap;
+    let width = client.right - client.left;
+    let show_action = mini_footer_action_visible(client, dpi);
+    let show_slider = mini_footer_slider_visible(client, dpi);
     let slider_width = pixel(SELF_SLIDER_WIDTH, dpi);
+    let slider_left = client.right - gap - slider_width;
+    let button_top = bottom - button_side;
+    let (button_left, topmost_left) = if show_slider {
+        (client.left + gap, slider_left - gap - button_side)
+    } else if show_action {
+        let left = client.left + (width - 2 * button_side - gap) / 2;
+        (left, left + button_side + gap)
+    } else {
+        // 最窄模式只保留居中的置顶按钮
+        let left = client.left + (width - button_side) / 2;
+        (left, left)
+    };
+    let button = if show_action {
+        [button_left, button_top, button_side, button_side]
+    } else {
+        [0, 0, 0, 0]
+    };
     [
         (ID_MINI_BACK, button),
         (ID_MINI_MODE, button),
         (
+            ID_TOPMOST,
+            [topmost_left, button_top, button_side, button_side],
+        ),
+        (
             ID_SELF_SLIDER,
-            [
-                client.right - pixel(4, dpi) - slider_width,
-                bottom - button_side,
-                slider_width,
-                button_side,
-            ],
+            if show_slider {
+                [slider_left, button_top, slider_width, button_side]
+            } else {
+                // 隐藏滑块不保留覆盖底部按钮的绘制区域
+                [0, 0, 0, 0]
+            },
         ),
     ]
 }
@@ -1611,6 +1640,7 @@ struct App {
     picker_tooltip: Option<ControlTooltip>,
     refresh_tooltip: Option<ControlTooltip>,
     name_tooltip: Option<ControlTooltip>,
+    topmost_tooltip: Option<ControlTooltip>,
     mini_tooltip: Option<ControlTooltip>,
     mini_open_tooltip: Option<ControlTooltip>,
     picker_overlay: Option<PickerOverlay>,
@@ -1677,6 +1707,7 @@ impl App {
             picker_tooltip: None,
             refresh_tooltip: None,
             name_tooltip: None,
+            topmost_tooltip: None,
             mini_tooltip: None,
             mini_open_tooltip: None,
             picker_overlay: None,
@@ -1829,7 +1860,7 @@ impl App {
             "BUTTON",
             "置顶",
             ID_TOPMOST,
-            WS_TABSTOP | BS_AUTOCHECKBOX as u32 | BS_RIGHT as u32,
+            WS_TABSTOP | BS_OWNERDRAW as u32,
         )?;
         self.add(
             "BUTTON",
@@ -2216,6 +2247,11 @@ impl App {
             self.control(ID_SHOW_WINDOW_NAME),
             tr("隐藏顶部窗口名称", "Hide the window name above"),
         );
+        self.topmost_tooltip = ControlTooltip::new(
+            hwnd,
+            self.control(ID_TOPMOST),
+            tr("置顶 Trans 窗口", "Keep Trans on top"),
+        );
         self.mini_tooltip = ControlTooltip::new(
             hwnd,
             self.control(ID_MINI_MODE),
@@ -2251,12 +2287,6 @@ impl App {
             } as usize,
             0,
         );
-        SendMessageW(
-            self.control(ID_TOPMOST),
-            BM_SETCHECK,
-            BST_CHECKED as usize,
-            0,
-        );
         SetWindowPos(
             hwnd,
             HWND_TOPMOST,
@@ -2266,6 +2296,7 @@ impl App {
             0,
             SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
         );
+        self.sync_topmost_button();
         for (id, checked) in [
             (ID_DEFAULT_CONTAINER, self.settings.default_container),
             (ID_SHOW_ICONS, self.settings.show_icons),
@@ -2389,6 +2420,7 @@ impl App {
                 self.picker_tooltip.as_ref(),
                 self.refresh_tooltip.as_ref(),
                 self.name_tooltip.as_ref(),
+                self.topmost_tooltip.as_ref(),
                 self.mini_tooltip.as_ref(),
                 self.mini_open_tooltip.as_ref(),
             ]
@@ -2481,12 +2513,11 @@ impl App {
         let scroll_offset = panel.scroll_offset();
         let english = self.settings.language == Language::English;
         let about_value_left = if english { 60 } else { 46 };
-        // 按实际字体测量复选框内容，避免中英文预留宽度造成不同的图标间距
-        let topmost_width = ui_theme::compact_checkbox_width(self.control(ID_TOPMOST))
-            .unwrap_or_else(|| pixel(if english { 72 } else { 44 }, dpi));
+        // 名称显隐和置顶均使用相同尺寸的图标按钮
+        let topmost_width = pixel(24, dpi);
         let name_toggle_width = pixel(24, dpi);
         let topmost_left = rect.right - pixel(10, dpi) - topmost_width;
-        let name_toggle_left = topmost_left - name_toggle_width - 6;
+        let name_toggle_left = topmost_left - name_toggle_width - pixel(6, dpi);
         let name_row_bounds = [
             (
                 ID_TARGET,
@@ -2706,6 +2737,48 @@ impl App {
             && bounds.right - bounds.left >= pixel(MINI_DETAIL_TITLE_MIN_WIDTH, dpi)
     }
 
+    unsafe fn mini_footer_action_visible(&self) -> bool {
+        let mut bounds: RECT = zeroed();
+        GetClientRect(self.hwnd, &mut bounds) != 0
+            && mini_footer_action_visible(bounds, GetDpiForWindow(self.hwnd).max(96))
+    }
+
+    unsafe fn mini_mode_button_visible(&self) -> bool {
+        !self.settings_page
+            && (!self.mini_mode
+                || (self.mini_detail.is_none() && self.mini_footer_action_visible()))
+    }
+
+    unsafe fn update_mini_action_visibility(&self) {
+        if !self.mini_mode {
+            return;
+        }
+        let fits = self.mini_footer_action_visible();
+        let mut restore_focus = false;
+        for (id, active) in [
+            (ID_MINI_MODE, self.mini_detail.is_none()),
+            (ID_MINI_BACK, self.mini_detail.is_some()),
+        ] {
+            let control = self.control(id);
+            let visible = fits && active;
+            if !visible {
+                restore_focus |= GetFocus() == control;
+                if GetCapture() == control {
+                    ReleaseCapture();
+                }
+            }
+            if (GetWindowLongPtrW(control, GWL_STYLE) as u32 & WS_VISIBLE != 0) != visible {
+                ShowWindow(control, if visible { SW_SHOW } else { SW_HIDE });
+            }
+        }
+        if let Some(tooltip) = &self.mini_tooltip {
+            tooltip.set_active(self.mini_mode_button_visible() && !self.picking);
+        }
+        if restore_focus && main_window_active(self.hwnd) {
+            SetFocus(self.control(ID_TOPMOST));
+        }
+    }
+
     unsafe fn self_slider_visible(&self) -> bool {
         if self.settings_page {
             return false;
@@ -2715,11 +2788,7 @@ impl App {
         }
         let mut bounds: RECT = zeroed();
         GetClientRect(self.hwnd, &mut bounds) != 0
-            && bounds.right - bounds.left
-                >= pixel(
-                    MINI_SELF_HORIZONTAL_MIN_WIDTH,
-                    GetDpiForWindow(self.hwnd).max(96),
-                )
+            && mini_footer_slider_visible(bounds, GetDpiForWindow(self.hwnd).max(96))
     }
 
     unsafe fn update_self_slider_visibility(&self) {
@@ -2747,7 +2816,6 @@ impl App {
 
     unsafe fn layout_mini(&mut self, rect: RECT, dpi: u32) {
         let width = (rect.right * 96 / dpi as i32).max(MINI_MIN_WIDTH);
-        let height = (rect.bottom * 96 / dpi as i32).max(MINI_MIN_HEIGHT);
         let show_title = self.mini_detail_title_visible();
         let title = self.control(ID_MINI_TITLE);
         if (GetWindowLongPtrW(title, GWL_STYLE) as u32 & WS_VISIBLE != 0) != show_title {
@@ -2759,9 +2827,20 @@ impl App {
             PICKER_BUTTON_SIZE
         };
         let content_y = 4 + top_button_size + 4;
-        let bottom_button_y = height - MINI_ACTION_BUTTON_SIZE - 4;
-        let list_bottom = bottom_button_y - 4;
         let footer_bounds = mini_footer_bounds(rect, dpi);
+        let footer_top = footer_bounds
+            .iter()
+            .filter(|(_, bounds)| bounds[3] > 0)
+            .map(|(_, bounds)| bounds[1])
+            .min()
+            .unwrap_or(rect.bottom);
+        let list_top = pixel(content_y, dpi);
+        let list_bounds = [
+            rect.left + pixel(4, dpi),
+            list_top,
+            (rect.right - rect.left - 2 * pixel(4, dpi)).max(0),
+            (footer_top - pixel(4, dpi) - list_top).max(0),
+        ];
         // 按相邻控件的实际边缘延长滑块，避免 DPI 分别取整造成重叠
         let slider_top = if show_title {
             pixel(content_y, dpi) + pixel(18, dpi)
@@ -2773,8 +2852,9 @@ impl App {
             rect.left + (rect.right - rect.left - slider_width) / 2,
             slider_top,
             slider_width,
-            (footer_bounds[0].1[1] - slider_top).max(0),
+            (footer_top - slider_top).max(0),
         ];
+        self.update_mini_action_visibility();
         self.update_self_slider_visibility();
         let positions: Vec<_> = [
             (
@@ -2792,13 +2872,6 @@ impl App {
                 MINI_ACTION_BUTTON_SIZE,
             ),
             (ID_MINI_TITLE, 4, content_y, width - 8, 18),
-            (
-                ID_MINI_LIST,
-                4,
-                content_y,
-                width - 8,
-                list_bottom - content_y,
-            ),
         ]
         .into_iter()
         .map(|(id, x, y, width, height)| {
@@ -2812,7 +2885,7 @@ impl App {
                 ],
             )
         })
-        .chain([(ID_MINI_SLIDER, slider_bounds)])
+        .chain([(ID_MINI_LIST, list_bounds), (ID_MINI_SLIDER, slider_bounds)])
         .chain(footer_bounds)
         .filter_map(|(id, bounds)| {
             let control = self.controls.iter().find(|control| control.id == id)?;
@@ -2961,7 +3034,11 @@ impl App {
         self.refresh_changed_list(false);
         self.update_mini_view();
         self.update_enabled();
-        SetFocus(self.control(ID_MINI_MODE));
+        SetFocus(self.control(if self.mini_mode_button_visible() {
+            ID_MINI_MODE
+        } else {
+            ID_TOPMOST
+        }));
         if let Err(error) = self.save_current_settings() {
             self.report_error(&error);
         }
@@ -3166,15 +3243,14 @@ impl App {
     }
 
     unsafe fn update_page_visibility(&self) {
+        if let Some(tooltip) = &self.topmost_tooltip {
+            tooltip.set_active(!self.settings_page && !self.picking);
+        }
         if let Some(tooltip) = &self.name_tooltip {
             tooltip.set_active(!self.settings_page && !self.mini_mode && !self.picking);
         }
         if let Some(tooltip) = &self.mini_tooltip {
-            tooltip.set_active(
-                !self.settings_page
-                    && !self.picking
-                    && (!self.mini_mode || self.mini_detail.is_none()),
-            );
+            tooltip.set_active(self.mini_mode_button_visible() && !self.picking);
         }
         if let Some(tooltip) = &self.picker_tooltip {
             tooltip.set_active(
@@ -3196,16 +3272,18 @@ impl App {
         }
         let mini_title_visible = self.mini_detail_title_visible();
         for control in &self.controls {
-            if control.id == ID_SELF_SLIDER {
+            if control.id == ID_SELF_SLIDER
+                || (self.mini_mode && matches!(control.id, ID_MINI_MODE | ID_MINI_BACK))
+            {
                 continue;
             }
             let visible = if self.mini_mode {
                 match control.id {
+                    ID_TOPMOST => true,
                     ID_PICK => self.mini_detail.is_none(),
-                    ID_MINI_MODE => self.mini_detail.is_none(),
                     ID_MINI_LIST => self.mini_detail.is_none() && !self.changed_windows.is_empty(),
                     ID_MINI_TITLE => mini_title_visible,
-                    ID_MINI_BACK | ID_MINI_SLIDER | ID_MINI_OPEN => self.mini_detail.is_some(),
+                    ID_MINI_SLIDER | ID_MINI_OPEN => self.mini_detail.is_some(),
                     _ => false,
                 }
             } else {
@@ -3233,6 +3311,7 @@ impl App {
                 ShowWindow(control.hwnd, if visible { SW_SHOW } else { SW_HIDE });
             }
         }
+        self.update_mini_action_visibility();
         self.update_self_slider_visibility();
         if let Some(panel) = &self.settings_panel {
             panel.show(self.settings_page && !self.mini_mode);
@@ -3330,6 +3409,7 @@ impl App {
         self.sync_language_selection();
         self.sync_name_button();
         self.sync_mini_button();
+        self.sync_topmost_button();
         self.update_mini_view();
         InvalidateRect(self.control(ID_HOTKEY_INPUT), null(), 0);
     }
@@ -3345,6 +3425,59 @@ impl App {
         set_button_selected(button, self.settings.show_window_name);
         if let Some(tooltip) = &mut self.name_tooltip {
             tooltip.update_caption(self.hwnd, button, caption);
+        }
+    }
+
+    unsafe fn sync_topmost_button(&mut self) {
+        let button = self.control(ID_TOPMOST);
+        if button.is_null() {
+            return;
+        }
+        let topmost = GetWindowLongPtrW(self.hwnd, GWL_EXSTYLE) as u32 & WS_EX_TOPMOST != 0;
+        let caption = if topmost {
+            tr("取消 Trans 窗口置顶", "Stop keeping Trans on top")
+        } else {
+            tr("置顶 Trans 窗口", "Keep Trans on top")
+        };
+        set_button_selected(button, topmost);
+        if read_text(button) != caption {
+            set_text(button, caption);
+            if let Some(tooltip) = &mut self.topmost_tooltip {
+                tooltip.update_caption(self.hwnd, button, caption);
+            }
+        }
+    }
+
+    unsafe fn toggle_topmost(&mut self) {
+        let topmost = GetWindowLongPtrW(self.hwnd, GWL_EXSTYLE) as u32 & WS_EX_TOPMOST != 0;
+        let changed = SetWindowPos(
+            self.hwnd,
+            if topmost {
+                HWND_NOTOPMOST
+            } else {
+                HWND_TOPMOST
+            },
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+        );
+        let error = if changed == 0 {
+            Some(GetLastError())
+        } else {
+            None
+        };
+        // 按实际窗口状态更新图标，失败时不会显示为已切换
+        self.sync_topmost_button();
+        if let Some(error) = error {
+            self.report_error(&format!(
+                "{} {error}",
+                tr(
+                    "无法切换窗口置顶状态，Windows 错误码",
+                    "Cannot change the always-on-top state; Windows error"
+                )
+            ));
         }
     }
 
@@ -3735,17 +3868,21 @@ impl App {
                 Err(error) => self.report_error(&error),
             }
         }
+        let slider = self.control(ID_SELF_SLIDER);
+        let slider_visible = IsWindowVisible(slider) != 0;
         SendMessageW(
-            self.control(ID_SELF_SLIDER),
+            slider,
             TBM_SETPOS,
-            1,
+            slider_visible as usize,
             self.self_transparency as isize,
         );
         set_text(
             self.control(ID_SELF_LABEL),
             &format!("{}%", self.self_transparency),
         );
-        InvalidateRect(self.control(ID_SELF_SLIDER), null(), 0);
+        if slider_visible {
+            InvalidateRect(slider, null(), 0);
+        }
         if save && self.settings.self_transparency != self.self_transparency {
             if let Err(error) = self.save_current_settings() {
                 self.report_error(&format!(
@@ -3862,6 +3999,9 @@ impl App {
         if !exit && self.settings.close_to_tray {
             match self.ensure_tray() {
                 Ok(()) => {
+                    if let Some(tooltip) = &self.topmost_tooltip {
+                        tooltip.set_active(false);
+                    }
                     if let Some(tooltip) = &self.picker_tooltip {
                         tooltip.set_active(false);
                     }
@@ -4086,15 +4226,14 @@ impl App {
     }
 
     unsafe fn update_enabled(&self) {
+        if let Some(tooltip) = &self.topmost_tooltip {
+            tooltip.set_active(!self.settings_page && !self.picking);
+        }
         EnableWindow(self.control(ID_MINI_MODE), (!self.picking) as i32);
         EnableWindow(self.control(ID_MINI_LIST), (!self.picking) as i32);
         EnableWindow(self.control(ID_MINI_BACK), (!self.picking) as i32);
         if let Some(tooltip) = &self.mini_tooltip {
-            tooltip.set_active(
-                !self.settings_page
-                    && !self.picking
-                    && (!self.mini_mode || self.mini_detail.is_none()),
-            );
+            tooltip.set_active(self.mini_mode_button_visible() && !self.picking);
         }
         EnableWindow(self.control(ID_SHOW_WINDOW_NAME), (!self.picking) as i32);
         if let Some(tooltip) = &self.name_tooltip {
@@ -4146,9 +4285,12 @@ impl App {
                 self.selected_valid && self.last_percent == *percent,
             );
         }
-        InvalidateRect(self.control(ID_SLIDER), null(), 0);
-        InvalidateRect(self.control(ID_MINI_SLIDER), null(), 0);
-        InvalidateRect(self.control(ID_SELF_SLIDER), null(), 0);
+        for id in [ID_SLIDER, ID_MINI_SLIDER, ID_SELF_SLIDER] {
+            let slider = self.control(id);
+            if IsWindowVisible(slider) != 0 {
+                InvalidateRect(slider, null(), 0);
+            }
+        }
     }
 
     unsafe fn maintain_taskbar_state(&mut self) {
@@ -5126,29 +5268,14 @@ impl App {
                         self.cancel_picker();
                         self.restore_all();
                     }
-                    ID_TOPMOST => {
-                        let checked = SendMessageW(self.control(ID_TOPMOST), BM_GETCHECK, 0, 0)
-                            == BST_CHECKED as isize;
-                        SetWindowPos(
-                            self.hwnd,
-                            if checked {
-                                HWND_TOPMOST
-                            } else {
-                                HWND_NOTOPMOST
-                            },
-                            0,
-                            0,
-                            0,
-                            0,
-                            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
-                        );
-                    }
+                    ID_TOPMOST => self.toggle_topmost(),
                     id if (ID_PRESET..ID_PRESET + 5).contains(&id) => {
                         self.apply_percent(self.settings.preset_levels[(id - ID_PRESET) as usize])
                     }
                     _ => {}
                 }
             }
+            EVENT_TOPMOST_SYNC => self.sync_topmost_button(),
             EVENT_LANGUAGE_CHANGE => match parameter {
                 0 => self.change_language(Language::Chinese),
                 1 => self.change_language(Language::English),
@@ -5172,6 +5299,7 @@ impl Drop for App {
             self.picker_tooltip = None;
             self.refresh_tooltip = None;
             self.name_tooltip = None;
+            self.topmost_tooltip = None;
             self.mini_tooltip = None;
             self.mini_open_tooltip = None;
             self.mini_list = None;
@@ -5526,6 +5654,7 @@ unsafe extern "system" fn window_proc(
                     ID_PICK => ButtonStyle::Picker,
                     ID_REFRESH => ButtonStyle::Refresh,
                     ID_SHOW_WINDOW_NAME => ButtonStyle::NameVisibility,
+                    ID_TOPMOST => ButtonStyle::Topmost,
                     ID_MINI_MODE => ButtonStyle::MiniMode,
                     ID_SETTINGS => ButtonStyle::Icon,
                     ID_SETTINGS_BACK | ID_MINI_BACK => ButtonStyle::Back,
@@ -5778,6 +5907,12 @@ unsafe extern "system" fn window_proc(
             if !state.is_null() && GetWindowLongPtrW(hwnd, GWLP_USERDATA) == state as isize {
                 if let Ok(mut app) = (*state).try_borrow_mut() {
                     app.remember_main_window_geometry();
+                    if flags & SWP_NOZORDER == 0 {
+                        app.sync_topmost_button();
+                    }
+                } else if flags & SWP_NOZORDER == 0 {
+                    // 嵌套通知等待 App 状态释放后再同步图标和提示
+                    post(hwnd, EVENT_TOPMOST_SYNC, 0);
                 }
                 if position_affects_surface(flags) && IsIconic(hwnd) == 0 {
                     layout_for_window_size(hwnd, state);
