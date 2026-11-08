@@ -990,7 +990,7 @@ unsafe fn fit_list_columns(list: HWND) {
         if width <= 0 {
             break;
         }
-        let capacity = crate::list_layout::report_column_capacity(list, width);
+        let capacity = crate::list_layout::column_capacity(width);
         let widths = proportional_list_columns(
             capacity,
             GetDpiForWindow(list).max(96),
@@ -1017,10 +1017,8 @@ unsafe fn fit_list_columns(list: HWND) {
             break;
         }
         let updated_width = updated.right - updated.left;
-        // 隐藏横滚也会改变可见行数，宽度不变时仍需复核纵滚预留
-        if updated_width == width
-            && crate::list_layout::report_column_capacity(list, updated_width) == capacity
-        {
+        // 实际纵向滚动条显隐会改变客户区宽度，稳定后结束调整
+        if updated_width == width {
             break;
         }
     }
@@ -1732,11 +1730,22 @@ impl App {
             )
             .into());
         }
-        if class == "BUTTON"
-            && style & BS_TYPEMASK as u32 == BS_OWNERDRAW as u32
-            && !ui_theme::install_button_hover(hwnd)
-        {
-            return Err(tr("无法初始化按钮样式", "Cannot initialize the button style").into());
+        if class == "BUTTON" {
+            match (style & BS_TYPEMASK as u32) as i32 {
+                BS_OWNERDRAW if !ui_theme::install_button_hover(hwnd) => {
+                    return Err(
+                        tr("无法初始化按钮样式", "Cannot initialize the button style").into(),
+                    );
+                }
+                BS_AUTOCHECKBOX if !ui_theme::install_checkbox_theme(hwnd) => {
+                    return Err(tr(
+                        "无法初始化复选框样式",
+                        "Cannot initialize the checkbox style",
+                    )
+                    .into());
+                }
+                _ => {}
+            }
         }
         if class == "msctls_trackbar32"
             && !ui_theme::install_trackbar_theme(hwnd, id == ID_SELF_SLIDER)
@@ -1787,13 +1796,6 @@ impl App {
             ID_TOPMOST,
             WS_TABSTOP | BS_AUTOCHECKBOX as u32 | BS_RIGHT as u32,
         )?;
-        if !ui_theme::install_compact_checkbox(self.control(ID_TOPMOST)) {
-            return Err(tr(
-                "无法初始化置顶选项样式",
-                "Cannot initialize the always-on-top option style",
-            )
-            .into());
-        }
         self.add(
             "BUTTON",
             "拖动选窗",
@@ -1976,13 +1978,6 @@ impl App {
             ID_HOTKEY_ENABLED,
             WS_TABSTOP | BS_AUTOCHECKBOX as u32 | BS_RIGHT as u32,
         )?;
-        if !ui_theme::install_compact_checkbox(self.control(ID_HOTKEY_ENABLED)) {
-            return Err(tr(
-                "无法初始化快捷键启用选项样式",
-                "Cannot initialize the shortcut enable option style",
-            )
-            .into());
-        }
         self.add(
             "STATIC",
             "恢复全部",

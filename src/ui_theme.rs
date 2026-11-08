@@ -517,13 +517,27 @@ unsafe extern "system" fn button_hover_proc(
     result
 }
 
-pub unsafe fn install_compact_checkbox(hwnd: HWND) -> bool {
-    SetWindowSubclass(
+pub unsafe fn install_checkbox_theme(hwnd: HWND) -> bool {
+    if SetWindowSubclass(
         hwnd,
         Some(compact_checkbox_proc),
         COMPACT_CHECKBOX_SUBCLASS,
         0,
-    ) != 0
+    ) == 0
+    {
+        return false;
+    }
+    SendMessageW(
+        hwnd,
+        WM_UPDATEUISTATE,
+        (UIS_SET | (UISF_HIDEFOCUS << 16)) as usize,
+        0,
+    );
+    true
+}
+
+unsafe fn checkbox_parent_ui_state(hwnd: HWND) -> u32 {
+    SendMessageW(GetParent(hwnd), WM_QUERYUISTATE, 0, 0) as u32
 }
 
 unsafe extern "system" fn compact_checkbox_proc(
@@ -535,6 +549,18 @@ unsafe extern "system" fn compact_checkbox_proc(
     data: usize,
 ) -> LRESULT {
     match message {
+        WM_UPDATEUISTATE => {
+            // 只隐藏本控件的原生焦点框，自绘焦点仍遵循父窗口的键盘提示状态
+            let desired = checkbox_parent_ui_state(hwnd) | UISF_HIDEFOCUS;
+            let flags = UISF_HIDEFOCUS | UISF_HIDEACCEL | UISF_ACTIVE;
+            for (action, mask) in [(UIS_SET, desired & flags), (UIS_CLEAR, !desired & flags)] {
+                if mask != 0 {
+                    DefSubclassProc(hwnd, message, (action | (mask << 16)) as usize, 0);
+                }
+            }
+            InvalidateRect(hwnd, null(), 0);
+            return 0;
+        }
         WM_PAINT => {
             let mut paint: PAINTSTRUCT = zeroed();
             let dc = BeginPaint(hwnd, &mut paint);
@@ -567,7 +593,6 @@ unsafe extern "system" fn compact_checkbox_proc(
         WM_ENABLE
             | WM_SETFOCUS
             | WM_KILLFOCUS
-            | WM_UPDATEUISTATE
             | WM_SETTEXT
             | WM_SETFONT
             | BM_SETCHECK
@@ -625,15 +650,22 @@ unsafe fn draw_compact_checkbox(hwnd: HWND, dc: HDC, rect: RECT, hovered: bool) 
     let enabled = IsWindowEnabled(hwnd) != 0;
     let checked = SendMessageW(hwnd, BM_GETCHECK, 0, 0) != BST_UNCHECKED as isize;
     let pressed = SendMessageW(hwnd, BM_GETSTATE, 0, 0) as u32 & BST_PUSHED != 0;
+    let focused =
+        enabled && GetFocus() == hwnd && checkbox_parent_ui_state(hwnd) & UISF_HIDEFOCUS == 0;
+    let right_aligned = GetWindowLongPtrW(hwnd, GWL_STYLE) as u32 & BS_RIGHT as u32 != 0;
     let length = GetWindowTextLengthW(hwnd).max(0) as usize;
     let mut text = vec![0_u16; length + 1];
     let copied = GetWindowTextW(hwnd, text.as_mut_ptr(), text.len() as i32);
     font_for(dc, hwnd);
     let mut size: SIZE = zeroed();
     GetTextExtentPoint32W(dc, text.as_ptr(), copied, &mut size);
-    let side = pixels(12, dpi);
+    let side = pixels(if right_aligned { 12 } else { 13 }, dpi);
     let gap = pixels(4, dpi);
-    let text_left = (rect.right - size.cx).max(rect.left + side + gap);
+    let text_left = if right_aligned {
+        (rect.right - size.cx).max(rect.left + side + gap)
+    } else {
+        rect.left + side + gap
+    };
     let mut label = RECT {
         left: text_left,
         ..rect
@@ -646,7 +678,7 @@ unsafe fn draw_compact_checkbox(hwnd: HWND, dc: HDC, rect: RECT, hovered: bool) 
     };
     let border = if !enabled {
         BORDER
-    } else if checked || pressed {
+    } else if checked || pressed || focused {
         ACCENT
     } else if hovered {
         PICKER_BORDER
@@ -657,6 +689,12 @@ unsafe fn draw_compact_checkbox(hwnd: HWND, dc: HDC, rect: RECT, hovered: bool) 
         SUBTLE
     } else if pressed {
         PRESSED
+    } else if focused {
+        if checked {
+            PICKER_HOVER
+        } else {
+            ACCENT_SOFT
+        }
     } else if checked {
         ACCENT_SOFT
     } else if hovered {
@@ -694,18 +732,24 @@ unsafe fn draw_compact_checkbox(hwnd: HWND, dc: HDC, rect: RECT, hovered: bool) 
         }
     }
     SetBkMode(dc, TRANSPARENT as i32);
-    SetTextColor(dc, if enabled { TEXT } else { DISABLED_TEXT });
+    SetTextColor(
+        dc,
+        if !enabled {
+            DISABLED_TEXT
+        } else if focused {
+            ACCENT
+        } else {
+            TEXT
+        },
+    );
+    let alignment = if right_aligned { DT_RIGHT } else { DT_LEFT };
     DrawTextW(
         dc,
         text.as_ptr(),
         copied,
         &mut label,
-        DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX,
+        alignment | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX,
     );
-    if GetFocus() == hwnd && SendMessageW(hwnd, WM_QUERYUISTATE, 0, 0) as u32 & UISF_HIDEFOCUS == 0
-    {
-        DrawFocusRect(dc, &inset(rect, pixels(1, dpi)));
-    }
     true
 }
 
@@ -2462,10 +2506,12 @@ unsafe fn draw_button_content(item: &DRAWITEMSTRUCT, style: ButtonStyle, selecte
     let disabled = item.itemState & (ODS_DISABLED | ODS_GRAYED) != 0;
     let pressed = item.itemState & ODS_SELECTED != 0;
     let hot = !disabled && hovered(item.hwndItem);
+    let focused =
+        !disabled && item.itemState & ODS_FOCUS != 0 && item.itemState & ODS_NOFOCUSRECT == 0;
     // 名称行使用轻量图标按钮，常态不绘制外框或选中底色
     if matches!(style, ButtonStyle::NameVisibility) {
         fill(item.hDC, &item.rcItem, BACKGROUND);
-        if !disabled && (hot || pressed) {
+        if !disabled && (hot || pressed || focused) {
             let background = if pressed { PRESSED } else { HOVER };
             rounded(
                 item.hDC,
@@ -2476,7 +2522,7 @@ unsafe fn draw_button_content(item: &DRAWITEMSTRUCT, style: ButtonStyle, selecte
         }
         let foreground = if disabled {
             DISABLED_TEXT
-        } else if hot || pressed {
+        } else if hot || pressed || focused {
             ACCENT
         } else {
             MUTED
@@ -2487,9 +2533,6 @@ unsafe fn draw_button_content(item: &DRAWITEMSTRUCT, style: ButtonStyle, selecte
             ..item.rcItem
         };
         name_visibility_icon(item.hDC, icon_rect, dpi, foreground, selected);
-        if item.itemState & ODS_FOCUS != 0 && item.itemState & ODS_NOFOCUSRECT == 0 {
-            DrawFocusRect(item.hDC, &inset(item.rcItem, pixels(1, dpi)));
-        }
         return true;
     }
     let picker = matches!(style, ButtonStyle::Picker);
@@ -2535,6 +2578,16 @@ unsafe fn draw_button_content(item: &DRAWITEMSTRUCT, style: ButtonStyle, selecte
             },
         )
     };
+    // 沿按钮原有圆角边框提示键盘焦点，避免叠加方形虚线
+    let border = if focused {
+        if matches!(style, ButtonStyle::Primary) {
+            ACCENT_PRESSED
+        } else {
+            ACCENT
+        }
+    } else {
+        border
+    };
     fill(item.hDC, &item.rcItem, BACKGROUND);
     let outline = inset(item.rcItem, pixels(1, dpi));
     draw_rounded_surface(
@@ -2574,10 +2627,6 @@ unsafe fn draw_button_content(item: &DRAWITEMSTRUCT, style: ButtonStyle, selecte
             &mut content,
             DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX,
         );
-    }
-    if item.itemState & ODS_FOCUS != 0 && item.itemState & ODS_NOFOCUSRECT == 0 {
-        let focus = inset(outline, pixels(4, dpi));
-        DrawFocusRect(item.hDC, &focus);
     }
     true
 }

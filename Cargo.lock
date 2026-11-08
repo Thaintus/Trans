@@ -19,7 +19,7 @@ dependencies = [
 
 [[package]]
 name = "Trans"
-version = "2.2.3"
+version = "2.2.5"
 dependencies = [
  "windows-sys",
 ]

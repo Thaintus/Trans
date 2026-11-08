@@ -3,8 +3,7 @@ use std::mem::zeroed;
 
 use windows_sys::Win32::Foundation::{HWND, RECT};
 use windows_sys::Win32::UI::Controls::{
-    HDM_GETITEMCOUNT, LVM_GETCOLUMNWIDTH, LVM_GETCOUNTPERPAGE, LVM_GETHEADER, LVM_GETITEMCOUNT,
-    LVM_SETCOLUMNWIDTH,
+    HDM_GETITEMCOUNT, LVM_GETCOLUMNWIDTH, LVM_GETHEADER, LVM_SETCOLUMNWIDTH,
 };
 use windows_sys::Win32::UI::HiDpi::{GetDpiForWindow, GetSystemMetricsForDpi};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
@@ -37,19 +36,6 @@ pub fn is_preparing(hwnd: HWND) -> bool {
 // 列尾留一个物理像素，避免原生滚动范围在临界宽度舍入后溢出
 pub fn column_capacity(client_width: i32) -> i32 {
     client_width.saturating_sub(1).max(0)
-}
-
-pub unsafe fn report_column_capacity(hwnd: HWND, client_width: i32) -> i32 {
-    // 列表太矮时原生控件仍预留纵滚宽度，即使 WS_VSCROLL 没有出现
-    let missing_vertical = GetWindowLongPtrW(hwnd, GWL_STYLE) as u32 & WS_VSCROLL == 0
-        && SendMessageW(hwnd, LVM_GETITEMCOUNT, 0, 0)
-            > SendMessageW(hwnd, LVM_GETCOUNTPERPAGE, 0, 0).max(0);
-    let reserve = if missing_vertical {
-        GetSystemMetricsForDpi(SM_CXVSCROLL, GetDpiForWindow(hwnd).max(96)).max(0)
-    } else {
-        0
-    };
-    column_capacity(client_width.saturating_sub(reserve))
 }
 
 fn resize_capacity(

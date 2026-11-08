@@ -5,7 +5,7 @@ use std::rc::Rc;
 use windows_sys::Win32::Foundation::*;
 use windows_sys::Win32::Graphics::Gdi::*;
 use windows_sys::Win32::UI::Controls::*;
-use windows_sys::Win32::UI::HiDpi::GetDpiForWindow;
+use windows_sys::Win32::UI::HiDpi::{GetDpiForWindow, GetSystemMetricsForDpi};
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     GetCapture, IsWindowEnabled, ReleaseCapture, SetCapture, TrackMouseEvent, TME_LEAVE,
     TME_NONCLIENT, TRACKMOUSEEVENT,
@@ -36,6 +36,7 @@ struct ScrollState {
     alive: Cell<bool>,
     redraw_enabled: Cell<bool>,
     painting: Cell<bool>,
+    resetting_horizontal: Cell<bool>,
     hovered: Cell<bool>,
     tracking_mouse: Cell<bool>,
     drag_anchor: Cell<Option<i32>>,
@@ -181,6 +182,17 @@ unsafe fn draw_geometry(
 }
 
 impl ScrollState {
+    unsafe fn reset_horizontal_offset(&self, hwnd: HWND) {
+        if !self.alive.get() || self.resetting_horizontal.replace(true) {
+            return;
+        }
+        let offset = GetScrollPos(hwnd, SB_HORZ);
+        if offset != 0 {
+            SendMessageW(hwnd, LVM_SCROLL, (-(offset as isize)) as usize, 0);
+        }
+        self.resetting_horizontal.set(false);
+    }
+
     unsafe fn paint(&self, hwnd: HWND) {
         self.paint_if_needed(hwnd, true);
     }
@@ -369,6 +381,7 @@ unsafe fn install_with_visibility(hwnd: HWND, show_scrollbars: bool) -> bool {
         alive: Cell::new(true),
         redraw_enabled: Cell::new(true),
         painting: Cell::new(false),
+        resetting_horizontal: Cell::new(false),
         hovered: Cell::new(false),
         tracking_mouse: Cell::new(false),
         drag_anchor: Cell::new(None),
@@ -396,18 +409,48 @@ unsafe extern "system" fn scrollbar_proc(
     Rc::increment_strong_count(raw);
     let state = Rc::from_raw(raw);
     match message {
-        WM_NCCALCSIZE if !state.show_scrollbars && lparam != 0 => {
-            // 保留原生滚动范围，让客户区占满列表，不为滚动条留下非客户区
-            return 0;
+        WM_NCCALCSIZE if lparam != 0 => {
+            if !state.show_scrollbars {
+                // 保留原生滚动范围，让客户区占满列表，不为滚动条留下非客户区
+                return 0;
+            }
+            let client = if wparam != 0 {
+                std::ptr::addr_of_mut!((*(lparam as *mut NCCALCSIZE_PARAMS)).rgrc[0])
+            } else {
+                lparam as *mut RECT
+            };
+            let proposed_bottom = (*client).bottom;
+            let result = DefSubclassProc(hwnd, message, wparam, lparam);
+            if state.alive.get() && GetWindowLongPtrW(hwnd, GWL_STYLE) as u32 & WS_HSCROLL != 0 {
+                // 横滚即使被原生列表临时创建也不占高度，真实纵滚仍使用原生宽度
+                let height = GetSystemMetricsForDpi(SM_CYHSCROLL, GetDpiForWindow(hwnd).max(96));
+                let bottom = (*client)
+                    .bottom
+                    .saturating_add(height.max(0))
+                    .min(proposed_bottom);
+                if bottom > (*client).bottom {
+                    (*client).bottom = bottom;
+                    // 原生有效拷贝矩形按扣除横滚后的客户区计算，修改后不再复用
+                    return if wparam == 0 {
+                        0
+                    } else {
+                        result & !(WVR_VALIDRECTS as isize)
+                    };
+                }
+            }
+            return if wparam == 0 { 0 } else { result };
         }
-        WM_NCHITTEST if !state.show_scrollbars => {
+        WM_NCHITTEST => {
             let hit = DefSubclassProc(hwnd, message, wparam, lparam);
-            return if hit == HTVSCROLL as isize || hit == HTHSCROLL as isize {
+            return if hit == HTHSCROLL as isize
+                || (!state.show_scrollbars && hit == HTVSCROLL as isize)
+            {
                 HTCLIENT as isize
             } else {
                 hit
             };
         }
+        WM_HSCROLL | WM_MOUSEHWHEEL => return 0,
         WM_WINDOWPOSCHANGING if lparam != 0 => {
             crate::list_layout::prepare_resize(
                 hwnd,
@@ -560,11 +603,13 @@ unsafe extern "system" fn scrollbar_proc(
             | LVM_SETEXTENDEDLISTVIEWSTYLE
             | LVM_SETVIEW
     ) {
+        state.reset_horizontal_offset(hwnd);
         state.paint(hwnd);
     } else if matches!(
         message,
         WM_LBUTTONDOWN | WM_LBUTTONDBLCLK | WM_LBUTTONUP | WM_MOUSEMOVE | WM_TIMER
     ) {
+        state.reset_horizontal_offset(hwnd);
         // 原生选中半露行和边缘自动滚动可能在内部直接更新滚动位置
         state.paint_if_needed(hwnd, false);
     }
