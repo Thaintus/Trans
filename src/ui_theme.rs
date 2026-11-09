@@ -45,10 +45,14 @@ const INPUT_THEME_SUBCLASS: usize = 0x5452_5348;
 const HOTKEY_TEXT_SUBCLASS: usize = 0x5452_534b;
 const COMPACT_CHECKBOX_SUBCLASS: usize = 0x5452_5354;
 const TRACKBAR_THEME_SUBCLASS: usize = 0x5452_5352;
+const TBM_GETPOS: u32 = WM_USER;
+const TRACKBAR_FIRST_CENTER: *const u16 = windows_sys::core::w!("Trans.Ui.Trackbar.FirstCenter");
+const TRACKBAR_LAST_CENTER: *const u16 = windows_sys::core::w!("Trans.Ui.Trackbar.LastCenter");
 
 thread_local! {
     static WINDOW_BADGES: RefCell<HashMap<usize, WindowBadges>> = RefCell::new(HashMap::new());
     static GDIPLUS_READY: Cell<bool> = const { Cell::new(false) };
+    static TRACKBAR_PROBE: Cell<usize> = const { Cell::new(0) };
 }
 
 // 在窗口与消息循环外持有会话，避免在线程局部存储析构时关闭 GDI+
@@ -1838,6 +1842,18 @@ unsafe fn scaled_icon_path_antialiased(
     stroke: f32,
     build: impl FnOnce(*mut gdip::GpPath, f32, f32, f32) -> bool,
 ) -> bool {
+    scaled_icon_path_antialiased_with_fill(hdc, rect, color, scale, stroke, false, build)
+}
+
+unsafe fn scaled_icon_path_antialiased_with_fill(
+    hdc: HDC,
+    rect: RECT,
+    color: COLORREF,
+    scale: f32,
+    stroke: f32,
+    filled: bool,
+    build: impl FnOnce(*mut gdip::GpPath, f32, f32, f32) -> bool,
+) -> bool {
     if !GDIPLUS_READY.with(Cell::get) {
         return false;
     }
@@ -1878,6 +1894,12 @@ unsafe fn scaled_icon_path_antialiased(
         && gdip::GdipSetPenEndCap(pen.0, gdip::LineCapRound) == gdip::Ok
         && gdip::GdipSetPenLineJoin(pen.0, gdip::LineJoinRound) == gdip::Ok
         && build(path.0, cx, cy, scale)
+        && (!filled || {
+            let Some(brush) = GdiPlusBrush::new(color) else {
+                return false;
+            };
+            gdip::GdipFillPath(graphics.0, brush.0.cast(), path.0) == gdip::Ok
+        })
         && gdip::GdipDrawPath(graphics.0, pen.0, path.0) == gdip::Ok
         && gdip::GdipFlush(graphics.0, gdip::FlushIntentionSync) == gdip::Ok
 }
@@ -2489,32 +2511,34 @@ unsafe fn draw_button_content(item: &DRAWITEMSTRUCT, style: ButtonStyle, selecte
         !disabled && item.itemState & ODS_FOCUS != 0 && item.itemState & ODS_NOFOCUSRECT == 0;
     if matches!(style, ButtonStyle::Topmost) {
         fill(item.hDC, &item.rcItem, BACKGROUND);
-        if selected || (!disabled && (hot || pressed || focused)) {
-            let background = if disabled {
-                SUBTLE
-            } else if pressed {
-                PRESSED
-            } else if selected {
-                if hot {
-                    PICKER_HOVER
-                } else {
-                    ACCENT_SOFT
-                }
-            } else {
-                HOVER
-            };
-            draw_rounded_surface(
-                item.hDC,
-                &inset(item.rcItem, pixels(1, dpi)),
-                pixels(5, dpi),
-                background,
-                focused.then_some((ACCENT, pixels(1, dpi))),
-            );
-        }
+        // 置顶状态通过图钉内部填色区分，按钮底色只响应交互状态
+        let background = if disabled {
+            SUBTLE
+        } else if pressed {
+            PRESSED
+        } else if hot {
+            HOVER
+        } else {
+            SURFACE
+        };
+        let border = if focused { TEXT } else { BORDER };
+        draw_rounded_surface(
+            item.hDC,
+            &inset(item.rcItem, pixels(1, dpi)),
+            pixels(5, dpi),
+            background,
+            Some((border, pixels(1, dpi))),
+        );
         let foreground = if disabled {
             DISABLED_TEXT
-        } else if selected || hot || pressed || focused {
-            ACCENT
+        } else if selected {
+            if pressed {
+                ACCENT_PRESSED
+            } else if hot {
+                ACCENT_HOVER
+            } else {
+                ACCENT
+            }
         } else {
             MUTED
         };
@@ -2533,7 +2557,11 @@ unsafe fn draw_button_content(item: &DRAWITEMSTRUCT, style: ButtonStyle, selecte
                     bottom: top + side,
                 },
                 foreground,
-                WindowActionIcon::Topmost,
+                if selected {
+                    WindowActionIcon::TopmostFilled
+                } else {
+                    WindowActionIcon::Topmost
+                },
             );
         }
         return true;
@@ -2669,6 +2697,155 @@ struct TrackbarVisual {
     highlighted: bool,
 }
 
+fn trackbar_thumb_radius(thumb: RECT, dpi: u32, compact: bool, vertical: bool) -> i32 {
+    let radius = pixels(if compact { 5 } else { 8 }, dpi);
+    if compact && !vertical {
+        radius
+    } else {
+        radius.min(((thumb.right - thumb.left).min(thumb.bottom - thumb.top) / 2).max(1))
+    }
+}
+
+struct TrackbarProbe {
+    hwnd: HWND,
+    position: LPARAM,
+    previous: usize,
+}
+
+impl TrackbarProbe {
+    fn new(hwnd: HWND, position: LPARAM) -> Self {
+        Self {
+            hwnd,
+            position,
+            previous: TRACKBAR_PROBE.with(|probe| probe.replace(hwnd as usize)),
+        }
+    }
+}
+
+impl Drop for TrackbarProbe {
+    fn drop(&mut self) {
+        unsafe {
+            // 先恢复数值和原生手柄矩形，再解除临时绘制屏蔽
+            SendMessageW(self.hwnd, TBM_SETPOS, 1, self.position);
+            TRACKBAR_PROBE.with(|probe| probe.set(self.previous));
+            InvalidateRect(self.hwnd, null(), 0);
+        }
+    }
+}
+
+unsafe fn horizontal_thumb_ends(hwnd: HWND) -> Option<(RECT, RECT)> {
+    if GetCapture() == hwnd {
+        return None;
+    }
+    let position = SendMessageW(hwnd, TBM_GETPOS, 0, 0);
+    let minimum = SendMessageW(hwnd, TBM_GETRANGEMIN, 0, 0);
+    let maximum = SendMessageW(hwnd, TBM_GETRANGEMAX, 0, 0);
+    if minimum >= maximum {
+        return None;
+    }
+    let mut first: RECT = zeroed();
+    let mut last: RECT = zeroed();
+    let probe = TrackbarProbe::new(hwnd, position);
+    // 原生控件只有启用重绘才刷新手柄矩形，探测期间仅屏蔽临时画面
+    // 先切到最大值，确保两次取样都发生实际位置变化
+    SendMessageW(hwnd, TBM_SETPOS, 1, maximum);
+    SendMessageW(hwnd, TBM_SETPOS, 1, minimum);
+    SendMessageW(hwnd, TBM_GETTHUMBRECT, 0, &mut first as *mut RECT as LPARAM);
+    SendMessageW(hwnd, TBM_SETPOS, 1, maximum);
+    SendMessageW(hwnd, TBM_GETTHUMBRECT, 0, &mut last as *mut RECT as LPARAM);
+    drop(probe);
+    if SendMessageW(hwnd, TBM_GETPOS, 0, 0) != position
+        || first.right <= first.left
+        || first.bottom <= first.top
+        || last.right <= last.left
+        || last.bottom <= last.top
+        || first.left + first.right >= last.left + last.right
+    {
+        return None;
+    }
+    Some((first, last))
+}
+
+unsafe fn clear_trackbar_centers(hwnd: HWND) {
+    RemovePropW(hwnd, TRACKBAR_FIRST_CENTER);
+    RemovePropW(hwnd, TRACKBAR_LAST_CENTER);
+}
+
+pub unsafe fn align_horizontal_trackbar(hwnd: HWND, left: i32, right: i32) -> bool {
+    if hwnd.is_null() || right <= left {
+        return false;
+    }
+    let mut client: RECT = zeroed();
+    let mut bounds: RECT = zeroed();
+    let parent = GetParent(hwnd);
+    if parent.is_null()
+        || GetClientRect(hwnd, &mut client) == 0
+        || GetWindowRect(hwnd, &mut bounds) == 0
+        || GetWindowLongPtrW(hwnd, GWL_STYLE) as u32 & TBS_VERT != 0
+    {
+        return false;
+    }
+    let mut origin = POINT {
+        x: bounds.left,
+        y: bounds.top,
+    };
+    if ScreenToClient(parent, &mut origin) == 0 {
+        return false;
+    }
+    let Some((mut first, mut last)) = horizontal_thumb_ends(hwnd) else {
+        return false;
+    };
+    let dpi = GetDpiForWindow(hwnd).max(96);
+    // 圆心向内预留半径，让两端圆球的外缘分别贴合组件对齐线
+    let left_inset = (first.left + first.right) / 2
+        - trackbar_thumb_radius(first, dpi, false, false)
+        - client.left;
+    let right_inset = client.right
+        - (last.left + last.right) / 2
+        - trackbar_thumb_radius(last, dpi, false, false);
+    let x = left - left_inset;
+    let width = right - left + left_inset + right_inset;
+    if width <= 0 {
+        return false;
+    }
+    if origin.x != x || bounds.right - bounds.left != width {
+        if SetWindowPos(
+            hwnd,
+            null_mut(),
+            x,
+            origin.y,
+            width,
+            bounds.bottom - bounds.top,
+            SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_NOREDRAW | SWP_NOCOPYBITS,
+        ) == 0
+        {
+            return false;
+        }
+        let Some(final_ends) = horizontal_thumb_ends(hwnd) else {
+            return false;
+        };
+        (first, last) = final_ends;
+    }
+    // 仅保存最终尺寸下的圆心，绘制时不探测或改变滑块值
+    let first_center = (first.left + first.right) / 2;
+    let last_center = (last.left + last.right) / 2;
+    if SetPropW(
+        hwnd,
+        TRACKBAR_FIRST_CENTER,
+        (first_center as usize + 1) as HANDLE,
+    ) == 0
+        || SetPropW(
+            hwnd,
+            TRACKBAR_LAST_CENTER,
+            (last_center as usize + 1) as HANDLE,
+        ) == 0
+    {
+        clear_trackbar_centers(hwnd);
+        return false;
+    }
+    true
+}
+
 pub unsafe fn install_trackbar_theme(hwnd: HWND, compact: bool) -> bool {
     SetWindowSubclass(
         hwnd,
@@ -2686,6 +2863,32 @@ unsafe extern "system" fn trackbar_theme_proc(
     subclass: usize,
     compact: usize,
 ) -> LRESULT {
+    let probing = TRACKBAR_PROBE.with(|probe| probe.get() == hwnd as usize);
+    if probing {
+        match message {
+            WM_PAINT => {
+                let mut paint: PAINTSTRUCT = zeroed();
+                BeginPaint(hwnd, &mut paint);
+                EndPaint(hwnd, &paint);
+                return 0;
+            }
+            WM_PRINTCLIENT => return 0,
+            _ => {}
+        }
+    }
+    if matches!(
+        message,
+        WM_SIZE
+            | WM_THEMECHANGED
+            | WM_DPICHANGED_AFTERPARENT
+            | TBM_SETTHUMBLENGTH
+            | TBM_SETRANGE
+            | TBM_SETRANGEMIN
+            | TBM_SETRANGEMAX
+            | WM_NCDESTROY
+    ) {
+        clear_trackbar_centers(hwnd);
+    }
     match message {
         WM_ERASEBKGND => return 1,
         WM_PAINT => {
@@ -2749,10 +2952,18 @@ unsafe extern "system" fn trackbar_theme_proc(
         | TBM_SETPOSNOTIFY => true,
         _ => false,
     };
-    if redraw && IsWindowVisible(hwnd) != 0 {
+    if redraw && !probing && IsWindowVisible(hwnd) != 0 {
         InvalidateRect(hwnd, null(), 0);
     }
-    DefSubclassProc(hwnd, message, wparam, lparam)
+    let result = DefSubclassProc(hwnd, message, wparam, lparam);
+    if compact == 0
+        && matches!(message, WM_THEMECHANGED | WM_DPICHANGED_AFTERPARENT)
+        && GetWindowLongPtrW(hwnd, GWL_STYLE) as u32 & TBS_VERT == 0
+    {
+        // 子控件的新尺寸生效后再排队布局，避免晚到的 DPI 通知清除有效圆心
+        crate::app::invalidate_main_layout(GetParent(hwnd));
+    }
+    result
 }
 
 unsafe fn paint_trackbar(hwnd: HWND, dc: HDC, compact: bool) -> bool {
@@ -2781,6 +2992,14 @@ unsafe fn paint_trackbar(hwnd: HWND, dc: HDC, compact: bool) -> bool {
         0,
         &mut channel as *mut RECT as LPARAM,
     );
+    if !compact && !vertical {
+        let first = GetPropW(hwnd, TRACKBAR_FIRST_CENTER) as usize;
+        let last = GetPropW(hwnd, TRACKBAR_LAST_CENTER) as usize;
+        if first > 0 && last > first {
+            channel.left = (first - 1) as i32;
+            channel.right = (last - 1) as i32;
+        }
+    }
     let mut cursor: POINT = zeroed();
     let hot = GetCursorPos(&mut cursor) != 0
         && ScreenToClient(hwnd, &mut cursor) != 0
@@ -2823,6 +3042,8 @@ unsafe fn draw_trackbar_frame(dc: HDC, visual: TrackbarVisual) -> bool {
     fill(dc, &client, BACKGROUND);
     let cx = (thumb.left + thumb.right) / 2;
     let cy = (thumb.top + thumb.bottom) / 2;
+    // 主手柄和竖向手柄不超出原生命中矩形，保持可见圆边缘可以拖动
+    let radius = trackbar_thumb_radius(thumb, dpi, compact, vertical);
     let thickness = pixels(if compact { 3 } else { 4 }, dpi);
     if vertical {
         // 只取原生轨道长边，避开竖向控件返回矩形的横纵坐标差异
@@ -2845,13 +3066,6 @@ unsafe fn draw_trackbar_frame(dc: HDC, visual: TrackbarVisual) -> bool {
         channel.right = cx.min(channel.right);
         rounded(dc, &channel, thickness, ACCENT);
     }
-    let radius = pixels(if compact { 5 } else { 8 }, dpi);
-    // 主手柄和竖向手柄不超出原生命中矩形，避免可见圆边缘无法开始拖动
-    let radius = if compact && !vertical {
-        radius
-    } else {
-        radius.min(((thumb.right - thumb.left).min(thumb.bottom - thumb.top) / 2).max(1))
-    };
     let circle = RECT {
         left: cx - radius,
         top: cy - radius,
@@ -2878,6 +3092,7 @@ const LIST_BADGE_SIDE: i32 = 11;
 pub(crate) enum WindowActionIcon {
     Hidden,
     Topmost,
+    TopmostFilled,
     Container,
     Remove,
 }
@@ -2887,7 +3102,7 @@ impl WindowActionIcon {
     fn lines(self) -> &'static [&'static [(f32, f32)]] {
         match self {
             Self::Hidden => &[&[(3.1, 8.9), (8.9, 3.1)]],
-            Self::Topmost => &[
+            Self::Topmost | Self::TopmostFilled => &[
                 &[
                     (7.27, 1.19),
                     (10.81, 4.73),
@@ -2917,15 +3132,17 @@ pub(crate) unsafe fn draw_window_action_icon(
     icon: WindowActionIcon,
 ) {
     let scale = (rect.right - rect.left) as f32 / 12.0;
-    if scaled_icon_path_antialiased(
+    let filled = matches!(icon, WindowActionIcon::TopmostFilled);
+    if scaled_icon_path_antialiased_with_fill(
         dc,
         rect,
         color,
         scale,
         1.25 * scale,
+        filled,
         |path, cx, cy, scale| {
             let point = |(x, y): (f32, f32)| (cx + (x - 6.0) * scale, cy + (y - 6.0) * scale);
-            for line in icon.lines() {
+            for (index, line) in icon.lines().iter().enumerate() {
                 if gdip::GdipStartPathFigure(path) != gdip::Ok {
                     return false;
                 }
@@ -2935,6 +3152,10 @@ pub(crate) unsafe fn draw_window_action_icon(
                     if gdip::GdipAddPathLine(path, x1, y1, x2, y2) != gdip::Ok {
                         return false;
                     }
+                }
+                // 图钉主体闭合填充，针尖保留为独立线段
+                if filled && index == 0 && gdip::GdipClosePathFigure(path) != gdip::Ok {
+                    return false;
                 }
             }
             if matches!(icon, WindowActionIcon::Hidden)
@@ -2968,7 +3189,15 @@ pub(crate) unsafe fn draw_window_action_icon(
         x: (rect.left as f32 + x * scale).round() as i32,
         y: (rect.top as f32 + y * scale).round() as i32,
     };
-    for line in icon.lines() {
+    for (index, line) in icon.lines().iter().enumerate() {
+        if filled && index == 0 {
+            let points: Vec<POINT> = line.iter().copied().map(point).collect();
+            SetDCBrushColor(dc, color);
+            SelectObject(dc, GetStockObject(DC_BRUSH));
+            Polygon(dc, points.as_ptr(), points.len() as i32);
+            SelectObject(dc, GetStockObject(NULL_BRUSH));
+            continue;
+        }
         let start = point(line[0]);
         MoveToEx(dc, start.x, start.y, null_mut());
         for &position in &line[1..] {

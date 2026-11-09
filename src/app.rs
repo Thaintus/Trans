@@ -357,11 +357,18 @@ fn pixel(value: i32, dpi: u32) -> i32 {
     (value * dpi as i32 + 48) / 96
 }
 
+fn main_content_edges(client: RECT, dpi: u32) -> (i32, i32) {
+    // 统一普通界面各行的可见外缘，按钮窗口另行补偿向内绘制的边框
+    let margin = pixel(12, dpi) + pixel(1, dpi);
+    (client.left + margin, client.right - margin)
+}
+
 fn main_footer_bounds(client: RECT, dpi: u32) -> [(i32, [i32; 4]); 5] {
     // 直接锚定物理客户区，避免先取整逻辑宽高再缩放造成边距跳变
+    let (left, right) = main_content_edges(client, dpi);
+    let button_inset = pixel(1, dpi);
     let button_side = pixel(32, dpi);
     let button_top = client.bottom - pixel(5, dpi) - button_side;
-    let right = client.right - pixel(12, dpi);
     let exit_width = pixel(86, dpi);
     let label_width = pixel(22, dpi);
     let label_height = pixel(14, dpi);
@@ -371,17 +378,12 @@ fn main_footer_bounds(client: RECT, dpi: u32) -> [(i32, [i32; 4]); 5] {
     [
         (
             ID_SETTINGS,
-            [
-                client.left + pixel(12, dpi),
-                button_top,
-                button_side,
-                button_side,
-            ],
+            [left - button_inset, button_top, button_side, button_side],
         ),
         (
             ID_MINI_MODE,
             [
-                client.left + pixel(50, dpi),
+                left - button_inset + pixel(38, dpi),
                 button_top,
                 button_side,
                 button_side,
@@ -389,7 +391,12 @@ fn main_footer_bounds(client: RECT, dpi: u32) -> [(i32, [i32; 4]); 5] {
         ),
         (
             ID_EXIT,
-            [right - exit_width, button_top, exit_width, button_side],
+            [
+                right + button_inset - exit_width,
+                button_top,
+                exit_width,
+                button_side,
+            ],
         ),
         (
             ID_SELF_LABEL,
@@ -630,19 +637,19 @@ unsafe fn draw_chrome(hwnd: HWND, dc: HDC, rect: &RECT) {
     SelectObject(dc, GetStockObject(NULL_BRUSH));
     SetDCPenColor(dc, ui_theme::BORDER);
     let footer_line = rect.bottom - pixel(40, dpi);
-    let content_right = rect.right - pixel(12, dpi);
-    MoveToEx(dc, pixel(12, dpi), footer_line, null_mut());
+    let (content_left, content_right) = main_content_edges(*rect, dpi);
+    MoveToEx(dc, content_left, footer_line, null_mut());
     LineTo(dc, content_right, footer_line);
     if IsWindowVisible(GetDlgItem(hwnd, ID_SETTINGS_TITLE)) != 0 {
-        MoveToEx(dc, pixel(12, dpi), pixel(48, dpi), null_mut());
+        MoveToEx(dc, content_left, pixel(48, dpi), null_mut());
         LineTo(dc, content_right, pixel(48, dpi));
     } else {
         ui_theme::draw_rounded_surface(
             dc,
             &RECT {
-                left: pixel(12, dpi),
+                left: content_left,
                 top: pixel(215, dpi),
-                right: rect.right - pixel(12, dpi),
+                right: content_right,
                 bottom: rect.bottom - pixel(45, dpi),
             },
             pixel(4, dpi),
@@ -1100,6 +1107,21 @@ unsafe fn queue_layout(hwnd: HWND) {
         && PostMessageW(hwnd, APP_EVENT, EVENT_LAYOUT, 0) == 0
     {
         LAYOUT_PENDING.with(|pending| pending.set(false));
+    }
+}
+
+pub(crate) unsafe fn invalidate_main_layout(hwnd: HWND) {
+    let state = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const RefCell<App>;
+    if state.is_null() {
+        return;
+    }
+    if let Ok(mut app) = (*state).try_borrow_mut() {
+        app.layout_size = None;
+        drop(app);
+        queue_layout(hwnd);
+    } else {
+        // 嵌套通知等状态释放后再失效布局，确保原生滑条尺寸变化可以重新对齐
+        post(hwnd, EVENT_LAYOUT, 1);
     }
 }
 
@@ -1955,7 +1977,7 @@ impl App {
             ID_SETTINGS,
             WS_TABSTOP | BS_OWNERDRAW as u32,
         )?;
-        self.add("STATIC", "0%", ID_SELF_LABEL, SS_LEFT)?;
+        self.add("STATIC", "0%", ID_SELF_LABEL, SS_RIGHT)?;
         self.add(
             "BUTTON",
             "迷你模式",
@@ -2508,13 +2530,23 @@ impl App {
             }
             return;
         }
-        let width = (rect.right * 96 / dpi as i32).max(MIN_WIDTH);
+        let (content_left, content_right) = main_content_edges(rect, dpi);
+        let content_width = content_right - content_left;
+        let button_inset = pixel(1, dpi);
+        let button_left = content_left - button_inset;
+        let button_right = content_right + button_inset;
+        let picker_width = pixel(PICKER_BUTTON_SIZE, dpi);
+        let refresh_width = pixel(32, dpi);
+        let refresh_left = button_right - refresh_width;
+        let search_left = button_left + picker_width + pixel(8, dpi);
+        let search_right = refresh_left - pixel(8, dpi);
         SendMessageW(
             self.control(ID_WINDOWS),
             CB_SETDROPPEDWIDTH,
-            pixel(width - 104, dpi) as usize,
+            (search_right - search_left) as usize,
             0,
         );
+        let width = (rect.right * 96 / dpi as i32).max(MIN_WIDTH);
         let height = (rect.bottom * 96 / dpi as i32).max(MIN_MAIN_BODY_HEIGHT);
         let panel = self.settings_panel.as_ref().unwrap();
         let panel_positioned = panel.set_bounds(
@@ -2533,15 +2565,38 @@ impl App {
         // 名称显隐和置顶均使用相同尺寸的图标按钮
         let topmost_width = pixel(24, dpi);
         let name_toggle_width = pixel(24, dpi);
-        let topmost_left = rect.right - pixel(10, dpi) - topmost_width;
+        let topmost_left = button_right - topmost_width;
         let name_toggle_left = topmost_left - name_toggle_width - pixel(6, dpi);
-        let name_row_bounds = [
+        let value_width = pixel(68, dpi);
+        let value_left = content_right - value_width;
+        let list_top = pixel(215, dpi) + 1;
+        let list_bottom = rect.bottom - pixel(45, dpi) - 1;
+        let header_only =
+            !self.settings_page && rect.bottom <= minimum_client_height(self.hwnd, dpi);
+        let mut root_bounds = vec![
+            (
+                ID_PICK,
+                [button_left, pixel(8, dpi), picker_width, picker_width],
+            ),
+            (
+                ID_WINDOWS,
+                [
+                    search_left,
+                    pixel(8, dpi),
+                    search_right - search_left,
+                    pixel(280, dpi),
+                ],
+            ),
+            (
+                ID_REFRESH,
+                [refresh_left, pixel(8, dpi), refresh_width, pixel(32, dpi)],
+            ),
             (
                 ID_TARGET,
                 [
-                    pixel(12, dpi),
+                    content_left,
                     pixel(42, dpi),
-                    name_toggle_left - pixel(20, dpi),
+                    name_toggle_left - pixel(8, dpi) - content_left,
                     pixel(32, dpi),
                 ],
             ),
@@ -2558,7 +2613,72 @@ impl App {
                 ID_TOPMOST,
                 [topmost_left, pixel(46, dpi), topmost_width, pixel(24, dpi)],
             ),
+            (
+                5,
+                [
+                    content_left,
+                    pixel(80, dpi),
+                    value_left - pixel(8, dpi) - content_left,
+                    pixel(18, dpi),
+                ],
+            ),
+            (
+                ID_VALUE,
+                [value_left, pixel(72, dpi), value_width, pixel(28, dpi)],
+            ),
+            (
+                ID_SLIDER,
+                [content_left, pixel(100, dpi), content_width, pixel(32, dpi)],
+            ),
+            (
+                ID_SETTINGS_TITLE,
+                [
+                    content_left,
+                    pixel(8, dpi),
+                    refresh_left - pixel(8, dpi) - content_left,
+                    pixel(32, dpi),
+                ],
+            ),
+            (
+                ID_SETTINGS_BACK,
+                [refresh_left, pixel(8, dpi), refresh_width, pixel(32, dpi)],
+            ),
+            (
+                ID_CHANGED_TITLE,
+                [content_left, pixel(196, dpi), content_width, pixel(18, dpi)],
+            ),
+            (
+                ID_CHANGED_LIST,
+                [
+                    content_left + 1,
+                    list_top,
+                    content_width - 2,
+                    if header_only {
+                        list_header_height(self.hwnd, dpi)
+                    } else {
+                        (list_bottom - list_top).max(0)
+                    },
+                ],
+            ),
         ];
+        // 按可见边缘和等分端点分配按钮组宽度，处理除法余数并精确贴合右边界
+        let button_gap = pixel(8, dpi);
+        for (first_id, count, top, height) in [(ID_PRESET, 5, 136, 24), (ID_RESTORE, 2, 166, 26)] {
+            let available = content_width - button_gap * (count - 1);
+            for index in 0..count {
+                let left = content_left + index * button_gap + available * index / count;
+                let right = content_left + index * button_gap + available * (index + 1) / count;
+                root_bounds.push((
+                    first_id + index,
+                    [
+                        left - button_inset,
+                        pixel(top, dpi),
+                        right - left + 2 * button_inset,
+                        pixel(height, dpi),
+                    ],
+                ));
+            }
+        }
         let hotkey_label_width = if english { 78 } else { 56 };
         let hotkey_input_left = hotkey_label_width + 18;
         let hotkey_enabled_width = if english { 88 } else { 64 };
@@ -2567,30 +2687,7 @@ impl App {
         // 按钮边框向内绘制，启用文字按实际可见边缘对齐并统一使用物理像素
         let settings_action_right =
             pixel(preset_save_left, dpi) + pixel(preset_save_width, dpi) - pixel(1, dpi) - 1;
-        let header_only =
-            !self.settings_page && rect.bottom <= minimum_client_height(self.hwnd, dpi);
-        let list_x = 13;
-        let list_y = 216;
-        let list_width = width - 26;
-        let list_height = height - list_y - 46;
-        let restore_width = (width - 30) / 2;
         let mut positions = vec![
-            (ID_PICK, 12, 8, PICKER_BUTTON_SIZE, PICKER_BUTTON_SIZE),
-            (ID_WINDOWS, 52, 8, width - 104, 280),
-            (ID_REFRESH, width - 44, 8, 32, 32),
-            (5, 12, 80, width - 100, 18),
-            (ID_VALUE, width - 80, 72, 68, 28),
-            (ID_SLIDER, 8, 100, width - 16, 32),
-            (ID_RESTORE, 12, 166, restore_width, 26),
-            (
-                ID_RESTORE_ALL,
-                18 + restore_width,
-                166,
-                width - 30 - restore_width,
-                26,
-            ),
-            (ID_SETTINGS_TITLE, 12, 8, width - 64, 32),
-            (ID_SETTINGS_BACK, width - 44, 8, 32, 32),
             (ID_BASIC_TITLE, 0, 8, body_width, 20),
             (ID_LANGUAGE_LABEL, 12, 54, 64, 20),
             (ID_LANGUAGE, 80, 48, body_width - 92, 120),
@@ -2646,14 +2743,8 @@ impl App {
                 body_width - about_value_left - 12,
                 20,
             ),
-            (ID_CHANGED_TITLE, 12, 196, width - 24, 18),
-            (ID_CHANGED_LIST, list_x, list_y, list_width, list_height),
         ];
-        let gap = 6;
         for index in 0..5 {
-            let left = 12 + index * (width - 24 + gap) / 5;
-            let right = 12 + (index + 1) * (width - 24 + gap) / 5 - gap;
-            positions.push((ID_PRESET + index, left, 136, right - left, 24));
             let input_left = 12 + index * (body_width - 16) / 5;
             let input_right = 12 + (index + 1) * (body_width - 16) / 5 - 8;
             positions.push((
@@ -2687,17 +2778,11 @@ impl App {
                 if id == ID_HOTKEY_ENABLED {
                     bounds[0] = settings_action_right - bounds[2];
                 }
-                if id == ID_CHANGED_LIST && header_only {
-                    bounds[3] = list_header_height(self.hwnd, dpi);
-                }
                 // 缓存请求尺寸，避免原生下拉框将展开高度折算为可见高度后反复移动
                 (control.bounds != Some(bounds)).then_some((control.hwnd, bounds))
             })
             .collect();
-        for (id, bounds) in name_row_bounds
-            .into_iter()
-            .chain(main_footer_bounds(rect, dpi))
-        {
+        for (id, bounds) in root_bounds.into_iter().chain(main_footer_bounds(rect, dpi)) {
             if let Some(control) = self.controls.iter().find(|control| control.id == id) {
                 if control.bounds != Some(bounds) {
                     positions.push((control.hwnd, bounds));
@@ -2710,11 +2795,17 @@ impl App {
             .copied()
             .partition(|(hwnd, _)| GetParent(*hwnd) == panel.hwnd());
         let root_positioned = position_controls(&root_positions);
+        let slider_aligned = root_positioned
+            && ui_theme::align_horizontal_trackbar(
+                self.control(ID_SLIDER),
+                content_left,
+                content_right,
+            );
         let body_positioned = position_controls(&body_positions);
         if body_positioned {
             panel.commit_layout(scroll_offset);
         }
-        if panel_positioned && root_positioned && body_positioned {
+        if panel_positioned && root_positioned && slider_aligned && body_positioned {
             for (hwnd, bounds) in positions {
                 if let Some(control) = self
                     .controls
@@ -3460,9 +3551,9 @@ impl App {
         }
         let topmost = GetWindowLongPtrW(self.hwnd, GWL_EXSTYLE) as u32 & WS_EX_TOPMOST != 0;
         let caption = if topmost {
-            tr("取消 Trans 窗口置顶", "Stop keeping Trans on top")
+            tr("已置顶，点击取消置顶", "On top — click to turn off")
         } else {
-            tr("置顶 Trans 窗口", "Keep Trans on top")
+            tr("未置顶，点击置顶", "Not on top — click to turn on")
         };
         set_button_selected(button, topmost);
         if read_text(button) != caption {
@@ -5601,6 +5692,9 @@ unsafe extern "system" fn window_proc(
     if matches!(message, WM_THEMECHANGED | WM_DWMCOMPOSITIONCHANGED) {
         apply_main_window_corners(hwnd);
     }
+    if message == WM_THEMECHANGED {
+        invalidate_main_layout(hwnd);
+    }
     // 标题栏状态独立于 App，绘制和鼠标捕获不依赖可重入的状态借用
     if message != WM_GETMINMAXINFO {
         let result = if MINI_MODE.with(Cell::get) {
@@ -5691,8 +5785,12 @@ unsafe extern "system" fn window_proc(
                     ID_EXIT => ButtonStyle::Primary,
                     _ => ButtonStyle::Secondary,
                 };
-                let selected =
-                    !GetPropW(item.hwndItem, wide(BUTTON_SELECTED_PROP).as_ptr()).is_null();
+                let selected = if item.CtlID as i32 == ID_TOPMOST {
+                    // 每次绘制以主窗实际置顶状态为准，不依赖按钮焦点或属性缓存
+                    GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32 & WS_EX_TOPMOST != 0
+                } else {
+                    !GetPropW(item.hwndItem, wide(BUTTON_SELECTED_PROP).as_ptr()).is_null()
+                };
                 ui_theme::draw_button(item, style, selected);
                 return 1;
             }
@@ -5737,7 +5835,13 @@ unsafe extern "system" fn window_proc(
         WM_HSCROLL | WM_VSCROLL if lparam != 0 => {
             let percent = SendMessageW(lparam as HWND, TBM_GETPOS, 0, 0);
             match GetDlgCtrlID(lparam as HWND) {
-                ID_SLIDER => post(hwnd, EVENT_SLIDER, percent),
+                ID_SLIDER => {
+                    post(hwnd, EVENT_SLIDER, percent);
+                    if (wparam as u32 & 0xffff) == TB_ENDTRACK {
+                        // 捕获期间延期的端点对齐在拖动结束后重试，已有效的布局由缓存跳过
+                        queue_layout(hwnd);
+                    }
+                }
                 ID_MINI_SLIDER if IsWindowVisible(lparam as HWND) != 0 => {
                     let parameter =
                         (interaction_version() << 8) | (100 - percent.clamp(0, 100)) as usize;
@@ -6055,6 +6159,11 @@ unsafe extern "system" fn window_proc(
         }
         APP_EVENT if wparam == EVENT_LAYOUT => {
             LAYOUT_PENDING.with(|pending| pending.set(false));
+            if lparam != 0 && !state.is_null() {
+                if let Ok(mut app) = (*state).try_borrow_mut() {
+                    app.layout_size = None;
+                }
+            }
             layout_window(hwnd, state);
             // 排队布局已离开父窗原生尺寸处理，同一轮提交完整控件画面
             flush_main_redraw_impl(hwnd, state, true);
@@ -6213,8 +6322,9 @@ mod resize_tests {
                     .find(|(id, _)| *id == ID_SELF_SLIDER)
                     .unwrap()
                     .1;
-                assert_eq!(width - exit[0] - exit[2], pixel(12, dpi));
-                assert_eq!(width - label[0] - label[2], pixel(12, dpi));
+                let (_, content_right) = main_content_edges(client, dpi);
+                assert_eq!(exit[0] + exit[2] - pixel(1, dpi), content_right);
+                assert_eq!(label[0] + label[2], content_right);
                 assert_eq!(slider[0] + slider[2], label[0]);
                 if let Some(previous) = previous {
                     for ((id, bounds), (_, old)) in footer.iter().zip(previous) {
