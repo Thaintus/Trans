@@ -1,4 +1,4 @@
-[CmdletBinding()]
+﻿[CmdletBinding()]
 param(
     [switch]$AllowOnline,
     [ValidateNotNullOrEmpty()][string]$Version
@@ -147,7 +147,7 @@ Invoke-TransReleaseVersionTransaction -Workspace $workspaceDir @versionOptions -
             if ($sourceHash -ne $outputHash) {
                 throw '复制后的 EXE 校验失败'
             }
-            ($outputHash.ToLowerInvariant() + '  Trans.exe') | Set-Content -LiteralPath (Join-Path $stageDir 'Trans.exe.sha256') -Encoding UTF8
+            ($outputHash.ToLowerInvariant() + '  Trans.exe') | Set-Content -LiteralPath (Join-Path $stageDir 'Trans.exe.sha256') -Encoding Ascii
             [System.IO.Directory]::Move($stageDir, $releaseDir)
         } finally {
             if (Test-Path -LiteralPath $stageDir) {

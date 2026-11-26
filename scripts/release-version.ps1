@@ -1,4 +1,4 @@
-function Get-TransVersionField {
+﻿function Get-TransVersionField {
     param([string]$Content, [string]$SectionPattern, [string]$Path)
 
     $sections = @([regex]::Matches($Content, $SectionPattern))

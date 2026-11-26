@@ -12,7 +12,9 @@ use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::System::SystemServices::{
     SS_CENTER, SS_CENTERIMAGE, SS_ENDELLIPSIS, SS_LEFT, SS_NOPREFIX, SS_RIGHT,
 };
-use windows_sys::Win32::System::Threading::{CreateMutexW, GetCurrentProcessId};
+use windows_sys::Win32::System::Threading::{
+    CreateMutexW, GetCurrentProcessId, GetCurrentThreadId,
+};
 use windows_sys::Win32::UI::Controls::*;
 use windows_sys::Win32::UI::HiDpi::*;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::*;
@@ -36,6 +38,7 @@ use crate::window_redraw::{position_affects_surface, WindowRedraw};
 use crate::window_search::{display_title, filter_windows};
 
 const CLASS_NAME: &str = "Trans.MainWindow.1";
+const SMOKE_CLASS_NAME: &str = "Trans.Smoke.MainWindow.1";
 const APP_EVENT: u32 = WM_APP + 1;
 const LIST_COLUMN_RESIZE: u32 = WM_APP + 3;
 const TARGET_ACTIVITY_MESSAGE: u32 = WM_APP + 5;
@@ -58,7 +61,7 @@ const EVENT_TRAY_READD: usize = 16;
 const EVENT_EXIT: usize = 17;
 const EVENT_CHANGED_ACTIVATE: usize = 18;
 const EVENT_HOTKEY_FOCUS: usize = 19;
-const EVENT_HOTKEY_RESTORE: usize = 20;
+const EVENT_RESTORE_HOTKEY: usize = 20;
 const EVENT_WINDOW_SEARCH: usize = 21;
 const EVENT_WINDOW_CHOOSE: usize = 22;
 const EVENT_CLEAR_SELECTION: usize = 23;
@@ -75,6 +78,10 @@ const EVENT_MINI_ACTIVATE: usize = 33;
 const EVENT_REDRAW: usize = 34;
 const EVENT_TOPMOST_SYNC: usize = 35;
 const HOTKEY_RESTORE: i32 = 1;
+const PLAIN_ESCAPE: Hotkey = Hotkey {
+    modifiers: 0,
+    key: VK_ESCAPE as u32,
+};
 const TIMER_TARGET_ACTIVITY: usize = 2;
 const ICON_RESOURCE: usize = 101;
 const ID_PICK: i32 = 100;
@@ -140,7 +147,7 @@ const WIDTH: i32 = 340;
 const HEIGHT: i32 = 364;
 const MIN_WIDTH: i32 = 300;
 const MINI_WIDTH: i32 = 168;
-const MINI_MIN_WIDTH: i32 = 40;
+const MINI_MIN_WIDTH: i32 = 37;
 const MINI_HEIGHT: i32 = 340;
 const MINI_MIN_HEIGHT: i32 = 150;
 const MINI_DETAIL_TITLE_MIN_HEIGHT: i32 = 190;
@@ -158,6 +165,10 @@ thread_local! {
     static MINI_FRAME: crate::container_frame::ContainerFrame = const { crate::container_frame::ContainerFrame::close_only() };
     // 同步窗口消息可在 App 已借用时读取模式，避免尺寸切换重入
     static MINI_MODE: Cell<bool> = const { Cell::new(false) };
+    // 消息循环重入时也能按接收瞬间的菜单和快捷键状态分派
+    static POPUP_OPEN: Cell<bool> = const { Cell::new(false) };
+    static EXIT_PENDING: Cell<bool> = const { Cell::new(false) };
+    static RESTORE_BINDING: Cell<Option<RestoreBinding>> = const { Cell::new(None) };
     static DEFERRED_EVENTS: RefCell<VecDeque<(HWND, usize, isize)>> = const { RefCell::new(VecDeque::new()) };
     static INTERACTION_VERSION: Cell<usize> = const { Cell::new(0) };
     static PICKER_VERSION: Cell<usize> = const { Cell::new(0) };
@@ -1302,7 +1313,20 @@ impl Drop for MutexHandle {
 pub fn run() -> Result<(), String> {
     unsafe {
         SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
-        let mutex = CreateMutexW(null(), 0, wide("Local\\Trans.MainWindow.1").as_ptr());
+        let smoke = std::env::args_os().skip(1).any(|arg| arg == "--smoke-test");
+        if smoke
+            && !std::env::var_os("APPDATA")
+                .map(std::path::PathBuf::from)
+                .is_some_and(|path| {
+                    path.is_absolute() && path.join(".trans-smoke-profile").is_file()
+                })
+        {
+            std::process::exit(ERROR_INVALID_PARAMETER as i32);
+        }
+        let class_name = if smoke { SMOKE_CLASS_NAME } else { CLASS_NAME };
+        let name = wide(class_name);
+        let mutex_name = wide(&format!("Local\\{class_name}"));
+        let mutex = CreateMutexW(null(), 0, mutex_name.as_ptr());
         if mutex.is_null() {
             return Err(format!(
                 "{} {}",
@@ -1316,7 +1340,14 @@ pub fn run() -> Result<(), String> {
         let already_running = GetLastError() == ERROR_ALREADY_EXISTS;
         let _mutex = MutexHandle(mutex);
         if already_running {
-            let existing = FindWindowW(wide(CLASS_NAME).as_ptr(), null());
+            if smoke
+                || std::env::args_os()
+                    .skip(1)
+                    .any(|arg| arg == "--require-new-instance")
+            {
+                std::process::exit(ERROR_ALREADY_EXISTS as i32);
+            }
+            let existing = FindWindowW(name.as_ptr(), null());
             if !existing.is_null() {
                 ShowWindow(existing, SW_RESTORE);
                 SetForegroundWindow(existing);
@@ -1343,7 +1374,6 @@ pub fn run() -> Result<(), String> {
         // 先于窗口状态创建，确保退出时先释放窗口和绘图对象，再关闭 GDI+
         let _graphics_session = ui_theme::GdiPlusSession::new();
         let instance = GetModuleHandleW(null());
-        let name = wide(CLASS_NAME);
         let class = WNDCLASSEXW {
             cbSize: size_of::<WNDCLASSEXW>() as u32,
             style: 0,
@@ -1500,7 +1530,7 @@ pub fn run() -> Result<(), String> {
                 ));
             }
             if message.message == WM_KEYDOWN && message.wParam == VK_ESCAPE as usize {
-                let (owned, composing, registered_escape) = {
+                let (owned, composing, editing_hotkey, registered_escape) = {
                     let app = state.borrow();
                     let search = message.hwnd == app.combo_edit
                         || message.hwnd == app.combo_list
@@ -1508,20 +1538,22 @@ pub fn run() -> Result<(), String> {
                     (
                         message.hwnd == hwnd || IsChild(hwnd, message.hwnd) != 0 || search,
                         search && search_composing() && !app.picking,
-                        app.hotkey
-                            && GetFocus() != app.control(ID_HOTKEY_INPUT)
-                            && app.settings.restore_hotkey.is_some_and(|hotkey| {
-                                hotkey.key == u32::from(VK_ESCAPE) && hotkey.modifiers == 0
-                            }),
+                        message.hwnd == app.control(ID_HOTKEY_INPUT) && GetFocus() == message.hwnd,
+                        GetFocus() != app.control(ID_HOTKEY_INPUT)
+                            && RESTORE_BINDING.get() == Some(RestoreBinding::Active(PLAIN_ESCAPE)),
                     )
                 };
                 let plain = [VK_CONTROL, VK_SHIFT, VK_MENU, VK_LWIN, VK_RWIN]
                     .into_iter()
                     .all(|key| GetKeyState(key as i32) >= 0);
                 if owned && main_window_active(hwnd) && plain && !composing {
-                    // 同一次长按只触发一次，已注册的裸 Esc 统一由全局快捷键消息处理
-                    if message.lParam & (1 << 30) == 0 && !registered_escape {
-                        post(hwnd, EVENT_ESCAPE, 0);
+                    if message.lParam & (1 << 30) == 0 {
+                        if editing_hotkey {
+                            // 录入中的 Esc 只修改快捷键草稿
+                            SendMessageW(message.hwnd, HKM_SETHOTKEY, VK_ESCAPE as usize, 0);
+                        } else if !registered_escape {
+                            post(hwnd, EVENT_ESCAPE, 0);
+                        }
                     }
                     continue;
                 }
@@ -1660,7 +1692,6 @@ struct App {
     dpi: u32,
     layout_size: Option<(i32, i32, u32)>,
     windows: Vec<WindowInfo>,
-    window_options: Vec<WindowInfo>,
     window_query: String,
     combo_edit: HWND,
     combo_list: HWND,
@@ -1684,7 +1715,6 @@ struct App {
     mini_open_tooltip: Option<ControlTooltip>,
     picker_overlay: Option<PickerOverlay>,
     picker_warning: Option<String>,
-    hotkey: bool,
     privacy_names: Option<PrivacyNames>,
     privacy_error_reported: bool,
     icons: Option<IconList>,
@@ -1707,8 +1737,6 @@ struct App {
     tray: Option<TrayIcon>,
     taskbar_created: u32,
     pending_menu: Option<PopupRequest>,
-    popup_open: bool,
-    exit_pending: bool,
     exiting: bool,
     last_taskbar_error: Option<String>,
 }
@@ -1727,7 +1755,6 @@ impl App {
             dpi: 0,
             layout_size: None,
             windows: Vec::new(),
-            window_options: Vec::new(),
             window_query: String::new(),
             combo_edit: null_mut(),
             combo_list: null_mut(),
@@ -1751,7 +1778,6 @@ impl App {
             mini_open_tooltip: None,
             picker_overlay: None,
             picker_warning: None,
-            hotkey: false,
             privacy_names: None,
             privacy_error_reported: false,
             icons: None,
@@ -1774,8 +1800,6 @@ impl App {
             tray: None,
             taskbar_created: 0,
             pending_menu: None,
-            popup_open: false,
-            exit_pending: false,
             exiting: false,
             last_taskbar_error: None,
         }
@@ -2355,7 +2379,7 @@ impl App {
         {
             return Err(tr("无法初始化快捷键输入", "Cannot initialize shortcut input").into());
         }
-        if let Err(error) = self.register_hotkey(self.settings.restore_hotkey) {
+        if let Err(error) = set_restore_binding(hwnd, self.settings.restore_hotkey, GetFocus()) {
             self.report_error(&error);
         }
         self.layout();
@@ -3339,53 +3363,34 @@ impl App {
     }
 
     unsafe fn report_error(&mut self, message: &str) {
-        // 隐私模式下不显示后端错误里可能包含的原始窗口名称
-        let message = if self.settings.privacy_mode {
-            self.private_error(message)
-        } else {
-            message.to_owned()
-        };
+        // 窗口操作诊断使用 PID 和 HWND 标识目标，直接保留错误码和原始提示
         if let Some(pending) = &mut self.pending_error {
             pending.push_str("\n\n");
-            pending.push_str(&message);
+            pending.push_str(message);
         } else {
-            self.pending_error = Some(message);
+            self.pending_error = Some(message.to_owned());
             post(self.hwnd, EVENT_SHOW_ERROR, 0);
         }
     }
 
+    unsafe fn sync_tooltip_visibility(&self) {
+        let mini_detail = self.mini_mode && self.mini_detail.is_some();
+        for (tooltip, visible) in [
+            (&self.topmost_tooltip, !mini_detail),
+            (&self.picker_tooltip, !mini_detail),
+            (&self.name_tooltip, !self.mini_mode),
+            (&self.refresh_tooltip, !self.mini_mode),
+            (&self.mini_tooltip, self.mini_mode_button_visible()),
+            (&self.mini_open_tooltip, mini_detail),
+        ] {
+            if let Some(tooltip) = tooltip {
+                tooltip.set_active(visible && !self.settings_page && !self.picking);
+            }
+        }
+    }
+
     unsafe fn update_page_visibility(&self) {
-        if let Some(tooltip) = &self.topmost_tooltip {
-            tooltip.set_active(
-                !self.settings_page
-                    && !self.picking
-                    && (!self.mini_mode || self.mini_detail.is_none()),
-            );
-        }
-        if let Some(tooltip) = &self.name_tooltip {
-            tooltip.set_active(!self.settings_page && !self.mini_mode && !self.picking);
-        }
-        if let Some(tooltip) = &self.mini_tooltip {
-            tooltip.set_active(self.mini_mode_button_visible() && !self.picking);
-        }
-        if let Some(tooltip) = &self.picker_tooltip {
-            tooltip.set_active(
-                !self.settings_page
-                    && !self.picking
-                    && (!self.mini_mode || self.mini_detail.is_none()),
-            );
-        }
-        if let Some(tooltip) = &self.mini_open_tooltip {
-            tooltip.set_active(
-                self.mini_mode
-                    && self.mini_detail.is_some()
-                    && !self.settings_page
-                    && !self.picking,
-            );
-        }
-        if let Some(tooltip) = &self.refresh_tooltip {
-            tooltip.set_active(!self.settings_page && !self.mini_mode && !self.picking);
-        }
+        self.sync_tooltip_visibility();
         let mini_title_visible = self.mini_detail_title_visible();
         for control in &self.controls {
             if control.id == ID_SELF_SLIDER
@@ -3679,6 +3684,14 @@ impl App {
 
     unsafe fn save_current_settings(&mut self) -> Result<(), String> {
         self.remember_main_window_geometry();
+        if self.settings.self_transparency == self.self_transparency
+            && self.settings.main_window == self.last_main_window
+            && self.settings.mini_window == self.last_mini_window
+            && self.settings.mini_mode == self.mini_mode
+            && self.settings.mini_vertical_layout == self.mini_geometry_vertical
+        {
+            return Ok(());
+        }
         let mut settings = self.settings.clone();
         settings.self_transparency = self.self_transparency;
         settings.main_window = self.last_main_window;
@@ -3688,22 +3701,6 @@ impl App {
         settings.save()?;
         self.settings = settings;
         Ok(())
-    }
-
-    fn private_error(&self, message: &str) -> String {
-        let mut titles: Vec<&str> = self
-            .windows
-            .iter()
-            .chain(self.changed_windows.iter().map(|row| &row.window))
-            .chain(self.selected.iter())
-            .map(|window| window.title.as_str())
-            .filter(|title| !title.is_empty())
-            .collect();
-        titles.sort_by_key(|title| std::cmp::Reverse(title.len()));
-        titles.dedup();
-        titles.into_iter().fold(message.to_owned(), |text, title| {
-            text.replace(title, tr("[窗口]", "[window]"))
-        })
     }
 
     unsafe fn display_name(&mut self, window: &WindowInfo, token: usize) -> String {
@@ -3786,14 +3783,6 @@ impl App {
                 RDW_INVALIDATE | RDW_ALLCHILDREN | RDW_ERASE,
             );
             return;
-        }
-        // 开启隐私时也脱敏已经排队、尚未展示的错误
-        if let Some(error) = self.pending_error.take() {
-            self.pending_error = Some(if self.settings.privacy_mode {
-                self.private_error(&error)
-            } else {
-                error
-            });
         }
         self.refresh_changed_list(true);
         self.refresh();
@@ -3879,54 +3868,6 @@ impl App {
         EnableWindow(self.control(ID_HOTKEY_INPUT), enabled as i32);
     }
 
-    unsafe fn unregister_hotkey(&mut self) -> Result<(), String> {
-        if self.hotkey {
-            SetLastError(0);
-            if UnregisterHotKey(self.hwnd, HOTKEY_RESTORE) == 0 {
-                let code = GetLastError();
-                if code != ERROR_HOTKEY_NOT_REGISTERED {
-                    return Err(format!(
-                        "{} {code}",
-                        tr(
-                            "无法停用当前快捷键，Windows 错误码",
-                            "Cannot disable the current shortcut; Windows error"
-                        )
-                    ));
-                }
-            }
-            self.hotkey = false;
-        }
-        Ok(())
-    }
-
-    unsafe fn register_hotkey(&mut self, hotkey: Option<Hotkey>) -> Result<(), String> {
-        if self.hotkey || hotkey.is_none() {
-            return Ok(());
-        }
-        let key = hotkey.unwrap();
-        key.validate()?;
-        if RegisterHotKey(
-            self.hwnd,
-            HOTKEY_RESTORE,
-            key.modifiers | MOD_NOREPEAT,
-            key.key,
-        ) == 0
-        {
-            return Err(format!(
-                "{} {key}{} {}{}",
-                tr("无法启用快捷键", "Cannot enable shortcut"),
-                tr(
-                    "，可能已被占用（Windows 错误码",
-                    "; it may already be in use (Windows error"
-                ),
-                GetLastError(),
-                tr("）", ")")
-            ));
-        }
-        self.hotkey = true;
-        Ok(())
-    }
-
     unsafe fn save_hotkey(&mut self) {
         let requested = if self.checked(ID_HOTKEY_ENABLED) {
             let value = SendMessageW(self.control(ID_HOTKEY_INPUT), HKM_GETHOTKEY, 0, 0) as u16;
@@ -3948,15 +3889,12 @@ impl App {
             None
         };
         let previous = self.settings.restore_hotkey;
-        if let Err(error) = self.unregister_hotkey() {
-            self.report_error(&error);
-            return;
-        }
         let mut settings = self.settings.clone();
         settings.restore_hotkey = requested;
         settings.self_transparency = self.self_transparency;
-        let saved = self
-            .register_hotkey(requested)
+        // 保存时先验证系统能注册该键，再按当前焦点决定是否暂停
+        let saved = set_restore_binding(self.hwnd, requested, null_mut())
+            .and_then(|_| set_restore_binding(self.hwnd, requested, GetFocus()))
             .and_then(|_| settings.save());
         match saved {
             Ok(()) => {
@@ -3964,9 +3902,7 @@ impl App {
                 self.load_hotkey_controls();
             }
             Err(error) => {
-                let rollback = self
-                    .unregister_hotkey()
-                    .and_then(|_| self.register_hotkey(previous));
+                let rollback = set_restore_binding(self.hwnd, previous, GetFocus());
                 self.load_hotkey_controls();
                 self.report_error(&error);
                 if let Err(error) = rollback {
@@ -4042,11 +3978,14 @@ impl App {
     }
 
     unsafe fn handle_escape(&mut self) {
-        if self.exiting || !main_window_active(self.hwnd) {
+        if self.exiting {
             return;
         }
-        if self.popup_open {
+        if POPUP_OPEN.get() {
             EndMenu();
+            return;
+        }
+        if !main_window_active(self.hwnd) {
             return;
         }
         if self.picking || owns_picker_capture(self.hwnd) {
@@ -4091,28 +4030,21 @@ impl App {
     }
 
     unsafe fn close(&mut self, exit: bool) {
-        self.exit_pending = false;
-        if self.exiting {
+        if self.exiting || EXIT_PENDING.get() {
             return;
         }
+        let close_to_tray = !exit && self.settings.close_to_tray;
+        EXIT_PENDING.set(!close_to_tray);
         self.cancel_picker();
-        self.remember_main_window_geometry();
-        if self.settings.self_transparency != self.self_transparency
-            || self.settings.main_window != self.last_main_window
-            || self.settings.mini_window != self.last_mini_window
-            || self.settings.mini_mode != self.mini_mode
-            || self.settings.mini_vertical_layout != self.mini_geometry_vertical
-        {
-            if let Err(error) = self.save_current_settings() {
-                // 配置写入失败不能阻止用户通过明确的退出入口关闭应用
-                if !exit && self.settings.close_to_tray {
-                    self.show_window(self.settings_page);
-                    self.report_error(&error);
-                    return;
-                }
+        if let Err(error) = self.save_current_settings() {
+            // 配置写入失败不能阻止用户通过明确的退出入口关闭应用
+            if close_to_tray {
+                self.show_window(self.settings_page);
+                self.report_error(&error);
+                return;
             }
         }
-        if !exit && self.settings.close_to_tray {
+        if close_to_tray {
             match self.ensure_tray() {
                 Ok(()) => {
                     if let Some(tooltip) = &self.topmost_tooltip {
@@ -4137,26 +4069,56 @@ impl App {
                     self.report_error(&format!("{error}\n{}", tr("主窗口会保持可见，可在设置页选择退出", "The main window will remain visible; use Exit in Settings to close Trans")));
                 }
             }
-        } else if self.restore_all() {
-            self.window_events = None;
-            KillTimer(self.hwnd, TIMER_TARGET_ACTIVITY);
-            self.exiting = true;
-            post(self.hwnd, EVENT_DESTROY, 0);
         } else {
-            self.exit_pending = crate::window_topmost::has_pending_requests();
+            if self.restore_all() {
+                if !crate::window_topmost::has_pending_requests() {
+                    self.finish_exit();
+                    return;
+                }
+                self.pending_menu = None;
+                if POPUP_OPEN.get() {
+                    EndMenu();
+                }
+            } else {
+                EXIT_PENDING.set(false);
+            }
+            self.update_enabled();
             self.show_window(false);
         }
     }
 
-    unsafe fn queue_menu(&mut self, request: PopupRequest) {
-        if self.popup_open || self.pending_menu.is_some() || self.exiting {
-            return;
-        }
+    unsafe fn finish_exit(&mut self) {
+        self.window_events = None;
+        KillTimer(self.hwnd, TIMER_TARGET_ACTIVITY);
+        self.exiting = true;
+        post(self.hwnd, EVENT_DESTROY, 0);
+    }
+
+    unsafe fn finish_topmost_requests(&mut self) -> bool {
         for error in self.controller.finish_topmost_requests() {
             self.report_error(&error);
         }
-        if self.exit_pending && !crate::window_topmost::has_pending_requests() {
-            self.close(true);
+        if EXIT_PENDING.get() && !crate::window_topmost::has_pending_requests() {
+            // 失败记录留给用户重试，完成通知不能重新发起一轮恢复
+            if self.controller.changed_count() == 0 {
+                // 等待后台恢复期间窗口仍可移动或缩放
+                let _ = self.save_current_settings();
+                self.finish_exit();
+                return true;
+            }
+            EXIT_PENDING.set(false);
+            self.update_enabled();
+        }
+        false
+    }
+
+    unsafe fn queue_menu(&mut self, request: PopupRequest) {
+        if POPUP_OPEN.get()
+            || self.pending_menu.is_some()
+            || self.exiting
+            || EXIT_PENDING.get()
+            || self.finish_topmost_requests()
+        {
             return;
         }
         self.pending_menu = Some(request);
@@ -4167,7 +4129,7 @@ impl App {
         if self.settings_page
             || self.picking
             || self.changed_list_dirty
-            || self.popup_open
+            || POPUP_OPEN.get()
             || self.pending_menu.is_some()
         {
             return;
@@ -4256,8 +4218,8 @@ impl App {
             let container_available = container_mode
                 || self
                     .controller
-                    .can_enable_container(&window)
-                    .unwrap_or(false);
+                    .check_container_compatibility(&window)
+                    .is_ok();
             // 弹出菜单前保存完整窗口身份，刷新和行索引变化不能改变操作目标
             self.queue_menu(PopupRequest::Window {
                 taskbar_hidden: self.controller.is_taskbar_hidden(&window),
@@ -4271,7 +4233,7 @@ impl App {
     }
 
     unsafe fn menu_command(&mut self, request: PopupRequest, command: u32) {
-        if self.exiting {
+        if self.exiting || EXIT_PENDING.get() {
             return;
         }
         match (request, command) {
@@ -4342,24 +4304,24 @@ impl App {
     }
 
     unsafe fn update_enabled(&self) {
-        if let Some(tooltip) = &self.topmost_tooltip {
-            tooltip.set_active(
-                !self.settings_page
-                    && !self.picking
-                    && (!self.mini_mode || self.mini_detail.is_none()),
-            );
+        let interactive = !self.picking && !EXIT_PENDING.get();
+        for id in [
+            ID_MINI_MODE,
+            ID_MINI_LIST,
+            ID_MINI_BACK,
+            ID_SHOW_WINDOW_NAME,
+            ID_WINDOWS,
+            ID_REFRESH,
+            ID_CHANGED_LIST,
+            ID_SETTINGS,
+            ID_SELF_SLIDER,
+        ] {
+            EnableWindow(self.control(id), interactive as i32);
         }
-        EnableWindow(self.control(ID_MINI_MODE), (!self.picking) as i32);
-        EnableWindow(self.control(ID_MINI_LIST), (!self.picking) as i32);
-        EnableWindow(self.control(ID_MINI_BACK), (!self.picking) as i32);
-        if let Some(tooltip) = &self.mini_tooltip {
-            tooltip.set_active(self.mini_mode_button_visible() && !self.picking);
+        for id in [ID_PICK, ID_TOPMOST] {
+            EnableWindow(self.control(id), (!EXIT_PENDING.get()) as i32);
         }
-        EnableWindow(self.control(ID_SHOW_WINDOW_NAME), (!self.picking) as i32);
-        if let Some(tooltip) = &self.name_tooltip {
-            tooltip.set_active(!self.settings_page && !self.mini_mode && !self.picking);
-        }
-        let available = self.selected_valid && !self.picking;
+        let available = self.selected_valid && interactive;
         EnableWindow(self.control(ID_SLIDER), available as i32);
         EnableWindow(self.control(ID_MINI_SLIDER), available as i32);
         EnableWindow(self.control(ID_MINI_OPEN), available as i32);
@@ -4370,35 +4332,13 @@ impl App {
             .selected
             .as_ref()
             .is_some_and(|window| self.controller.is_changed(window));
-        EnableWindow(self.control(ID_RESTORE), (changed && !self.picking) as i32);
+        EnableWindow(self.control(ID_RESTORE), (changed && interactive) as i32);
         EnableWindow(
             self.control(ID_RESTORE_ALL),
-            (self.controller.changed_count() > 0) as i32,
+            (!EXIT_PENDING.get() && self.controller.changed_count() > 0) as i32,
         );
-        EnableWindow(self.control(ID_WINDOWS), (!self.picking) as i32);
-        EnableWindow(self.control(ID_REFRESH), (!self.picking) as i32);
-        EnableWindow(self.control(ID_CHANGED_LIST), (!self.picking) as i32);
-        EnableWindow(self.control(ID_SETTINGS), (!self.picking) as i32);
-        EnableWindow(self.control(ID_SELF_SLIDER), (!self.picking) as i32);
         SendMessageW(self.control(ID_PICK), BM_SETSTATE, self.picking as usize, 0);
-        if let Some(tooltip) = &self.picker_tooltip {
-            tooltip.set_active(
-                !self.settings_page
-                    && !self.picking
-                    && (!self.mini_mode || self.mini_detail.is_none()),
-            );
-        }
-        if let Some(tooltip) = &self.mini_open_tooltip {
-            tooltip.set_active(
-                self.mini_mode
-                    && self.mini_detail.is_some()
-                    && !self.settings_page
-                    && !self.picking,
-            );
-        }
-        if let Some(tooltip) = &self.refresh_tooltip {
-            tooltip.set_active(!self.settings_page && !self.mini_mode && !self.picking);
-        }
+        self.sync_tooltip_visibility();
         for (index, percent) in self.settings.preset_levels.iter().enumerate() {
             set_button_selected(
                 self.control(ID_PRESET + index as i32),
@@ -4719,26 +4659,28 @@ impl App {
                 self.changed_windows.len()
             ),
         );
-        if let Some(row) = self
-            .selected
-            .as_ref()
-            .and_then(|selected| {
-                self.changed_windows
-                    .iter()
-                    .find(|row| same_window(&row.window, selected))
-            })
-            .cloned()
-        {
-            if let Some(selected) = &mut self.selected {
+        if let Some(selected) = &mut self.selected {
+            let row = self
+                .changed_windows
+                .iter()
+                .find(|row| same_window(&row.window, selected));
+            let percent = if let Some(row) = row {
                 selected.title = row.window.title.clone();
-            }
-            let title = display_title(&row.window);
+                Some(row.transparency)
+            } else {
+                // 恢复完成会移除管理记录，但当前选择可能仍有效
+                self.controller.transparency_of(selected).ok()
+            };
+            let title = display_title(selected);
             set_text(self.control(ID_TARGET), &title);
-            if !self.picking
-                && GetCapture() != self.control(ID_SLIDER)
-                && GetCapture() != self.control(ID_MINI_SLIDER)
-            {
-                self.show_percent(row.transparency);
+            if let Some(percent) = percent {
+                if row.is_none()
+                    || (!self.picking
+                        && GetCapture() != self.control(ID_SLIDER)
+                        && GetCapture() != self.control(ID_MINI_SLIDER))
+                {
+                    self.show_percent(percent);
+                }
             }
         }
         self.update_enabled();
@@ -4774,7 +4716,7 @@ impl App {
         if search_composing() {
             return;
         }
-        let options = filter_windows(
+        let mut options = filter_windows(
             &self.windows,
             &self.changed_windows,
             &self.window_query,
@@ -4792,31 +4734,25 @@ impl App {
         );
         set_combo_updating(true);
         SendMessageW(combo, CB_RESETCONTENT, 0, 0);
-        self.window_options.clear();
-        for window in options {
-            let label = format!("{}  ·  PID {}", display_title(&window), window.process_id);
+        for (index, window) in options.iter().enumerate() {
+            let label = format!("{}  ·  PID {}", display_title(window), window.process_id);
             let inserted = SendMessageW(combo, CB_ADDSTRING, 0, wide(&label).as_ptr() as isize);
-            if inserted != self.window_options.len() as isize {
+            if inserted != index as isize {
                 SendMessageW(combo, CB_RESETCONTENT, 0, 0);
-                self.window_options.clear();
+                options.clear();
                 self.report_error(tr(
                     "无法更新窗口候选项，请点击刷新重试",
                     "Cannot update the available windows; click Refresh to try again",
                 ));
                 break;
             }
-            self.window_options.push(window);
         }
         SendMessageW(combo, CB_SETCURSEL, usize::MAX, 0);
         set_text(combo, &self.window_query);
-        WINDOW_OPTIONS.with(|options| *options.borrow_mut() = self.window_options.clone());
+        let has_options = !options.is_empty();
+        WINDOW_OPTIONS.with(|current| *current.borrow_mut() = options);
         let focused = GetFocus() == self.combo_edit || GetFocus() == combo;
-        if focused
-            && (open || dropped)
-            && !self.window_options.is_empty()
-            && !self.settings_page
-            && !self.picking
-        {
+        if focused && (open || dropped) && has_options && !self.settings_page && !self.picking {
             SendMessageW(combo, CB_SHOWDROPDOWN, 1, 0);
         }
         if focused {
@@ -4866,16 +4802,7 @@ impl App {
             };
             if watched.is_ok() && newly_added && self.settings.default_container {
                 // 仅首次登记时尝试，失败和手动取消后重新选中都不会自动重试
-                let enabled = self
-                    .controller
-                    .can_enable_container(&window)
-                    .and_then(|supported| {
-                        if supported {
-                            self.controller.set_container_mode(&window, true)
-                        } else {
-                            Ok(())
-                        }
-                    });
+                let enabled = self.controller.set_container_mode(&window, true);
                 if let Err(error) = enabled {
                     self.report_error(&format!(
                         "{}\n{error}",
@@ -4968,9 +4895,7 @@ impl App {
         if failures.is_empty() {
             true
         } else {
-            if !crate::window_topmost::has_pending_requests() {
-                self.report_error(&failures.join("\n\n"));
-            }
+            self.report_error(&failures.join("\n\n"));
             false
         }
     }
@@ -5004,14 +4929,24 @@ impl App {
             return;
         }
         // 完成通知即使被消息队列延迟，也可在下一次用户事件中收敛恢复状态
-        if event != EVENT_TOPMOST_COMPLETED {
-            for error in self.controller.finish_topmost_requests() {
-                self.report_error(&error);
-            }
-            if self.exit_pending && !crate::window_topmost::has_pending_requests() {
-                self.close(true);
-                return;
-            }
+        let was_exit_pending = EXIT_PENDING.get();
+        if self.finish_topmost_requests() {
+            return;
+        }
+        // 等待退出时继续处理后台通知，忽略禁用控件前已排队的用户操作
+        if was_exit_pending
+            && !matches!(
+                event,
+                EVENT_TARGET_ACTIVITY
+                    | EVENT_WINDOW_REFRESH
+                    | EVENT_TOPMOST_COMPLETED
+                    | EVENT_TRAY_READD
+                    | EVENT_HOTKEY_FOCUS
+                    | EVENT_TOPMOST_SYNC
+                    | EVENT_SHOW_MAIN
+            )
+        {
+            return;
         }
         match event {
             EVENT_ABOUT_LINK if self.settings_page && !self.picking => {
@@ -5098,7 +5033,7 @@ impl App {
             EVENT_CLEAR_SELECTION
                 if parameter as usize == interaction_version()
                     && !self.picking
-                    && !self.popup_open =>
+                    && !POPUP_OPEN.get() =>
             {
                 self.clear_current_selection()
             }
@@ -5114,34 +5049,10 @@ impl App {
                 }
             }
             EVENT_HOTKEY_FOCUS => {
-                if GetFocus() == self.control(ID_HOTKEY_INPUT) {
-                    if let Err(error) = self.unregister_hotkey() {
-                        self.report_error(&error);
-                    }
-                } else if let Err(error) = self.register_hotkey(self.settings.restore_hotkey) {
-                    self.report_error(&error);
-                }
-            }
-            EVENT_HOTKEY_RESTORE => {
-                let value = parameter as u32;
-                let modifiers = value & 0xffff;
-                let key = value >> 16;
-                if self.hotkey
-                    && GetFocus() != self.control(ID_HOTKEY_INPUT)
-                    && self
-                        .settings
-                        .restore_hotkey
-                        .is_some_and(|saved| saved.key == key && saved.modifiers == modifiers)
+                if let Err(error) =
+                    set_restore_binding(self.hwnd, self.settings.restore_hotkey, GetFocus())
                 {
-                    if key == u32::from(VK_ESCAPE)
-                        && modifiers == 0
-                        && main_window_active(self.hwnd)
-                    {
-                        self.handle_escape();
-                    } else {
-                        self.cancel_picker();
-                        self.restore_all();
-                    }
+                    self.report_error(&error);
                 }
             }
             EVENT_SHOW_MAIN => self.show_window(false),
@@ -5157,14 +5068,8 @@ impl App {
             EVENT_WINDOW_REFRESH => self.refresh_managed_windows(),
             EVENT_TARGET_ACTIVITY => self.process_target_activity(),
             EVENT_TOPMOST_COMPLETED => {
-                for error in self.controller.finish_topmost_requests() {
-                    self.report_error(&error);
-                }
                 self.refresh_changed_list_display(false);
                 self.update_enabled();
-                if self.exit_pending && !crate::window_topmost::has_pending_requests() {
-                    self.close(true);
-                }
             }
             EVENT_CHANGED_SELECT
                 if parameter as usize == interaction_version()
@@ -5402,6 +5307,10 @@ impl App {
                 _ => self.sync_language_selection(),
             },
             EVENT_ESCAPE => self.handle_escape(),
+            EVENT_RESTORE_HOTKEY => {
+                self.cancel_picker();
+                self.restore_all();
+            }
             EVENT_CLOSE => self.close(false),
             EVENT_EXIT => self.close(true),
             _ => {}
@@ -5445,7 +5354,7 @@ impl Drop for App {
                 );
             }
             self.icons = None;
-            if self.hotkey {
+            if matches!(RESTORE_BINDING.take(), Some(RestoreBinding::Active(_))) {
                 UnregisterHotKey(self.hwnd, HOTKEY_RESTORE);
             }
             for font in self.fonts.drain(..) {
@@ -5529,6 +5438,7 @@ unsafe extern "system" fn search_edit_proc(
     parent: usize,
 ) -> LRESULT {
     let parent = parent as HWND;
+    update_hotkey_focus(hwnd, parent, message, wparam);
     if (message == WM_KEYDOWN || message == WM_IME_KEYDOWN)
         && wparam == VK_ESCAPE as usize
         && !search_composing()
@@ -5536,6 +5446,7 @@ unsafe extern "system" fn search_edit_proc(
         queue_window_search(parent, false, false, None);
     }
     if message == WM_IME_STARTCOMPOSITION {
+        follow_hotkey_focus(parent, GetFocus());
         SEARCH_COMPOSING.with(|composing| composing.set(true));
         SEARCH_COMPOSITION_VERSION.with(|version| version.set(search_version()));
     }
@@ -5567,6 +5478,9 @@ unsafe extern "system" fn search_edit_proc(
             // 组合输入期间清空或取消后，不再回填旧查询或展开候选框
             queue_window_search(parent, valid, false, valid.then(|| read_text(hwnd)));
         }
+    }
+    if message == WM_KILLFOCUS || message == WM_NCDESTROY {
+        SEARCH_COMPOSING.with(|composing| composing.set(false));
     }
     result
 }
@@ -5603,9 +5517,7 @@ unsafe extern "system" fn hotkey_proc(
     _id: usize,
     parent: usize,
 ) -> LRESULT {
-    if message == WM_SETFOCUS || message == WM_KILLFOCUS {
-        post(parent as HWND, EVENT_HOTKEY_FOCUS, 0);
-    }
+    update_hotkey_focus(hwnd, parent as HWND, message, wparam);
     if message == WM_NCDESTROY {
         RemoveWindowSubclass(hwnd, Some(hotkey_proc), 2);
     }
@@ -5640,6 +5552,140 @@ unsafe extern "system" fn picker_proc(
     DefSubclassProc(hwnd, message, wparam, lparam)
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RestoreBinding {
+    Active(Hotkey),
+    Paused(Hotkey),
+}
+
+unsafe fn set_restore_binding(hwnd: HWND, key: Option<Hotkey>, focus: HWND) -> Result<(), String> {
+    let requested = if let Some(key) = key {
+        key.validate()?;
+        // 搜索编辑框获得裸 Esc 时让输入法及原生编辑控件处理按键
+        let paused = GetForegroundWindow() == hwnd
+            && IsChild(hwnd, focus) != 0
+            && (GetDlgCtrlID(focus) == ID_HOTKEY_INPUT
+                || (key == PLAIN_ESCAPE && GetDlgCtrlID(GetParent(focus)) == ID_WINDOWS));
+        Some(if paused {
+            RestoreBinding::Paused(key)
+        } else {
+            RestoreBinding::Active(key)
+        })
+    } else {
+        None
+    };
+    let current = RESTORE_BINDING.get();
+    if current == requested {
+        return Ok(());
+    }
+    if matches!(current, Some(RestoreBinding::Active(_))) {
+        SetLastError(0);
+        if UnregisterHotKey(hwnd, HOTKEY_RESTORE) == 0 {
+            let code = GetLastError();
+            if code != ERROR_HOTKEY_NOT_REGISTERED {
+                return Err(format!(
+                    "{} {code}",
+                    tr(
+                        "无法停用当前快捷键，Windows 错误码",
+                        "Cannot disable the current shortcut; Windows error"
+                    )
+                ));
+            }
+        }
+        RESTORE_BINDING.set(None);
+    }
+    if let Some(RestoreBinding::Active(key)) = requested {
+        if RegisterHotKey(hwnd, HOTKEY_RESTORE, key.modifiers | MOD_NOREPEAT, key.key) == 0 {
+            let code = GetLastError();
+            // 此时实际没有注册，提示框的焦点切换不再重复尝试同一失败绑定
+            RESTORE_BINDING.set(None);
+            return Err(format!(
+                "{} {key}{} {}{}",
+                tr("无法启用快捷键", "Cannot enable shortcut"),
+                tr(
+                    "，可能已被占用（Windows 错误码",
+                    "; it may already be in use (Windows error"
+                ),
+                code,
+                tr("）", ")")
+            ));
+        }
+    }
+    RESTORE_BINDING.set(requested);
+    Ok(())
+}
+
+unsafe fn update_hotkey_focus(edit: HWND, hwnd: HWND, message: u32, wparam: WPARAM) {
+    let focus = match message {
+        WM_SETFOCUS => edit,
+        WM_KILLFOCUS => wparam as HWND,
+        _ => return,
+    };
+    follow_hotkey_focus(hwnd, focus);
+}
+
+unsafe fn follow_hotkey_focus(hwnd: HWND, focus: HWND) {
+    if let Some(RestoreBinding::Active(key) | RestoreBinding::Paused(key)) = RESTORE_BINDING.get() {
+        if set_restore_binding(hwnd, Some(key), focus).is_err() {
+            // 焦点变动中不弹窗，恢复绑定失败时用保存的配置重试并报告结果
+            post(hwnd, EVENT_HOTKEY_FOCUS, 0);
+        }
+    }
+}
+
+// 在接收消息时决定操作，重入队列只延迟该操作，不重新解释前台窗口
+unsafe fn restore_hotkey_event(hwnd: HWND, value: LPARAM) -> Option<usize> {
+    let hotkey = Hotkey {
+        key: (value as u32) >> 16,
+        modifiers: (value as u32) & 0xffff,
+    };
+    let foreground = GetForegroundWindow();
+    let focus = GetFocus();
+    let editing =
+        foreground == hwnd && IsChild(hwnd, focus) != 0 && GetDlgCtrlID(focus) == ID_HOTKEY_INPUT;
+    let binding = RESTORE_BINDING.get();
+    if binding != Some(RestoreBinding::Active(hotkey))
+        && !(editing && binding == Some(RestoreBinding::Paused(hotkey)))
+    {
+        return None;
+    }
+    let plain_escape = hotkey == PLAIN_ESCAPE;
+    if plain_escape {
+        const DIALOG_CLASS_ATOM: u32 = 32770;
+        if !foreground.is_null()
+            && IsWindowEnabled(hwnd) == 0
+            && GetWindow(foreground, GW_OWNER) == hwnd
+            && GetWindowThreadProcessId(foreground, null_mut()) == GetCurrentThreadId()
+            && GetClassLongW(foreground, GCW_ATOM) == DIALOG_CLASS_ATOM
+        {
+            PostMessageW(foreground, WM_CLOSE, 0, 0);
+            return None;
+        }
+        // 托盘菜单的所有者可以是隐藏的主窗
+        if POPUP_OPEN.get() {
+            EndMenu();
+            return None;
+        }
+        if foreground.is_null() {
+            return None;
+        }
+    }
+    if EXIT_PENDING.get() {
+        return None;
+    }
+    if editing {
+        // 焦点切换前已截获的按键仍可录入草稿
+        if let Ok(value) = hotkey.to_control() {
+            SendMessageW(focus, HKM_SETHOTKEY, usize::from(value), 0);
+        }
+        return None;
+    }
+    if foreground == hwnd && plain_escape {
+        return Some(EVENT_ESCAPE);
+    }
+    Some(EVENT_RESTORE_HOTKEY)
+}
+
 unsafe extern "system" fn window_proc(
     hwnd: HWND,
     message: u32,
@@ -5648,6 +5694,12 @@ unsafe extern "system" fn window_proc(
 ) -> LRESULT {
     // 活动通知直接进入已有事件处理路径，减少一次排队并保留重入保护
     let (message, wparam, lparam) = match message {
+        WM_HOTKEY if wparam == HOTKEY_RESTORE as usize => {
+            let Some(event) = restore_hotkey_event(hwnd, lparam) else {
+                return 0;
+            };
+            (APP_EVENT, event, 0)
+        }
         TARGET_ACTIVITY_MESSAGE => (APP_EVENT, EVENT_TARGET_ACTIVITY, 0),
         WM_TIMER if wparam == TIMER_TARGET_ACTIVITY => {
             KillTimer(hwnd, TIMER_TARGET_ACTIVITY);
@@ -5879,7 +5931,12 @@ unsafe extern "system" fn window_proc(
             if header.code == NM_CUSTOMDRAW {
                 match header.idFrom as i32 {
                     ID_CHANGED_LIST | ID_MINI_LIST => {
-                        return ui_theme::draw_list(&mut *(lparam as *mut NMLVCUSTOMDRAW));
+                        let mini_min_width =
+                            (header.idFrom == ID_MINI_LIST as usize).then_some(MINI_MIN_WIDTH);
+                        return ui_theme::draw_list(
+                            &mut *(lparam as *mut NMLVCUSTOMDRAW),
+                            mini_min_width,
+                        );
                     }
                     _ => {}
                 }
@@ -5998,8 +6055,11 @@ unsafe extern "system" fn window_proc(
         }
         WM_ACTIVATEAPP => {
             if wparam == 0 {
+                // 即使隐藏主窗口后原控件暂时保留焦点，外部应用也能使用恢复键
+                follow_hotkey_focus(hwnd, null_mut());
                 post(hwnd, EVENT_DEACTIVATE, interaction_version() as isize);
             } else {
+                follow_hotkey_focus(hwnd, GetFocus());
                 post(hwnd, EVENT_WINDOW_REFRESH, 0);
             }
         }
@@ -6026,10 +6086,6 @@ unsafe extern "system" fn window_proc(
         }
         WM_CANCELMODE if owns_picker_capture(hwnd) => {
             post(hwnd, EVENT_PICK_CANCEL, picker_version() as isize);
-            return 0;
-        }
-        WM_HOTKEY if wparam == HOTKEY_RESTORE as usize => {
-            post(hwnd, EVENT_HOTKEY_RESTORE, lparam);
             return 0;
         }
         WM_WINDOWPOSCHANGED if lparam != 0 => {
@@ -6200,18 +6256,18 @@ unsafe extern "system" fn window_proc(
         }
         if message == APP_EVENT && wparam == EVENT_SHOW_MENU {
             let request = (*pointer).try_borrow_mut().ok().and_then(|mut app| {
-                if app.popup_open || app.exiting {
+                if POPUP_OPEN.get() || app.exiting {
                     return None;
                 }
                 let request = app.pending_menu.take()?;
-                app.popup_open = true;
+                POPUP_OPEN.set(true);
                 Some(request)
             });
             if let Some(request) = request {
                 // 菜单会运行嵌套消息循环，必须释放状态借用后再显示
                 let command = show_popup(hwnd, &request);
+                POPUP_OPEN.set(false);
                 if let Ok(mut app) = (*pointer).try_borrow_mut() {
-                    app.popup_open = false;
                     if IsWindow(hwnd) != 0 {
                         match command {
                             Ok(command) => app.menu_command(request, command),

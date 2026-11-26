@@ -35,7 +35,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::*;
 use crate::container_frame::{self, ContainerFrame};
 use crate::localization::tr;
 use crate::taskbar::ContainerTaskbarGroup;
-use crate::window_control::{restore_window_topmost, window_is_topmost, WindowInfo};
+use crate::window_control::{window_is_topmost, WindowInfo};
 use crate::window_topmost;
 
 static CONTAINER_CLASS: OnceLock<Result<(), u32>> = OnceLock::new();
@@ -1205,10 +1205,6 @@ impl WindowContainer {
         Self::hosting_mode(window).map(|_| ())
     }
 
-    pub fn supports_rendering(window: &WindowInfo) -> Result<bool, String> {
-        Self::check_render_compatibility(window).map(|_| true)
-    }
-
     fn hosting_mode(window: &WindowInfo) -> Result<HostingMode, String> {
         unsafe {
             if !GetMenu(window.hwnd).is_null()
@@ -1454,7 +1450,7 @@ impl WindowContainer {
             };
             let result = container.attach_target(transparency);
             if let Err(error) = result {
-                return match container.detach() {
+                return match container.detach(&[]) {
                     Ok(()) => Err(error.into()),
                     Err(restore_error) => Err(ContainerAttachError {
                         message: format!("{error}\n{restore_error}"),
@@ -1608,7 +1604,12 @@ impl WindowContainer {
             || window_topmost::is_pending(self.owned_state.target.hwnd)
     }
 
-    pub fn set_topmost(&self, enabled: bool) -> Result<bool, String> {
+    pub fn set_topmost(
+        &self,
+        enabled: bool,
+        completed: Option<window_topmost::SetStep>,
+    ) -> Result<Option<window_topmost::SetStep>, String> {
+        use window_topmost::SetStep;
         unsafe {
             let state = self.state()?;
             state.validate()?;
@@ -1628,32 +1629,35 @@ impl WindowContainer {
             // 顶层目标随所有者进入同一置顶分组，恢复时还原原窗口的分组
             state.topmost_modified.set(true);
             let allowed = (state.mode == HostingMode::TopLevel).then_some(state.target.hwnd);
-            if !window_topmost::request(
+            // 内容窗口的步骤总在宿主之后，任一步完成都只复核已处理的宿主
+            if completed.is_some() {
+                window_topmost::confirm(self.hwnd, enabled)?;
+            } else if !window_topmost::request(
                 self.hwnd,
                 enabled,
                 allowed,
                 window_topmost::Authority::new(&state.target, &state.property, state.token),
             )? {
-                return Ok(false);
+                return Ok(Some(SetStep::Host));
             }
             state.validate_host(self.hwnd)?;
             state.validate()?;
             // 原应用可能独立改变自身置顶标志，所有者联动后再核对内容窗口
-            if state.mode == HostingMode::TopLevel
-                && window_is_topmost(state.target.hwnd)? != enabled
-            {
-                if !window_topmost::request(
+            if state.mode == HostingMode::TopLevel {
+                if completed == Some(SetStep::Window) {
+                    window_topmost::confirm(state.target.hwnd, enabled)?;
+                } else if !window_topmost::request(
                     state.target.hwnd,
                     enabled,
                     Some(self.hwnd),
                     window_topmost::Authority::new(&state.target, &state.property, state.token),
                 )? {
-                    return Ok(false);
+                    return Ok(Some(SetStep::Window));
                 }
                 state.validate_host(self.hwnd)?;
                 state.validate()?;
             }
-            Ok(true)
+            Ok(None)
         }
     }
 
@@ -1928,7 +1932,7 @@ impl WindowContainer {
         }
     }
 
-    pub fn detach(&mut self) -> Result<(), String> {
+    pub fn detach(&mut self, completed: &[window_topmost::Completion]) -> Result<(), String> {
         unsafe {
             if self.hwnd.is_null() {
                 return Ok(());
@@ -2037,12 +2041,14 @@ impl WindowContainer {
                     }
                     state.validate()?;
                     if state.topmost_modified.get() {
-                        if !restore_window_topmost(
-                            state.target.hwnd,
-                            state.original_ex_style & WS_EX_TOPMOST != 0,
+                        if !window_topmost::restore(
                             &state.target,
                             &state.property,
                             state.token,
+                            window_topmost::RestoreStep::Detach(
+                                state.original_ex_style & WS_EX_TOPMOST != 0,
+                            ),
+                            completed,
                         )? {
                             return Err(window_topmost::pending_message());
                         }
@@ -2140,7 +2146,7 @@ impl WindowContainer {
 impl Drop for WindowContainer {
     fn drop(&mut self) {
         // 还原失败时由窗口自身继续持有状态，不能连带销毁用户窗口
-        let _ = self.detach();
+        let _ = self.detach(&[]);
     }
 }
 

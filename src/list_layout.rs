@@ -5,10 +5,8 @@ use windows_sys::Win32::Foundation::{HWND, RECT};
 use windows_sys::Win32::UI::Controls::{
     HDM_GETITEMCOUNT, LVM_GETCOLUMNWIDTH, LVM_GETHEADER, LVM_SETCOLUMNWIDTH,
 };
-use windows_sys::Win32::UI::HiDpi::{GetDpiForWindow, GetSystemMetricsForDpi};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    GetClientRect, GetParent, GetWindowLongPtrW, GetWindowRect, SendMessageW, GWL_STYLE,
-    SM_CXVSCROLL, SWP_NOSIZE, WINDOWPOS, WS_VSCROLL,
+    GetClientRect, GetWindowRect, SendMessageW, SWP_NOSIZE, WINDOWPOS,
 };
 
 thread_local! {
@@ -38,22 +36,9 @@ pub fn column_capacity(client_width: i32) -> i32 {
     client_width.saturating_sub(1).max(0)
 }
 
-fn resize_capacity(
-    client_width: i32,
-    outer_width: i32,
-    requested_width: i32,
-    vertical_present: bool,
-    scrollbar_width: i32,
-) -> i32 {
-    // 高度或列宽变化可能使纵向滚动条出现，先为其预留空间再提交新尺寸
-    let reserve = if vertical_present {
-        0
-    } else {
-        scrollbar_width.max(0)
-    };
-    let width = i64::from(client_width) + i64::from(requested_width.max(0))
-        - i64::from(outer_width)
-        - i64::from(reserve);
+fn resize_capacity(client_width: i32, outer_width: i32, requested_width: i32) -> i32 {
+    let width =
+        i64::from(client_width) + i64::from(requested_width.max(0)) - i64::from(outer_width);
     column_capacity(width.clamp(0, i64::from(i32::MAX)) as i32)
 }
 
@@ -78,7 +63,7 @@ fn shrink_columns(current: &[i32], capacity: i32) -> Vec<i32> {
         .collect()
 }
 
-pub unsafe fn prepare_resize(hwnd: HWND, position: &WINDOWPOS, show_scrollbars: bool) {
+pub unsafe fn prepare_resize(hwnd: HWND, position: &WINDOWPOS) {
     if position.flags & SWP_NOSIZE != 0 || is_preparing(hwnd) {
         return;
     }
@@ -102,17 +87,6 @@ pub unsafe fn prepare_resize(hwnd: HWND, position: &WINDOWPOS, show_scrollbars: 
         client.right - client.left,
         outer.right - outer.left,
         position.cx,
-        GetWindowLongPtrW(hwnd, GWL_STYLE) as u32 & WS_VSCROLL != 0,
-        if show_scrollbars {
-            GetSystemMetricsForDpi(
-                SM_CXVSCROLL,
-                GetDpiForWindow(hwnd)
-                    .max(GetDpiForWindow(GetParent(hwnd)))
-                    .max(96),
-            )
-        } else {
-            0
-        },
     );
     let current: Vec<_> = (0..count as usize)
         .map(|index| SendMessageW(hwnd, LVM_GETCOLUMNWIDTH, index, 0) as i32)
@@ -133,43 +107,16 @@ mod tests {
     #[test]
     fn shrink_happens_before_the_native_client_width_changes() {
         for border in [0, 2, 4] {
-            for scrollbar_width in [17, 26, 34] {
-                for old_vertical in [false, true] {
-                    for toggle_vertical in [false, true] {
-                        let mut outer = 800;
-                        let mut client =
-                            outer - border - if old_vertical { scrollbar_width } else { 0 };
-                        let mut vertical_present = old_vertical;
-                        let mut columns = vec![client - 150, 70, 79];
-                        for requested in [600, 320, 700, 95, 52, 500] {
-                            let capacity = resize_capacity(
-                                client,
-                                outer,
-                                requested,
-                                vertical_present,
-                                scrollbar_width,
-                            );
-                            let prepared = shrink_columns(&columns, capacity);
-                            let new_vertical = if toggle_vertical {
-                                !vertical_present
-                            } else {
-                                vertical_present
-                            };
-                            let next_client = (requested
-                                - border
-                                - if new_vertical { scrollbar_width } else { 0 })
-                            .max(0);
-                            assert!(prepared.iter().sum::<i32>() <= column_capacity(next_client));
-                            assert!(prepared.iter().zip(&columns).all(|(new, old)| new <= old));
-                            let budget = column_capacity(next_client);
-                            columns =
-                                vec![budget / 2, budget / 4, budget - budget / 2 - budget / 4];
-                            outer = requested;
-                            client = next_client;
-                            vertical_present = new_vertical;
-                        }
-                    }
-                }
+            let mut outer = 800;
+            for requested in [600, 320, 700, 95, 52, 500] {
+                let client = outer - border;
+                let current = [client - 39, 38];
+                let capacity = resize_capacity(client, outer, requested);
+                let prepared = shrink_columns(&current, capacity);
+                assert_eq!(capacity, column_capacity(requested - border));
+                assert!(prepared.iter().sum::<i32>() <= capacity);
+                assert!(prepared.iter().zip(current).all(|(&new, old)| new <= old));
+                outer = requested;
             }
         }
     }

@@ -272,13 +272,13 @@ impl Drop for PaintBuffer {
     }
 }
 
-struct SavedDc {
+pub(crate) struct SavedDc {
     hdc: HDC,
     level: i32,
 }
 
 impl SavedDc {
-    unsafe fn new(hdc: HDC) -> Option<Self> {
+    pub(crate) unsafe fn new(hdc: HDC) -> Option<Self> {
         let level = SaveDC(hdc);
         (level != 0).then(|| Self { hdc, level })
     }
@@ -290,7 +290,7 @@ impl Drop for SavedDc {
     }
 }
 
-fn pixels(dip: i32, dpi: u32) -> i32 {
+pub(crate) fn pixels(dip: i32, dpi: u32) -> i32 {
     ((dip as i64 * dpi.max(96) as i64 + 48) / 96) as i32
 }
 
@@ -1005,6 +1005,46 @@ unsafe extern "system" fn hotkey_text_proc(
         InvalidateRect(hwnd, null(), 0);
     }
     result
+}
+
+#[test]
+fn empty_hotkey_writes_only_the_terminator_within_the_callers_buffer() {
+    unsafe {
+        let controls = INITCOMMONCONTROLSEX {
+            dwSize: size_of::<INITCOMMONCONTROLSEX>() as u32,
+            dwICC: ICC_HOTKEY_CLASS,
+        };
+        assert_ne!(InitCommonControlsEx(&controls), 0);
+        let hwnd = CreateWindowExW(
+            0,
+            HOTKEY_CLASSW,
+            null(),
+            WS_CHILD,
+            0,
+            0,
+            1,
+            1,
+            HWND_MESSAGE,
+            null_mut(),
+            null_mut(),
+            null(),
+        );
+        assert!(!hwnd.is_null());
+        assert!(install_hotkey_theme(hwnd));
+        assert_eq!(SendMessageW(hwnd, WM_GETTEXTLENGTH, 0, 0), 0);
+        for capacity in 0..=2 {
+            let mut buffer = [0x5a5a_u16; 3];
+            assert_eq!(
+                SendMessageW(hwnd, WM_GETTEXT, capacity, buffer.as_mut_ptr() as LPARAM),
+                0
+            );
+            assert_eq!(
+                buffer,
+                [if capacity == 0 { 0x5a5a } else { 0 }, 0x5a5a, 0x5a5a]
+            );
+        }
+        DestroyWindow(hwnd);
+    }
 }
 
 unsafe fn paint_empty_hotkey(hwnd: HWND, dc: HDC, update_caret: bool) {
@@ -1762,65 +1802,34 @@ unsafe fn back_icon(hdc: HDC, rect: RECT, dpi: u32, color: COLORREF) {
 }
 
 unsafe fn back_icon_antialiased(hdc: HDC, rect: RECT, dpi: u32, color: COLORREF) -> bool {
-    if !GDIPLUS_READY.with(Cell::get) {
-        return false;
-    }
-    let mut corners = [
-        POINT {
-            x: rect.left,
-            y: rect.top,
-        },
-        POINT {
-            x: rect.right,
-            y: rect.bottom,
-        },
-    ];
-    if LPtoDP(hdc, corners.as_mut_ptr(), corners.len() as i32) == 0 {
-        return false;
-    }
-    let Some(_saved) = SavedDc::new(hdc) else {
-        return false;
-    };
-    if SetWindowOrgEx(hdc, 0, 0, null_mut()) == 0 || SetViewportOrgEx(hdc, 0, 0, null_mut()) == 0 {
-        return false;
-    }
-    let Some(graphics) = GdiPlusGraphics::new(hdc) else {
-        return false;
-    };
-    let Some(path) = GdiPlusPath::new() else {
-        return false;
-    };
     let scale = dpi.max(96) as f32 / 96.0;
-    let Some(pen) = GdiPlusPen::new(color, 1.5 * scale) else {
-        return false;
-    };
-    let cx = (corners[0].x as f32 + corners[1].x as f32) / 2.0;
-    let cy = (corners[0].y as f32 + corners[1].y as f32) / 2.0;
-    let arrow = [
-        gdip::PointF {
-            X: cx,
-            Y: cy - 5.0 * scale,
+    scaled_icon_path_antialiased(
+        hdc,
+        rect,
+        color,
+        scale,
+        1.5 * scale,
+        |path, cx, cy, scale| {
+            let arrow = [
+                gdip::PointF {
+                    X: cx,
+                    Y: cy - 5.0 * scale,
+                },
+                gdip::PointF {
+                    X: cx - 5.0 * scale,
+                    Y: cy,
+                },
+                gdip::PointF {
+                    X: cx,
+                    Y: cy + 5.0 * scale,
+                },
+            ];
+            gdip::GdipAddPathLine2(path, arrow.as_ptr(), arrow.len() as i32) == gdip::Ok
+                && gdip::GdipStartPathFigure(path) == gdip::Ok
+                && gdip::GdipAddPathLine(path, cx - 5.0 * scale, cy, cx + 6.0 * scale, cy)
+                    == gdip::Ok
         },
-        gdip::PointF {
-            X: cx - 5.0 * scale,
-            Y: cy,
-        },
-        gdip::PointF {
-            X: cx,
-            Y: cy + 5.0 * scale,
-        },
-    ];
-    gdip::GdipSetPageUnit(graphics.0, gdip::UnitPixel) == gdip::Ok
-        && gdip::GdipSetSmoothingMode(graphics.0, gdip::SmoothingModeAntiAlias8x8) == gdip::Ok
-        && gdip::GdipSetPixelOffsetMode(graphics.0, gdip::PixelOffsetModeHighQuality) == gdip::Ok
-        && gdip::GdipSetPenStartCap(pen.0, gdip::LineCapRound) == gdip::Ok
-        && gdip::GdipSetPenEndCap(pen.0, gdip::LineCapRound) == gdip::Ok
-        && gdip::GdipSetPenLineJoin(pen.0, gdip::LineJoinRound) == gdip::Ok
-        && gdip::GdipAddPathLine2(path.0, arrow.as_ptr(), arrow.len() as i32) == gdip::Ok
-        && gdip::GdipStartPathFigure(path.0) == gdip::Ok
-        && gdip::GdipAddPathLine(path.0, cx - 5.0 * scale, cy, cx + 6.0 * scale, cy) == gdip::Ok
-        && gdip::GdipDrawPath(graphics.0, pen.0, path.0) == gdip::Ok
-        && gdip::GdipFlush(graphics.0, gdip::FlushIntentionSync) == gdip::Ok
+    )
 }
 
 unsafe fn icon_path_antialiased(
@@ -2136,91 +2145,41 @@ unsafe fn refresh_icon(hdc: HDC, rect: RECT, dpi: u32, color: COLORREF) {
 }
 
 unsafe fn refresh_icon_antialiased(hdc: HDC, rect: RECT, dpi: u32, color: COLORREF) -> bool {
-    if !GDIPLUS_READY.with(Cell::get) {
-        return false;
-    }
-    let mut corners = [
-        POINT {
-            x: rect.left,
-            y: rect.top,
-        },
-        POINT {
-            x: rect.right,
-            y: rect.bottom,
-        },
-    ];
-    if LPtoDP(hdc, corners.as_mut_ptr(), corners.len() as i32) == 0 {
-        return false;
-    }
-    let Some(_saved) = SavedDc::new(hdc) else {
-        return false;
-    };
-    // 先转为画布像素坐标，再清零原点，兼容缓冲区的非零窗口原点
-    if SetWindowOrgEx(hdc, 0, 0, null_mut()) == 0 || SetViewportOrgEx(hdc, 0, 0, null_mut()) == 0 {
-        return false;
-    }
-    let Some(graphics) = GdiPlusGraphics::new(hdc) else {
-        return false;
-    };
-    let Some(path) = GdiPlusPath::new() else {
-        return false;
-    };
-    let cx = (corners[0].x as f32 + corners[1].x as f32) / 2.0;
-    let cy = (corners[0].y as f32 + corners[1].y as f32) / 2.0;
-    let scale = 18.0 * dpi.max(96) as f32 / (96.0 * 24.0);
-    let point = |x: f32, y: f32| gdip::PointF {
-        X: cx + (x - 12.0) * scale,
-        Y: cy + (y - 12.0) * scale,
-    };
-    let Some(pen) = GdiPlusPen::new(color, 2.0 * scale) else {
-        return false;
-    };
-    // 保留路径和描边的亚像素精度，避免小尺寸圆弧先取整后出现锯齿
-    let tangent = 9.0 * 0.552_284_8;
-    let curve = [
-        point(21.0, 12.0),
-        point(21.0, 12.0 + tangent),
-        point(12.0 + tangent, 21.0),
-        point(12.0, 21.0),
-        point(12.0 - tangent, 21.0),
-        point(3.0, 12.0 + tangent),
-        point(3.0, 12.0),
-        point(3.0, 12.0 - tangent),
-        point(12.0 - tangent, 3.0),
-        point(12.0, 3.0),
-        point(14.52, 3.0),
-        point(16.93, 4.0),
-        point(18.74, 5.74),
-    ];
-    let arrow_start = point(21.0, 3.0);
-    let arrow_tip = point(21.0, 8.0);
-    let arrow_end = point(16.0, 8.0);
-    let curve_end = curve[curve.len() - 1];
-    if gdip::GdipSetPageUnit(graphics.0, gdip::UnitPixel) != gdip::Ok
-        || gdip::GdipSetSmoothingMode(graphics.0, gdip::SmoothingModeAntiAlias8x8) != gdip::Ok
-        || gdip::GdipSetPixelOffsetMode(graphics.0, gdip::PixelOffsetModeHighQuality) != gdip::Ok
-        || gdip::GdipSetPenStartCap(pen.0, gdip::LineCapRound) != gdip::Ok
-        || gdip::GdipSetPenEndCap(pen.0, gdip::LineCapRound) != gdip::Ok
-        || gdip::GdipSetPenLineJoin(pen.0, gdip::LineJoinRound) != gdip::Ok
-        || gdip::GdipAddPathBeziers(path.0, curve.as_ptr(), curve.len() as i32) != gdip::Ok
-        || gdip::GdipAddPathLine(path.0, curve_end.X, curve_end.Y, arrow_tip.X, arrow_tip.Y)
-            != gdip::Ok
-        || gdip::GdipStartPathFigure(path.0) != gdip::Ok
-        || gdip::GdipAddPathLine(
-            path.0,
-            arrow_start.X,
-            arrow_start.Y,
-            arrow_tip.X,
-            arrow_tip.Y,
-        ) != gdip::Ok
-        || gdip::GdipAddPathLine(path.0, arrow_tip.X, arrow_tip.Y, arrow_end.X, arrow_end.Y)
-            != gdip::Ok
-        || gdip::GdipDrawPath(graphics.0, pen.0, path.0) != gdip::Ok
-    {
-        return false;
-    }
-    // 完成 GDI+ 绘制后再让调用方把缓冲区复制到窗口
-    gdip::GdipFlush(graphics.0, gdip::FlushIntentionSync) == gdip::Ok
+    icon_path_antialiased(hdc, rect, dpi, color, |path, cx, cy, scale| {
+        let point = |x: f32, y: f32| gdip::PointF {
+            X: cx + (x - 12.0) * scale,
+            Y: cy + (y - 12.0) * scale,
+        };
+        // 保留路径和描边的亚像素精度，避免小尺寸圆弧先取整后出现锯齿
+        let tangent = 9.0 * 0.552_284_8;
+        let curve = [
+            point(21.0, 12.0),
+            point(21.0, 12.0 + tangent),
+            point(12.0 + tangent, 21.0),
+            point(12.0, 21.0),
+            point(12.0 - tangent, 21.0),
+            point(3.0, 12.0 + tangent),
+            point(3.0, 12.0),
+            point(3.0, 12.0 - tangent),
+            point(12.0 - tangent, 3.0),
+            point(12.0, 3.0),
+            point(14.52, 3.0),
+            point(16.93, 4.0),
+            point(18.74, 5.74),
+        ];
+        let arrow_start = point(21.0, 3.0);
+        let arrow_tip = point(21.0, 8.0);
+        let arrow_end = point(16.0, 8.0);
+        let curve_end = curve[curve.len() - 1];
+        gdip::GdipAddPathBeziers(path, curve.as_ptr(), curve.len() as i32) == gdip::Ok
+            && gdip::GdipAddPathLine(path, curve_end.X, curve_end.Y, arrow_tip.X, arrow_tip.Y)
+                == gdip::Ok
+            && gdip::GdipStartPathFigure(path) == gdip::Ok
+            && gdip::GdipAddPathLine(path, arrow_start.X, arrow_start.Y, arrow_tip.X, arrow_tip.Y)
+                == gdip::Ok
+            && gdip::GdipAddPathLine(path, arrow_tip.X, arrow_tip.Y, arrow_end.X, arrow_end.Y)
+                == gdip::Ok
+    })
 }
 
 unsafe fn refresh_icon_gdi(hdc: HDC, rect: RECT, dpi: u32, color: COLORREF) {
@@ -3214,7 +3173,102 @@ pub(crate) unsafe fn draw_window_action_icon(
     DeleteObject(pen);
 }
 
-unsafe fn draw_list_name(draw: &NMLVCUSTOMDRAW, badges: WindowBadges) -> bool {
+// 返回能完整放下的 UTF-16 前缀长度，避免在代理对中间截断
+unsafe fn fitting_name_prefix(dc: HDC, text: &[u16], width: i32) -> usize {
+    let mut fit = 0;
+    let mut extent: SIZE = zeroed();
+    if width <= 0
+        || GetTextExtentExPointW(
+            dc,
+            text.as_ptr(),
+            text.len() as i32,
+            width,
+            &mut fit,
+            null_mut(),
+            &mut extent,
+        ) == 0
+    {
+        return 0;
+    }
+    let end = (fit as usize).min(text.len());
+    if end > 0 && (0xD800..=0xDBFF).contains(&text[end - 1]) {
+        end - 1
+    } else {
+        end
+    }
+}
+
+// Unicode 17 的 Default_Ignorable_Code_Point 不单独触发名称显示
+// 测宽和绘制仍使用含这些格式字符的原始 UTF-16 前缀
+fn first_visible_name_end(text: &[u16]) -> Option<usize> {
+    let mut end = 0;
+    for ch in char::decode_utf16(text.iter().copied()) {
+        let ch = ch.unwrap_or(char::REPLACEMENT_CHARACTER);
+        end += ch.len_utf16();
+        let ignorable = matches!(ch as u32,
+            0x00AD | 0x034F | 0x061C | 0x115F..=0x1160 | 0x17B4..=0x17B5 |
+            0x180B..=0x180F | 0x200B..=0x200F | 0x202A..=0x202E | 0x2060..=0x206F |
+            0x3164 | 0xFE00..=0xFE0F | 0xFEFF | 0xFFA0 | 0xFFF0..=0xFFF8 |
+            0x1BCA0..=0x1BCA3 | 0x1D173..=0x1D17A | 0xE0000..=0xE0FFF);
+        // 盲文空白占用字宽，但没有可见点位
+        if !ch.is_whitespace() && !ch.is_control() && !ignorable && ch != '\u{2800}' {
+            return Some(end);
+        }
+    }
+    None
+}
+
+const LIST_NAME_CAPACITY: usize = 1024;
+const MINI_NAME_DOTS: [u16; 3] = [b'.' as u16; 3];
+
+unsafe fn fit_mini_icon_name(
+    dc: HDC,
+    text: &mut [u16; LIST_NAME_CAPACITY + 4],
+    length: usize,
+    width: i32,
+    badge_width: i32,
+) -> (usize, bool) {
+    let name = &text[..length];
+    let Some(first_end) = first_visible_name_end(name) else {
+        return (0, false);
+    };
+    let mut dots: SIZE = zeroed();
+    let mut first: SIZE = zeroed();
+    if GetTextExtentPoint32W(
+        dc,
+        MINI_NAME_DOTS.as_ptr(),
+        MINI_NAME_DOTS.len() as i32,
+        &mut dots,
+    ) == 0
+        || width < dots.cx
+        || GetTextExtentPoint32W(dc, name.as_ptr(), first_end as i32, &mut first) == 0
+    {
+        return (0, false);
+    }
+
+    // 每一档都按三个点预留空间，避免短名称跳过最后一档前缀
+    let prefix_space = width - dots.cx;
+    let show_badges = prefix_space >= first.cx + badge_width;
+    let prefix = if prefix_space < first.cx {
+        0
+    } else {
+        // 首字之后再为状态标记留位，标记出现时名称前缀不会缩短
+        let available = (prefix_space - badge_width).max(first.cx);
+        fitting_name_prefix(dc, name, available).max(first_end)
+    };
+    if prefix == length {
+        return (length, show_badges);
+    }
+    let end = prefix + MINI_NAME_DOTS.len();
+    text[prefix..end].copy_from_slice(&MINI_NAME_DOTS);
+    (end, show_badges)
+}
+
+unsafe fn draw_list_name(
+    draw: &NMLVCUSTOMDRAW,
+    badges: WindowBadges,
+    mini_min_width: Option<i32>,
+) -> bool {
     let list = draw.nmcd.hdr.hwndFrom;
     let row = draw.nmcd.dwItemSpec;
     let dc = draw.nmcd.hdc;
@@ -3235,7 +3289,7 @@ unsafe fn draw_list_name(draw: &NMLVCUSTOMDRAW, badges: WindowBadges) -> bool {
         return false;
     }
     // DrawTextExW 的省略处理最多额外写入四个字符
-    let mut text = [0_u16; 1028];
+    let mut text = [0_u16; LIST_NAME_CAPACITY + 4];
     let mut item = LVITEMW {
         mask: LVIF_IMAGE | LVIF_STATE,
         iItem: row as i32,
@@ -3247,7 +3301,7 @@ unsafe fn draw_list_name(draw: &NMLVCUSTOMDRAW, badges: WindowBadges) -> bool {
     }
     let mut name = LVITEMW {
         pszText: text.as_mut_ptr(),
-        cchTextMax: 1024,
+        cchTextMax: LIST_NAME_CAPACITY as i32,
         ..zeroed()
     };
     let length = SendMessageW(
@@ -3316,24 +3370,9 @@ unsafe fn draw_list_name(draw: &NMLVCUSTOMDRAW, badges: WindowBadges) -> bool {
     let has_icon = images != 0
         && item.iImage >= 0
         && ImageList_GetIconSize(images, &mut icon_width, &mut icon_height) != 0;
-    if has_icon {
-        ImageList_Draw(
-            images,
-            item.iImage,
-            dc,
-            cell.left + pixels(4, dpi),
-            cell.top + (cell.bottom - cell.top - icon_height) / 2,
-            ILD_TRANSPARENT
-                | if item.state & LVIS_CUT != 0 {
-                    ILD_BLEND50
-                } else {
-                    0
-                },
-        );
-    }
     let gap = pixels(2, dpi);
     let side = pixels(LIST_BADGE_SIDE, dpi).min((cell.bottom - cell.top).max(1));
-    let badge_width = [badges.topmost, badges.container, badges.hidden]
+    let mut badge_width = [badges.topmost, badges.container, badges.hidden]
         .into_iter()
         .filter(|enabled| *enabled)
         .count() as i32
@@ -3346,31 +3385,80 @@ unsafe fn draw_list_name(draw: &NMLVCUSTOMDRAW, badges: WindowBadges) -> bool {
         } else {
             text_left
         },
-        right: cell.right - pixels(4, dpi) - badge_width,
+        right: cell.right - pixels(4, dpi),
         ..cell
     };
-    if content.right <= content.left || length <= 0 {
+    font_for(dc, list);
+    let mut draw_length = length.clamp(0, name.cchTextMax as isize - 1) as usize;
+    let mut text_flags = DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX;
+    if let Some(minimum) = mini_min_width.filter(|_| has_icon) {
+        let mut parent: RECT = zeroed();
+        let at_minimum = GetClientRect(GetParent(list), &mut parent) != 0
+            && parent.right - parent.left <= pixels(minimum, dpi);
+        let (visible, show_badges) = if at_minimum {
+            (0, false)
+        } else {
+            fit_mini_icon_name(
+                dc,
+                &mut text,
+                draw_length,
+                content.right - content.left,
+                badge_width,
+            )
+        };
+        draw_length = visible;
+        text[visible] = 0;
+        if !show_badges {
+            badge_width = 0;
+        }
+    } else {
+        text_flags |= DT_END_ELLIPSIS | DT_MODIFYSTRING;
+    }
+    content.right -= badge_width;
+    if has_icon {
+        let x = if mini_min_width.is_some() && draw_length == 0 {
+            cell.left + (column_width - icon_width) / 2
+        } else {
+            text_left
+        };
+        ImageList_Draw(
+            images,
+            item.iImage,
+            dc,
+            x,
+            cell.top + (cell.bottom - cell.top - icon_height) / 2,
+            ILD_TRANSPARENT
+                | if item.state & LVIS_CUT != 0 {
+                    ILD_BLEND50
+                } else {
+                    0
+                },
+        );
+    }
+    if content.right <= content.left || draw_length == 0 {
         // 窄列或空名称仍保留已绘制的原色图标，避免原生选中绘制再次覆盖
         return true;
     }
-    font_for(dc, list);
     SetBkMode(dc, TRANSPARENT as i32);
     SetTextColor(dc, foreground);
     if DrawTextExW(
         dc,
         text.as_mut_ptr(),
-        length as i32,
+        draw_length as i32,
         &mut content,
-        DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_MODIFYSTRING | DT_NOPREFIX,
+        text_flags,
         null(),
     ) == 0
     {
         return true;
     }
-    if !badges.any() {
+    if badge_width == 0 {
         return true;
     }
-    let shown_length = text.iter().position(|value| *value == 0).unwrap_or(1024);
+    let shown_length = text
+        .iter()
+        .position(|value| *value == 0)
+        .unwrap_or(draw_length);
     let mut extent: SIZE = zeroed();
     if GetTextExtentPoint32W(dc, text.as_ptr(), shown_length as i32, &mut extent) == 0 {
         return true;
@@ -3402,7 +3490,7 @@ unsafe fn draw_list_name(draw: &NMLVCUSTOMDRAW, badges: WindowBadges) -> bool {
     true
 }
 
-pub unsafe fn draw_list(draw: &mut NMLVCUSTOMDRAW) -> LRESULT {
+pub unsafe fn draw_list(draw: &mut NMLVCUSTOMDRAW, mini_min_width: Option<i32>) -> LRESULT {
     match draw.nmcd.dwDrawStage {
         CDDS_PREPAINT => CDRF_NOTIFYITEMDRAW as LRESULT,
         CDDS_ITEMPREPAINT => {
@@ -3422,7 +3510,7 @@ pub unsafe fn draw_list(draw: &mut NMLVCUSTOMDRAW) -> LRESULT {
         }
         stage if stage == CDDS_ITEMPREPAINT | CDDS_SUBITEM && draw.iSubItem == 0 => {
             let badges = window_badges(draw.nmcd.lItemlParam as usize);
-            if draw_list_name(draw, badges) {
+            if draw_list_name(draw, badges, mini_min_width) {
                 CDRF_SKIPDEFAULT as LRESULT
             } else {
                 CDRF_DODEFAULT as LRESULT
@@ -3500,6 +3588,59 @@ mod rendering_tests {
     // 所有画布均为内存 DIB，不创建窗口或获取桌面 DC
     static GDI_TEST_LOCK: Mutex<()> = Mutex::new(());
     const SENTINEL: COLORREF = rgb(217, 31, 183);
+
+    #[test]
+    fn first_visible_name_includes_leading_format_marks_in_its_prefix() {
+        for (title, end) in [
+            ("\u{200E}A", Some(2)),
+            ("\u{200B}中", Some(2)),
+            ("\u{2800}中", Some(2)),
+            ("\u{2800}", None),
+            (" \u{2066}😀", Some(4)),
+            ("\u{FEFF}\u{E0100}", None),
+        ] {
+            let text: Vec<_> = title.encode_utf16().collect();
+            assert_eq!(first_visible_name_end(&text), end);
+        }
+    }
+
+    #[test]
+    fn widening_mini_name_reveals_each_prefix_before_the_full_name() {
+        let _serial = GDI_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        unsafe {
+            let canvas = Canvas::new(1, 1, SURFACE);
+            for badge_width in [0, 24] {
+                for (name, expected) in [
+                    ("abc", &["", "...", "a...", "ab...", "abc"][..]),
+                    ("a", &["", "...", "a"][..]),
+                    ("中文", &["", "...", "中...", "中文"][..]),
+                    ("😀b", &["", "...", "😀...", "😀b"][..]),
+                    ("\u{2800}", &[""][..]),
+                ] {
+                    let title: Vec<_> = name.encode_utf16().collect();
+                    let mut stages = Vec::new();
+                    for width in 0..=200 {
+                        let mut text = [0; LIST_NAME_CAPACITY + 4];
+                        text[..title.len()].copy_from_slice(&title);
+                        let (end, _) = fit_mini_icon_name(
+                            canvas.dc,
+                            &mut text,
+                            title.len(),
+                            width,
+                            badge_width,
+                        );
+                        let shown = String::from_utf16(&text[..end]).unwrap();
+                        if stages.last() != Some(&shown) {
+                            stages.push(shown);
+                        }
+                    }
+                    assert_eq!(stages, expected);
+                }
+            }
+        }
+    }
 
     struct Canvas {
         dc: HDC,

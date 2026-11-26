@@ -98,7 +98,7 @@ struct SelectedWindow {
 
 #[derive(Clone, Copy)]
 enum TopmostAction {
-    Set(bool),
+    Set(bool, window_topmost::SetStep),
     DisableContainer,
     Restore,
 }
@@ -107,6 +107,34 @@ enum TopmostAction {
 struct PendingTopmostAction {
     token: usize,
     action: TopmostAction,
+}
+
+impl PendingTopmostAction {
+    fn stops_on_failure(self, key: usize, owner: &window_topmost::RequestOwner) -> bool {
+        // 前序调整失败仍可首次恢复，恢复请求自身失败则保留快照等待手动重试
+        owner.hwnd == key
+            && owner.token == self.token
+            && (owner.restore.is_some() || !matches!(self.action, TopmostAction::Restore))
+    }
+}
+
+#[test]
+fn failed_topmost_restore_stops_only_its_own_continuation() {
+    let action = PendingTopmostAction {
+        token: 1,
+        action: TopmostAction::Restore,
+    };
+    let mut owner = window_topmost::RequestOwner {
+        hwnd: 42,
+        token: 1,
+        restore: None,
+    };
+    assert!(!action.stops_on_failure(42, &owner));
+    owner.restore = Some(window_topmost::RestoreStep::Direct(false));
+    assert!(action.stops_on_failure(42, &owner));
+    assert!(!action.stops_on_failure(43, &owner));
+    owner.token = 2;
+    assert!(!action.stops_on_failure(42, &owner));
 }
 
 pub struct WindowController {
@@ -355,6 +383,15 @@ impl WindowController {
     }
 
     pub fn set_container_mode(&mut self, window: &WindowInfo, enabled: bool) -> Result<(), String> {
+        self.set_container_mode_after(window, enabled, &[])
+    }
+
+    fn set_container_mode_after(
+        &mut self,
+        window: &WindowInfo,
+        enabled: bool,
+        completed: &[window_topmost::Completion],
+    ) -> Result<(), String> {
         let tracked = self.tracked_window(window)?;
         let key = window.hwnd as usize;
         if self.topmost_actions.contains_key(&key) {
@@ -364,7 +401,7 @@ impl WindowController {
             return Ok(());
         }
         if !enabled {
-            if !self.detach_container(key)? {
+            if !self.detach_container(key, completed)? {
                 self.defer_topmost(key, TopmostAction::DisableContainer);
                 return Ok(());
             }
@@ -391,11 +428,7 @@ impl WindowController {
             })();
             let taskbar_restored = self.set_taskbar_hidden(window, tracked.taskbar_hidden);
             let topmost_restored = if let Some(enabled) = tracked.desired_topmost {
-                self.write_topmost(&tracked, enabled).map(|complete| {
-                    if !complete {
-                        self.defer_topmost(key, TopmostAction::Set(enabled));
-                    }
-                })
+                self.apply_topmost(&tracked, enabled, None)
             } else {
                 Ok(())
             };
@@ -469,9 +502,7 @@ impl WindowController {
         }
         self.container_errors.remove(&key);
         if let Some(enabled) = tracked.desired_topmost {
-            if !self.write_topmost(&tracked, enabled)? {
-                self.defer_topmost(key, TopmostAction::Set(enabled));
-            }
+            self.apply_topmost(&tracked, enabled, None)?;
         }
         if tracked.taskbar_hidden {
             TaskbarList::new()?.set_hidden(self.containers[&key].hwnd()?, true)?;
@@ -487,10 +518,10 @@ impl WindowController {
                 .is_some_and(|tracked| same_identity(&tracked.window, window))
     }
 
-    pub fn can_enable_container(&self, window: &WindowInfo) -> Result<bool, String> {
+    pub fn check_container_compatibility(&self, window: &WindowInfo) -> Result<(), String> {
         let tracked = self.tracked_window(window)?;
         self.require_owned(&tracked)?;
-        let supported = WindowContainer::supports_rendering(window);
+        let supported = WindowContainer::check_render_compatibility(window);
         self.require_owned(&tracked)?;
         supported
     }
@@ -519,7 +550,7 @@ impl WindowController {
             .get(&key)
             .is_some_and(|tracked| !identity_matches(&tracked.window))
         {
-            match self.detach_container(key) {
+            match self.detach_container(key, &[]) {
                 Ok(true) => {
                     self.changed.remove(&key);
                     return Vec::new();
@@ -548,11 +579,15 @@ impl WindowController {
         }
     }
 
-    fn detach_container(&mut self, key: usize) -> Result<bool, String> {
+    fn detach_container(
+        &mut self,
+        key: usize,
+        completed: &[window_topmost::Completion],
+    ) -> Result<bool, String> {
         // 一旦开始脱离，失败时也不能继续自动同步旧宿主状态
         self.container_restores.insert(key);
         if let Some(container) = self.containers.get_mut(&key) {
-            if let Err(error) = container.detach() {
+            if let Err(error) = container.detach(completed) {
                 if container.has_pending_topmost() {
                     return Ok(false);
                 }
@@ -802,38 +837,45 @@ impl WindowController {
         if self.topmost_actions.contains_key(&key) {
             return Err(window_topmost::pending_message());
         }
-        let original = self.is_topmost(window)?;
+        let original = self.observed_topmost(&tracked)?;
         // 写入前保存恢复快照，失败或部分生效时也能通过恢复操作撤销
-        if let Some(current) = self.changed.get_mut(&(window.hwnd as usize)) {
+        if let Some(current) = self.changed.get_mut(&key) {
             current.original_topmost.get_or_insert(original);
         }
-        if !self.write_topmost(&tracked, enabled)? {
-            self.defer_topmost(key, TopmostAction::Set(enabled));
-            return Ok(());
-        }
-        if let Some(current) = self.changed.get_mut(&(window.hwnd as usize)) {
-            current.desired_topmost = Some(enabled);
-        }
-        Ok(())
+        self.apply_topmost(&tracked, enabled, None)
     }
 
-    fn write_topmost(&self, tracked: &ChangedWindow, enabled: bool) -> Result<bool, String> {
+    fn apply_topmost(
+        &mut self,
+        tracked: &ChangedWindow,
+        enabled: bool,
+        completed: Option<window_topmost::SetStep>,
+    ) -> Result<(), String> {
+        use window_topmost::SetStep;
         self.require_owned(tracked)?;
         let key = tracked.window.hwnd as usize;
         self.require_container_ready(key)?;
-        let complete = if let Some(container) = self.containers.get(&key) {
-            container.set_topmost(enabled)?
+        let pending = if let Some(container) = self.containers.get(&key) {
+            container.set_topmost(enabled, completed)?
+        } else if completed.is_some() {
+            window_topmost::confirm(tracked.window.hwnd, enabled)?;
+            None
         } else {
-            set_window_topmost(
+            let complete = window_topmost::request(
                 tracked.window.hwnd,
                 enabled,
-                &tracked.window,
-                &self.property_name,
-                tracked.token,
-            )?
+                None,
+                window_topmost::Authority::new(&tracked.window, &self.property_name, tracked.token),
+            )?;
+            (!complete).then_some(SetStep::Window)
         };
         self.require_owned(tracked)?;
-        Ok(complete)
+        if let Some(step) = pending {
+            self.defer_topmost(key, TopmostAction::Set(enabled, step));
+        } else if let Some(current) = self.changed.get_mut(&key) {
+            current.desired_topmost = Some(enabled);
+        }
+        Ok(())
     }
 
     pub fn finish_topmost_requests(&mut self) -> Vec<String> {
@@ -864,27 +906,22 @@ impl WindowController {
                 self.topmost_actions.insert(key, pending_action);
                 continue;
             }
-            let failed = completed.iter().any(|(hwnd, result)| {
-                result.is_err()
-                    && (*hwnd == tracked.window.hwnd
-                        || self
-                            .containers
-                            .get(&key)
-                            .is_some_and(|container| container.hwnd().ok() == Some(*hwnd)))
-            });
-            let action = pending_action.action;
-            if failed && !matches!(action, TopmostAction::Restore) {
+            if completed.iter().any(|(owner, result)| {
+                result.is_err() && pending_action.stops_on_failure(key, owner)
+            }) {
                 continue;
             }
-            let result = match action {
-                TopmostAction::Set(enabled) => self.set_topmost(&tracked.window, enabled),
-                TopmostAction::DisableContainer => self.set_container_mode(&tracked.window, false),
-                TopmostAction::Restore => self.restore_tracked(&tracked),
+            let result = match pending_action.action {
+                TopmostAction::Set(enabled, step) => {
+                    self.apply_topmost(&tracked, enabled, Some(step))
+                }
+                TopmostAction::DisableContainer => {
+                    self.set_container_mode_after(&tracked.window, false, &completed)
+                }
+                TopmostAction::Restore => self.restore_tracked(&tracked, &completed).map(|_| ()),
             };
             if let Err(error) = result {
-                if !self.topmost_actions.contains_key(&key) {
-                    errors.push(error);
-                }
+                errors.push(error);
             }
         }
         errors
@@ -1050,7 +1087,11 @@ impl WindowController {
             )
             .into());
         }
-        self.restore_tracked(&tracked)
+        if self.restore_tracked(&tracked, &[])? {
+            Ok(())
+        } else {
+            Err(window_topmost::pending_message())
+        }
     }
 
     pub fn restore_all(&mut self) -> Vec<String> {
@@ -1066,16 +1107,12 @@ impl WindowController {
                 self.forget_stale(tracked.window.hwnd as usize);
                 continue;
             }
-            if let Err(error) = self.restore_tracked(&tracked) {
+            if let Err(error) = self.restore_tracked(&tracked, &[]) {
                 failures.push(format!(
                     "PID {} / HWND 0x{:X}：{error}",
                     tracked.window.process_id, tracked.window.hwnd as usize
                 ));
             }
-        }
-        // 管理记录失效也不能忽略仍在执行的原生请求，正常退出须等待收尾
-        if failures.is_empty() && window_topmost::has_pending_requests() {
-            failures.push(window_topmost::pending_message());
         }
         failures
     }
@@ -1150,7 +1187,11 @@ impl WindowController {
             })
     }
 
-    fn restore_tracked(&mut self, tracked: &ChangedWindow) -> Result<(), String> {
+    fn restore_tracked(
+        &mut self,
+        tracked: &ChangedWindow,
+        completed: &[window_topmost::Completion],
+    ) -> Result<bool, String> {
         let key = tracked.window.hwnd as usize;
         if let Some(current) = self.changed.get_mut(&(tracked.window.hwnd as usize)) {
             if current.token == tracked.token && same_identity(&current.window, &tracked.window) {
@@ -1167,56 +1208,56 @@ impl WindowController {
                 .containers
                 .get(&key)
                 .is_some_and(WindowContainer::has_pending_topmost)
-            || !self.detach_container(key)?
+            || !self.detach_container(key, completed)?
         {
             self.defer_topmost(key, TopmostAction::Restore);
-            return Err(window_topmost::pending_message());
+            return Ok(false);
         }
         if window_identity_gone(&tracked.window) {
             self.changed.remove(&(tracked.window.hwnd as usize));
-            return Ok(());
+            return Ok(true);
         }
-        let restored: Result<(), String> = (|| {
+        let restored = (|| {
             let transparency_error = if tracked.transparency_modified {
                 self.write_snapshot(tracked, tracked.original).err()
             } else {
                 None
             };
             let taskbar_error = self.restore_taskbar(tracked).err();
-            let topmost_error = if let Some(original) = tracked.original_topmost {
+            let topmost = if let Some(original) = tracked.original_topmost {
                 self.require_owned(tracked)?;
-                let restored = restore_window_topmost(
-                    tracked.window.hwnd,
-                    original,
+                let restored = window_topmost::restore(
                     &tracked.window,
                     &self.property_name,
                     tracked.token,
+                    window_topmost::RestoreStep::Direct(original),
+                    completed,
                 );
                 self.require_owned(tracked)?;
-                match restored {
-                    Ok(true) => None,
-                    Ok(false) => {
-                        self.defer_topmost(key, TopmostAction::Restore);
-                        Some(window_topmost::pending_message())
-                    }
-                    Err(error) => Some(error),
-                }
+                restored
             } else {
-                None
+                Ok(true)
             };
-            let errors: Vec<_> = [transparency_error, taskbar_error, topmost_error]
+            let pending = matches!(topmost, Ok(false));
+            if pending {
+                self.defer_topmost(key, TopmostAction::Restore);
+            }
+            let errors: Vec<_> = [transparency_error, taskbar_error, topmost.err()]
                 .into_iter()
                 .flatten()
                 .collect();
             if !errors.is_empty() {
                 return Err(errors.join(tr("；", "; ")));
             }
-            self.remove_marker(tracked)
+            if !pending {
+                self.remove_marker(tracked)?;
+            }
+            Ok(!pending)
         })();
         // 还原期间原目标可能自行销毁，只清理旧记录，不接管新建窗口
-        if restored.is_ok() || window_identity_gone(&tracked.window) {
+        if matches!(restored, Ok(true)) || window_identity_gone(&tracked.window) {
             self.changed.remove(&(tracked.window.hwnd as usize));
-            Ok(())
+            Ok(true)
         } else {
             restored
         }
@@ -1557,36 +1598,6 @@ fn current_title(window: &WindowInfo) -> Option<String> {
 
 pub(crate) fn window_is_topmost(hwnd: HWND) -> Result<bool, String> {
     window_topmost::is_topmost(hwnd)
-}
-
-pub(crate) fn set_window_topmost(
-    hwnd: HWND,
-    enabled: bool,
-    window: &WindowInfo,
-    property: &[u16],
-    token: usize,
-) -> Result<bool, String> {
-    window_topmost::request(
-        hwnd,
-        enabled,
-        None,
-        window_topmost::Authority::new(window, property, token),
-    )
-}
-
-pub(crate) fn restore_window_topmost(
-    hwnd: HWND,
-    enabled: bool,
-    window: &WindowInfo,
-    property: &[u16],
-    token: usize,
-) -> Result<bool, String> {
-    window_topmost::request(
-        hwnd,
-        enabled,
-        None,
-        window_topmost::Authority::for_restore(window, property, token),
-    )
 }
 
 fn snapshot(hwnd: HWND) -> Result<Snapshot, String> {

@@ -9,9 +9,9 @@ $artifactFullPath = [IO.Path]::GetFullPath($ArtifactDirectory)
 if (-not (Test-Path -LiteralPath $exeFullPath -PathType Leaf)) {
     throw "Executable does not exist: $exeFullPath"
 }
-if (@(Get-Process -Name Trans -ErrorAction SilentlyContinue).Count -ne 0) {
-    throw 'Another Trans instance is running; this smoke runner does not close other instances'
-}
+. (Join-Path $PSScriptRoot 'open-smoke-session.ps1')
+$smokeSession = Open-SmokeSession $exeFullPath
+try {
 $hostScriptPath = Join-Path $PSScriptRoot 'test-window-host.ps1'
 if (-not (Test-Path -LiteralPath $hostScriptPath -PathType Leaf)) {
     throw "Synthetic window host script does not exist: $hostScriptPath"
@@ -27,6 +27,7 @@ if (Test-Path -LiteralPath $profilePath) {
 }
 $settingsDirectory = Join-Path $profilePath 'Trans'
 New-Item -ItemType Directory -Path $settingsDirectory -Force | Out-Null
+[IO.File]::WriteAllText((Join-Path $profilePath '.trans-smoke-profile'), 'Dedicated Trans window operations smoke profile', [Text.UTF8Encoding]::new($false))
 $settingsPath = Join-Path $settingsDirectory 'settings.ini'
 $fixture = "language=en`nclose_to_tray=true`nself_transparency=0`nshow_icons=false`nprivacy_mode=false`nrestore_hotkey=None`npreset_1=0`npreset_2=25`npreset_3=50`npreset_4=75`npreset_5=100`n"
 [IO.File]::WriteAllText($settingsPath, $fixture, [Text.UTF8Encoding]::new($false))
@@ -196,8 +197,7 @@ public static class TransWindowOpsNativeV1 {
 }
 '@
 }
-$previousDpiContext = [TransWindowOpsNativeV1]::SetThreadDpiAwarenessContext([IntPtr]::new(-4))
-if ($previousDpiContext -eq [IntPtr]::Zero) { throw 'Cannot set PER_MONITOR_AWARE_V2 for the test thread' }
+$previousDpiContext = [IntPtr]::Zero
 Add-Type -AssemblyName System.Drawing
 $checks = [Collections.Generic.List[object]]::new()
 $screenshots = [Collections.Generic.List[string]]::new()
@@ -207,6 +207,7 @@ $root = [IntPtr]::Zero
 $target = [IntPtr]::Zero
 $targetTitle = 'Trans-QA-' + [Guid]::NewGuid().ToString('N')
 $failure = $null
+$cleanupErrors = [Collections.Generic.List[string]]::new()
 $reportPath = Join-Path $artifactFullPath 'window-operations-results.json'
 
 function Assert-Smoke([bool] $Condition, [string] $Name, $Details = $null) {
@@ -272,6 +273,8 @@ function Save-Screenshot([string] $Name) {
 }
 
 try {
+    $previousDpiContext = [TransWindowOpsNativeV1]::SetThreadDpiAwarenessContext([IntPtr]::new(-4))
+    if ($previousDpiContext -eq [IntPtr]::Zero) { throw 'Cannot set PER_MONITOR_AWARE_V2 for the test thread' }
     $hostInfo = [Diagnostics.ProcessStartInfo]::new()
     $hostInfo.FileName = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
     $hostInfo.Arguments = '-NoProfile -ExecutionPolicy Bypass -STA -File "' + $hostScriptPath + '" -Title "' + $targetTitle + '"'
@@ -287,12 +290,16 @@ try {
 
     $transInfo = [Diagnostics.ProcessStartInfo]::new()
     $transInfo.FileName = $exeFullPath
+    $transInfo.Arguments = '--smoke-test'
     $transInfo.WorkingDirectory = [IO.Path]::GetDirectoryName($exeFullPath)
     $transInfo.UseShellExecute = $false
     $transInfo.EnvironmentVariables['APPDATA'] = $profilePath
     $transProcess = [Diagnostics.Process]::Start($transInfo)
-    Wait-Smoke { [TransWindowOpsNativeV1]::Root($transProcess.Id, 'Trans') -ne [IntPtr]::Zero } 'Trans ready'
-    $root = [TransWindowOpsNativeV1]::Root($transProcess.Id, 'Trans')
+    Wait-Smoke {
+        if ($transProcess.HasExited) { throw "Trans exited before creating its window (exit code $($transProcess.ExitCode))" }
+        $script:root = [TransSmokeWindowV1]::Find($transProcess.Id, $true)
+        $root -ne [IntPtr]::Zero
+    } 'Trans ready'
     Assert-Smoke ($transProcess.Id -ne $hostProcess.Id) 'target is a separate synthetic process'
     Select-TestWindow
     [TransWindowOpsNativeV1]::SetTargetAlpha($target, $hostProcess.Id, 64)
@@ -375,31 +382,33 @@ try {
 } catch {
     $failure = $_.Exception.ToString()
 } finally {
-    if ($null -ne $transProcess -and -not $transProcess.HasExited) {
-        if ($root -eq [IntPtr]::Zero) { $root = [TransWindowOpsNativeV1]::Root($transProcess.Id, 'Trans') }
-        if ($root -ne [IntPtr]::Zero) {
-            [void][TransWindowOpsNativeV1]::PostMessage($root, 0x0111, [UIntPtr]::new(146), [IntPtr]::Zero)
-        }
-        if (-not $transProcess.WaitForExit(7000)) {
-            $transProcess.Kill()
-            [void]$transProcess.WaitForExit(3000)
-            if ($null -eq $failure) { $failure = 'Test Trans process did not exit normally during cleanup' }
+    Invoke-SmokeCleanup {
+        Stop-SmokeProcess $transProcess {
+            $root = [TransSmokeWindowV1]::Find($transProcess.Id, $false)
+            if ($root -ne [IntPtr]::Zero) {
+                [void][TransWindowOpsNativeV1]::PostMessage($root, 0x0111, [UIntPtr]::new(146), [IntPtr]::Zero)
+            }
+        } -WaitMs 7000 -RequireNormalExit
+    }
+    Invoke-SmokeCleanup {
+        Stop-SmokeProcess $hostProcess {
+            $target = [TransWindowOpsNativeV1]::Root($hostProcess.Id, $targetTitle)
+            if ($target -ne [IntPtr]::Zero) {
+                [void][TransWindowOpsNativeV1]::PostMessage($target, 0x0010, [UIntPtr]::Zero, [IntPtr]::Zero)
+            }
+        } -WaitMs 3000
+    }
+    Invoke-SmokeCleanup {
+        if ($previousDpiContext -ne [IntPtr]::Zero -and
+            [TransWindowOpsNativeV1]::SetThreadDpiAwarenessContext($previousDpiContext) -eq [IntPtr]::Zero) {
+            throw 'Could not restore the smoke runner thread DPI context'
         }
     }
-    if ($null -ne $hostProcess -and -not $hostProcess.HasExited) {
-        if ($target -ne [IntPtr]::Zero -and [TransWindowOpsNativeV1]::IsWindow($target)) {
-            [void][TransWindowOpsNativeV1]::PostMessage($target, 0x0010, [UIntPtr]::Zero, [IntPtr]::Zero)
-        }
-        if (-not $hostProcess.WaitForExit(3000)) {
-            $hostProcess.Kill()
-            [void]$hostProcess.WaitForExit(3000)
-        }
-    }
-    [void][TransWindowOpsNativeV1]::SetThreadDpiAwarenessContext($previousDpiContext)
+    $exeHash = Invoke-SmokeCleanup { (Get-FileHash -LiteralPath $exeFullPath -Algorithm SHA256).Hash }
     $report = [pscustomobject]@{
         passed = ($null -eq $failure)
         exe = $exeFullPath
-        sha256 = (Get-FileHash -LiteralPath $exeFullPath -Algorithm SHA256).Hash
+        sha256 = $exeHash
         profile = $profilePath
         targetTitle = $targetTitle
         targetProcess = $(if ($null -ne $hostProcess) { $hostProcess.Id } else { $null })
@@ -407,9 +416,18 @@ try {
         checks = @($checks.ToArray())
         screenshots = @($screenshots.ToArray())
         failure = $failure
+        cleanupErrors = $cleanupErrors.ToArray()
         finishedAt = [DateTimeOffset]::Now.ToString('o')
     }
-    [IO.File]::WriteAllText($reportPath, ($report | ConvertTo-Json -Depth 7), [Text.UTF8Encoding]::new($false))
+    Invoke-SmokeCleanup {
+        [IO.File]::WriteAllText($reportPath, ($report | ConvertTo-Json -Depth 7), [Text.UTF8Encoding]::new($false))
+    }
+    $report.passed = ($null -eq $failure)
+    $report.failure = $failure
+    $report.cleanupErrors = $cleanupErrors.ToArray()
 }
 $report | ConvertTo-Json -Depth 7
-if ($null -ne $failure) { throw "Window operations smoke failed; details: $reportPath" }
+if ($null -ne $failure) { throw $failure }
+} finally {
+    $smokeSession.Dispose()
+}

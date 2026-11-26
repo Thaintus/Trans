@@ -69,6 +69,24 @@ fn same_entry(left: &Entry, right: &Entry) -> bool {
     same_window(&left.window, &right.window) && left.token == right.token
 }
 
+fn column_widths(capacity: i32, dpi: u32, show_icons: bool) -> [i32; 2] {
+    let percent = ui_theme::pixels(38, dpi);
+    let standard = crate::list_layout::column_capacity((100 * u64::from(dpi)).div_ceil(96) as i32);
+    let reserved = if show_icons {
+        // 图标模式下将新增宽度均分给名称与百分比，避免百分比出现时名称倒退
+        ((capacity - (standard - percent)).max(0) / 2).min(percent)
+    } else if capacity >= standard {
+        percent
+    } else {
+        0
+    };
+    // 只显示完整的百分比列，预留期间仍保留单元格中的真实数值
+    [
+        capacity - reserved,
+        if reserved == percent { percent } else { 0 },
+    ]
+}
+
 unsafe fn set_cell(hwnd: HWND, row: usize, column: i32, value: &str) -> bool {
     let mut text = wide(value);
     let item = LVITEMW {
@@ -356,8 +374,8 @@ impl MiniList {
         {
             return;
         }
-        let dpi = i64::from(GetDpiForWindow(self.hwnd).max(96));
-        let percent_width = ((38 * dpi + 48) / 96) as i32;
+        let dpi = GetDpiForWindow(self.hwnd).max(96);
+        let show_icons = SendMessageW(self.hwnd, LVM_GETIMAGELIST, LVSIL_SMALL as usize, 0) != 0;
         // 先缩窄再扩宽，复算滚动条出现或消失后的客户区宽度
         for _ in 0..3 {
             let mut bounds: RECT = zeroed();
@@ -366,13 +384,7 @@ impl MiniList {
             }
             let width = bounds.right - bounds.left;
             let capacity = crate::list_layout::column_capacity(width);
-            // 极窄列表优先完整利用名称列，拉宽后恢复百分比列
-            let percent = if i64::from(width) * 96 < 100 * dpi {
-                0
-            } else {
-                percent_width.min(capacity)
-            };
-            let widths = [capacity - percent, percent];
+            let widths = column_widths(capacity, dpi, show_icons);
             for shrinking in [true, false] {
                 for (index, target) in widths.into_iter().enumerate() {
                     let current = SendMessageW(self.hwnd, LVM_GETCOLUMNWIDTH, index, 0) as i32;
@@ -395,5 +407,31 @@ impl MiniList {
             }
         }
         self.fitting.set(false);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn widening_icon_rows_preserves_name_width_and_shows_whole_percentages() {
+        for dpi in [96, 120, 144, 192] {
+            let percent = ui_theme::pixels(38, dpi);
+            let mut previous = 0;
+            for capacity in 0..=ui_theme::pixels(160, dpi) {
+                let [name, shown] = column_widths(capacity, dpi, true);
+                assert!(name >= previous);
+                assert!(shown == 0 || shown == percent);
+                assert!(name + shown <= capacity);
+                previous = name;
+            }
+            assert_eq!(
+                column_widths(ui_theme::pixels(160, dpi), dpi, true)[1],
+                percent
+            );
+        }
+        assert_eq!(column_widths(98, 96, false), [98, 0]);
+        assert_eq!(column_widths(99, 96, false), [61, 38]);
     }
 }

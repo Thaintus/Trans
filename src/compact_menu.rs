@@ -5,7 +5,7 @@ use std::ptr::{null, null_mut};
 use std::rc::Rc;
 
 use crate::localization::tr;
-use crate::ui_theme::{self, WindowActionIcon};
+use crate::ui_theme::{self, SavedDc, WindowActionIcon};
 
 use windows_sys::Win32::Foundation::*;
 use windows_sys::Win32::Graphics::Gdi::*;
@@ -60,24 +60,6 @@ impl Drop for WindowDc {
     }
 }
 
-struct SavedDc {
-    dc: HDC,
-    state: i32,
-}
-
-impl SavedDc {
-    unsafe fn new(dc: HDC) -> Option<Self> {
-        let state = SaveDC(dc);
-        (state != 0).then(|| Self { dc, state })
-    }
-}
-
-impl Drop for SavedDc {
-    fn drop(&mut self) {
-        unsafe { RestoreDC(self.dc, self.state) };
-    }
-}
-
 struct MenuEntry {
     token: usize,
     command: u32,
@@ -128,8 +110,10 @@ struct MenuCorners {
 
 #[derive(Clone, Copy)]
 enum MenuCornerEvent {
+    PrepareShow(Option<(i32, i32)>),
     Refresh,
     Show,
+    Paint,
     Hide,
 }
 
@@ -203,8 +187,12 @@ unsafe fn popup_menu_handle(hwnd: HWND) -> Option<HMENU> {
         cbSize: size_of::<MENUBARINFO>() as u32,
         ..zeroed()
     };
-    (GetMenuBarInfo(hwnd, OBJID_CLIENT, 0, &mut info) != 0 && !info.hMenu.is_null())
-        .then_some(info.hMenu)
+    if GetMenuBarInfo(hwnd, OBJID_CLIENT, 0, &mut info) != 0 && !info.hMenu.is_null() {
+        return Some(info.hMenu);
+    }
+    // 首次显示时辅助功能信息可能还未就绪，直接查询同线程菜单窗口关联的句柄
+    let menu = SendMessageW(hwnd, MN_GETHMENU, 0, 0) as HMENU;
+    (!menu.is_null()).then_some(menu)
 }
 
 unsafe fn create_menu_region(bounds: MenuWindowBounds) -> Option<OwnedRegion> {
@@ -223,7 +211,7 @@ unsafe fn create_menu_region(bounds: MenuWindowBounds) -> Option<OwnedRegion> {
     (!region.0.is_null()).then_some(region)
 }
 
-unsafe fn set_menu_region(corners: &mut MenuCorners) -> bool {
+unsafe fn set_menu_region(corners: &mut MenuCorners, redraw: bool) -> bool {
     // 原生菜单可能在尺寸不变时重设区域，只有实际形状相同才跳过
     if GetWindowRgn(corners.bounds.hwnd, corners.scratch_region.0) != 0
         && EqualRgn(corners.scratch_region.0, corners.desired_region.0) != 0
@@ -234,7 +222,7 @@ unsafe fn set_menu_region(corners: &mut MenuCorners) -> bool {
     let region = OwnedRegion(CreateRectRgn(0, 0, 0, 0));
     if region.0.is_null()
         || CombineRgn(region.0, corners.desired_region.0, null_mut(), RGN_COPY) == 0
-        || SetWindowRgn(corners.bounds.hwnd, region.0, 1) == 0
+        || SetWindowRgn(corners.bounds.hwnd, region.0, redraw as i32) == 0
     {
         return false;
     }
@@ -282,55 +270,11 @@ unsafe fn update_menu_corners(hwnd: HWND, expected_menu: Option<HMENU>, event: M
     update_menu_corners_guarded(hwnd, expected_menu, event);
 }
 
-unsafe fn update_menu_corners_from_dc(dc: HDC, menu: HMENU) {
+unsafe fn finish_menu_item_frame(dc: HDC, menu: HMENU) {
     let Some(_scope) = MenuCornerScope::enter() else {
         return;
     };
-    update_menu_corners_guarded(WindowFromDC(dc), Some(menu), MenuCornerEvent::Refresh);
-}
-
-unsafe fn paint_menu_border(hwnd: HWND) {
-    let Some(_scope) = MenuCornerScope::enter() else {
-        return;
-    };
-    paint_menu_border_guarded(hwnd, None);
-}
-
-unsafe fn paint_menu_border_from_dc(dc: HDC, menu: HMENU) {
-    let Some(_scope) = MenuCornerScope::enter() else {
-        return;
-    };
-    paint_menu_border_guarded(WindowFromDC(dc), Some(menu));
-}
-
-unsafe fn paint_menu_border_guarded(hwnd: HWND, expected_menu: Option<HMENU>) {
-    let Some(menu) = popup_menu_handle(hwnd) else {
-        return;
-    };
-    if expected_menu.is_some_and(|expected| expected != menu) {
-        return;
-    }
-    let context = ACTIVE_MENUS.with(|active| {
-        active
-            .borrow()
-            .iter()
-            .rev()
-            .find(|context| context.menu.0 == menu)
-            .cloned()
-    });
-    let Some(context) = context else {
-        return;
-    };
-    if context.hiding_hwnd.get() == hwnd || IsWindowVisible(hwnd) == 0 {
-        return;
-    }
-    let corners = context.corners.borrow_mut().take();
-    if let Some(corners) = corners {
-        if corners.bounds.hwnd == hwnd {
-            draw_menu_border(&corners);
-        }
-        context.corners.replace(Some(corners));
-    }
+    update_menu_corners_guarded(WindowFromDC(dc), Some(menu), MenuCornerEvent::Paint);
 }
 
 unsafe fn draw_menu_border(corners: &MenuCorners) {
@@ -372,6 +316,15 @@ unsafe fn draw_menu_border(corners: &MenuCorners) {
     );
 }
 
+unsafe fn sync_menu_frame(corners: &mut MenuCorners, event: MenuCornerEvent) {
+    let preparing = matches!(event, MenuCornerEvent::PrepareShow(_));
+    if set_menu_region(corners, !preparing)
+        && matches!(event, MenuCornerEvent::Show | MenuCornerEvent::Paint)
+    {
+        draw_menu_border(corners);
+    }
+}
+
 unsafe fn update_menu_corners_guarded(
     hwnd: HWND,
     expected_menu: Option<HMENU>,
@@ -396,9 +349,11 @@ unsafe fn update_menu_corners_guarded(
     };
     match event {
         MenuCornerEvent::Hide => context.hiding_hwnd.set(hwnd),
-        MenuCornerEvent::Show => context.hiding_hwnd.set(null_mut()),
-        MenuCornerEvent::Refresh if context.hiding_hwnd.get() == hwnd => return,
-        MenuCornerEvent::Refresh => {}
+        MenuCornerEvent::PrepareShow(_) | MenuCornerEvent::Show => {
+            context.hiding_hwnd.set(null_mut())
+        }
+        _ if context.hiding_hwnd.get() == hwnd => return,
+        _ => {}
     }
     let mut previous = context.corners.borrow_mut().take();
     if matches!(event, MenuCornerEvent::Hide) {
@@ -409,19 +364,28 @@ unsafe fn update_menu_corners_guarded(
         }
         return;
     }
-    if IsWindowVisible(hwnd) == 0 {
+    if !matches!(event, MenuCornerEvent::PrepareShow(_)) && IsWindowVisible(hwnd) == 0 {
         context.corners.replace(previous);
         return;
     }
-    let mut rect: RECT = zeroed();
-    if GetWindowRect(hwnd, &mut rect) == 0 || rect.right <= rect.left || rect.bottom <= rect.top {
+    let (width, height) = if let MenuCornerEvent::PrepareShow(Some(size)) = event {
+        size
+    } else {
+        let mut rect: RECT = zeroed();
+        if GetWindowRect(hwnd, &mut rect) == 0 {
+            context.corners.replace(previous);
+            return;
+        }
+        (rect.right - rect.left, rect.bottom - rect.top)
+    };
+    if width <= 0 || height <= 0 {
         context.corners.replace(previous);
         return;
     }
     let bounds = MenuWindowBounds {
         hwnd,
-        width: rect.right - rect.left,
-        height: rect.bottom - rect.top,
+        width,
+        height,
         dpi: context.dpi,
     };
     if let Some(corners) = previous.as_mut() {
@@ -434,7 +398,7 @@ unsafe fn update_menu_corners_guarded(
                 corners.desired_region = region;
                 corners.bounds = bounds;
             }
-            set_menu_region(corners);
+            sync_menu_frame(corners, event);
             context.corners.replace(previous);
             return;
         }
@@ -468,7 +432,7 @@ unsafe fn update_menu_corners_guarded(
         scratch_region,
         modified: false,
     };
-    set_menu_region(&mut corners);
+    sync_menu_frame(&mut corners, event);
     context.corners.replace(Some(corners));
 }
 
@@ -490,7 +454,7 @@ unsafe extern "system" fn menu_corner_return_hook(
                     let event = if position.flags & SWP_SHOWWINDOW != 0 {
                         MenuCornerEvent::Show
                     } else {
-                        MenuCornerEvent::Refresh
+                        MenuCornerEvent::Paint
                     };
                     update_menu_corners(message.hwnd, None, event);
                 }
@@ -498,7 +462,13 @@ unsafe extern "system" fn menu_corner_return_hook(
             WM_SHOWWINDOW if message.wParam != 0 => {
                 update_menu_corners(message.hwnd, None, MenuCornerEvent::Show);
             }
-            WM_NCPAINT | WM_PAINT => paint_menu_border(message.hwnd),
+            WM_NCPAINT | WM_PAINT => {
+                update_menu_corners(message.hwnd, None, MenuCornerEvent::Paint)
+            }
+            // 菜单循环进入空闲时再从真实窗口核对外框，覆盖首绘使用内存 DC 的路径
+            WM_ENTERIDLE if message.wParam == MSGF_MENU as usize && message.lParam != 0 => {
+                update_menu_corners(message.lParam as HWND, None, MenuCornerEvent::Paint);
+            }
             _ => {}
         }
     }
@@ -517,6 +487,13 @@ unsafe extern "system" fn menu_corner_hook(code: i32, wparam: WPARAM, lparam: LP
                 let hide = position.flags & SWP_HIDEWINDOW != 0;
                 if hide {
                     update_menu_corners(message.hwnd, None, MenuCornerEvent::Hide);
+                } else if message.message == WM_WINDOWPOSCHANGING
+                    && position.flags & SWP_SHOWWINDOW != 0
+                {
+                    // 在菜单可见之前按本次定位尺寸裁剪，未改变尺寸时读取窗口原有尺寸
+                    let size =
+                        (position.flags & SWP_NOSIZE == 0).then(|| (position.cx, position.cy));
+                    update_menu_corners(message.hwnd, None, MenuCornerEvent::PrepareShow(size));
                 }
             }
             WM_SHOWWINDOW if message.wParam == 0 => {
@@ -845,7 +822,7 @@ pub(crate) unsafe fn show(
         let _corners = MenuCornerHook::new();
         TrackPopupMenuEx(
             context.menu.0,
-            TPM_RETURNCMD | TPM_NONOTIFY | TPM_RIGHTBUTTON,
+            TPM_RETURNCMD | TPM_NONOTIFY | TPM_RIGHTBUTTON | TPM_NOANIMATION,
             point.x,
             point.y,
             owner,
@@ -879,7 +856,6 @@ pub(crate) unsafe fn draw_item(item: &DRAWITEMSTRUCT) -> bool {
     if !std::ptr::eq(item.hwndItem, context.menu.0) {
         return false;
     }
-    update_menu_corners_from_dc(item.hDC, context.menu.0);
     let Some(_saved) = SavedDc::new(item.hDC) else {
         return true;
     };
@@ -941,6 +917,6 @@ pub(crate) unsafe fn draw_item(item: &DRAWITEMSTRUCT) -> bool {
         DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX,
     );
     // 原生菜单可只重绘单项，单项完成后同步补齐外框
-    paint_menu_border_from_dc(item.hDC, context.menu.0);
+    finish_menu_item_frame(item.hDC, context.menu.0);
     true
 }

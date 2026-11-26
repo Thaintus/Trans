@@ -159,7 +159,11 @@ impl Settings {
             .to_owned()
         })?;
         preserve_invalid_settings(&path, directory)?;
-        let (temporary, mut file) = create_temporary_file(directory)?;
+        let pid = std::process::id();
+        let (temporary, mut file) = create_unique_file(
+            |time, serial| directory.join(format!(".settings.ini.{pid}.{time}.{serial}.tmp")),
+            tr("设置临时文件", "temporary settings file"),
+        )?;
         let mut content = format!(
             "; Trans settings\nlanguage={}\ndefault_container={}\nclose_to_tray={}\nself_transparency={}\nshow_icons={}\nshow_window_name={}\nprivacy_mode={}\nrestore_hotkey={}\npreset_1={}\npreset_2={}\npreset_3={}\npreset_4={}\npreset_5={}\nmini_mode={}\nmini_vertical_layout={}\n",
             self.language.as_str(),
@@ -262,59 +266,35 @@ fn preserve_invalid_settings(path: &Path, directory: &Path) -> Result<(), String
     }
 
     // 读取失败时应用会使用默认值，覆盖损坏配置前先保留原始字节
-    let timestamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |duration| duration.as_nanos());
-    for _ in 0..16 {
-        let serial = NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed);
-        let recovery = directory.join(format!(
-            "settings.recovery-{}-{timestamp}-{serial}.ini",
-            std::process::id()
-        ));
-        let mut file = match OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&recovery)
-        {
-            Ok(file) => file,
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
-            Err(error) => {
-                return Err(tr(
-                    &format!(
-                        "无法创建设置恢复副本 {}，原设置未替换：{error}",
-                        recovery.display()
-                    ),
-                    &format!(
-                        "Could not create settings recovery copy {}; the existing settings were not replaced: {error}",
-                        recovery.display()
-                    ),
-                )
-                .to_owned());
-            }
-        };
-        let saved = file.write_all(&content).and_then(|_| file.sync_all());
-        drop(file);
-        if let Err(error) = saved {
-            let _ = fs::remove_file(&recovery);
-            return Err(tr(
-                &format!(
-                    "无法写入设置恢复副本 {}，原设置未替换：{error}",
-                    recovery.display()
-                ),
-                &format!(
-                    "Could not write settings recovery copy {}; the existing settings were not replaced: {error}",
-                    recovery.display()
-                ),
-            )
-            .to_owned());
-        }
-        return Ok(());
-    }
-    Err(tr(
-        "无法创建唯一的设置恢复副本，原设置未替换，请稍后重试",
-        "Could not create a unique settings recovery copy; the existing settings were not replaced. Please try again later",
+    let pid = std::process::id();
+    let (recovery, mut file) = create_unique_file(
+        |time, serial| directory.join(format!("settings.recovery-{pid}-{time}-{serial}.ini")),
+        tr("设置恢复副本", "settings recovery copy"),
     )
-    .to_owned())
+    .map_err(|error| {
+        error
+            + tr(
+                "，原设置未替换",
+                "; the existing settings were not replaced",
+            )
+    })?;
+    let saved = file.write_all(&content).and_then(|_| file.sync_all());
+    drop(file);
+    if let Err(error) = saved {
+        let _ = fs::remove_file(&recovery);
+        return Err(tr(
+            &format!(
+                "无法写入设置恢复副本 {}，原设置未替换：{error}",
+                recovery.display()
+            ),
+            &format!(
+                "Could not write settings recovery copy {}; the existing settings were not replaced: {error}",
+                recovery.display()
+            ),
+        )
+        .to_owned());
+    }
+    Ok(())
 }
 
 fn parse_settings(content: &str) -> Result<Settings, String> {
@@ -456,34 +436,31 @@ fn parse_bool(value: &str, key: &str, line: usize) -> Result<bool, String> {
     }
 }
 
-fn create_temporary_file(directory: &Path) -> Result<(PathBuf, File), String> {
+fn create_unique_file(
+    path_for: impl Fn(u128, usize) -> PathBuf,
+    description: &str,
+) -> Result<(PathBuf, File), String> {
     let timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |duration| duration.as_nanos());
     for _ in 0..16 {
         let serial = NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed);
-        let path = directory.join(format!(
-            ".settings.ini.{}.{timestamp}.{serial}.tmp",
-            std::process::id()
-        ));
+        let path = path_for(timestamp, serial);
         match OpenOptions::new().write(true).create_new(true).open(&path) {
             Ok(file) => return Ok((path, file)),
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
             Err(error) => {
                 return Err(tr(
-                    &format!("无法创建设置临时文件 {}：{error}", path.display()),
-                    &format!(
-                        "Could not create temporary settings file {}: {error}",
-                        path.display()
-                    ),
+                    &format!("无法创建{description} {}：{error}", path.display()),
+                    &format!("Could not create {description} {}: {error}", path.display()),
                 )
                 .to_owned());
             }
         }
     }
     Err(tr(
-        "无法创建唯一的设置临时文件，请稍后重试",
-        "Could not create a unique temporary settings file. Please try again later",
+        &format!("无法创建唯一的{description}，请稍后重试"),
+        &format!("Could not create a unique {description}. Please try again later"),
     )
     .to_owned())
 }

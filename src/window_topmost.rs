@@ -20,7 +20,7 @@ pub(crate) struct Authority {
     thread: u32,
     property: Vec<u16>,
     token: usize,
-    restoring: bool,
+    restore: Option<RestoreStep>,
 }
 
 impl Authority {
@@ -31,14 +31,7 @@ impl Authority {
             thread: window.thread_id,
             property: property.to_vec(),
             token,
-            restoring: false,
-        }
-    }
-
-    pub(crate) fn for_restore(window: &WindowInfo, property: &[u16], token: usize) -> Self {
-        Self {
-            restoring: true,
-            ..Self::new(window, property, token)
+            restore: None,
         }
     }
 
@@ -108,7 +101,51 @@ struct Job {
     target: Guard,
     allowed_owned: Option<Guard>,
     enabled: bool,
+    owner: RequestOwner,
     receiver: Receiver<Result<(), String>>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SetStep {
+    Host,
+    Window,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RestoreStep {
+    Detach(bool),
+    Direct(bool),
+}
+
+pub(crate) struct RequestOwner {
+    pub hwnd: usize,
+    pub token: usize,
+    pub restore: Option<RestoreStep>,
+}
+
+pub(crate) type Completion = (RequestOwner, Result<(), String>);
+
+impl RequestOwner {
+    fn confirms_restore(&self, hwnd: HWND, token: usize, step: RestoreStep) -> bool {
+        self.hwnd == hwnd as usize && self.token == token && self.restore == Some(step)
+    }
+}
+
+#[test]
+fn confirmation_matches_the_window_and_exact_restore_step() {
+    let hwnd = 42 as HWND;
+    let mut completed = RequestOwner {
+        hwnd: hwnd as usize,
+        token: 1,
+        restore: Some(RestoreStep::Detach(true)),
+    };
+    assert!(completed.confirms_restore(hwnd, 1, RestoreStep::Detach(true)));
+    assert!(!completed.confirms_restore(hwnd, 1, RestoreStep::Direct(true)));
+    assert!(!completed.confirms_restore(hwnd, 1, RestoreStep::Detach(false)));
+    assert!(!completed.confirms_restore(hwnd, 2, RestoreStep::Detach(true)));
+    assert!(!completed.confirms_restore(43 as HWND, 1, RestoreStep::Detach(true)));
+    completed.restore = None;
+    assert!(!completed.confirms_restore(hwnd, 1, RestoreStep::Detach(true)));
 }
 
 impl Job {
@@ -300,7 +337,7 @@ unsafe fn execute(
         hwnd,
         enabled,
         allowed.map(|guard| guard.hwnd as HWND),
-        authority.restoring,
+        authority.restore.is_some(),
     )?;
     if !authority.valid() || !target.valid() || allowed.is_some_and(|guard| !guard.valid()) {
         return Err(tr(
@@ -362,7 +399,13 @@ pub(crate) fn request(
                 job.contains(hwnd as usize)
                     || allowed_owned.is_some_and(|window| job.contains(window as usize))
             })
-            .map(|job| job.target.hwnd == hwnd as usize && job.enabled == enabled)
+            .map(|job| {
+                job.target.hwnd == hwnd as usize
+                    && job.enabled == enabled
+                    && job.owner.hwnd == authority.hwnd
+                    && job.owner.token == authority.token
+                    && job.owner.restore == authority.restore
+            })
     });
     if let Some(same_request) = busy {
         return if same_request {
@@ -388,7 +431,7 @@ pub(crate) fn request(
         }
     };
     unsafe {
-        validate_group(hwnd, enabled, allowed_owned, authority.restoring)?;
+        validate_group(hwnd, enabled, allowed_owned, authority.restore.is_some())?;
     }
     let target = unsafe { Guard::capture(hwnd, token)? };
     let allowed = match allowed_owned {
@@ -405,6 +448,11 @@ pub(crate) fn request(
     };
     let (sender, receiver) = mpsc::channel();
     let language = crate::localization::current_language();
+    let owner = RequestOwner {
+        hwnd: authority.hwnd,
+        token: authority.token,
+        restore: authority.restore,
+    };
     let started = std::thread::Builder::new()
         .name("trans-topmost".into())
         .spawn(move || {
@@ -431,6 +479,7 @@ pub(crate) fn request(
                 target,
                 allowed_owned: allowed,
                 enabled,
+                owner,
                 receiver,
             },
         )
@@ -438,7 +487,41 @@ pub(crate) fn request(
     Ok(false)
 }
 
-pub(crate) fn take_completed() -> Vec<(HWND, Result<(), String>)> {
+pub(crate) fn confirm(hwnd: HWND, enabled: bool) -> Result<(), String> {
+    if is_topmost(hwnd)? == enabled {
+        Ok(())
+    } else {
+        Err(tr(
+            "窗口的置顶状态再次变化，已保留恢复记录，请手动重试",
+            "The window's topmost state changed again. The recovery record was retained; retry manually",
+        )
+        .into())
+    }
+}
+
+pub(crate) fn restore(
+    window: &WindowInfo,
+    property: &[u16],
+    token: usize,
+    step: RestoreStep,
+    completed: &[Completion],
+) -> Result<bool, String> {
+    let (RestoreStep::Direct(enabled) | RestoreStep::Detach(enabled)) = step;
+    // 已执行的同一恢复步骤只复核，状态再次变化时保留快照供手动重试
+    if completed
+        .iter()
+        .any(|(owner, result)| result.is_ok() && owner.confirms_restore(window.hwnd, token, step))
+    {
+        return confirm(window.hwnd, enabled).map(|()| true);
+    }
+    let authority = Authority {
+        restore: Some(step),
+        ..Authority::new(window, property, token)
+    };
+    request(window.hwnd, enabled, None, authority)
+}
+
+pub(crate) fn take_completed() -> Vec<Completion> {
     let completed = JOBS.with(|jobs| {
         let mut jobs = jobs.borrow_mut();
         let ready: Vec<_> = jobs
@@ -467,7 +550,7 @@ pub(crate) fn take_completed() -> Vec<(HWND, Result<(), String>)> {
             unsafe {
                 job.clear();
             }
-            (job.target.hwnd as HWND, result)
+            (job.owner, result)
         })
         .collect()
 }

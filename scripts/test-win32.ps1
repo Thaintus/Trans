@@ -9,6 +9,10 @@ $artifactFullPath = [IO.Path]::GetFullPath($ArtifactDirectory)
 if (-not (Test-Path -LiteralPath $exeFullPath -PathType Leaf)) {
     throw "Executable does not exist: $exeFullPath"
 }
+
+. (Join-Path $PSScriptRoot 'open-smoke-session.ps1')
+$smokeSession = Open-SmokeSession $exeFullPath
+try {
 $profilePath = Join-Path $artifactFullPath 'profile'
 $realProfile = [Environment]::GetFolderPath([Environment+SpecialFolder]::ApplicationData)
 if ($profilePath.TrimEnd('\').Equals($realProfile.TrimEnd('\'), [StringComparison]::OrdinalIgnoreCase)) {
@@ -48,7 +52,6 @@ public static class TransSmokeNativeV1 {
         [MarshalAs(UnmanagedType.ByValTStr, SizeConst=32)] public string FaceName;
     }
     public struct TextMeasurement { public int Width, Height, FontHeight; public string FontFace; }
-    public struct TextBufferResult { public long Copied; public string Text; public ushort[] Units; public bool TerminatorPresent, CanaryUnchanged; }
     [StructLayout(LayoutKind.Sequential)] public struct MINMAXINFO {
         public POINT Reserved, MaxSize, MaxPosition, MinTrackSize, MaxTrackSize;
     }
@@ -67,7 +70,6 @@ public static class TransSmokeNativeV1 {
     [DllImport("user32.dll")] static extern bool GetWindowRect(IntPtr hwnd, out RECT rect);
     [DllImport("user32.dll")] static extern bool GetClientRect(IntPtr hwnd, out RECT rect);
     [DllImport("user32.dll")] public static extern bool SetWindowPos(IntPtr hwnd, IntPtr after, int x, int y, int width, int height, uint flags);
-    [DllImport("user32.dll", SetLastError=true)] public static extern bool SetProcessDpiAwarenessContext(IntPtr context);
     [DllImport("user32.dll", SetLastError=true)] public static extern IntPtr SetThreadDpiAwarenessContext(IntPtr context);
     [DllImport("user32.dll")] public static extern bool PrintWindow(IntPtr hwnd, IntPtr hdc, uint flags);
     [DllImport("user32.dll")] static extern IntPtr GetDC(IntPtr hwnd);
@@ -117,33 +119,8 @@ public static class TransSmokeNativeV1 {
         Send(hwnd, 0x0100, key, keyDown);
         Send(hwnd, 0x0101, key, keyDown | 0xC0000000L);
     }
-    public static TextBufferResult ReadTextBuffer(IntPtr hwnd, int capacity) {
-        IntPtr memory = Marshal.AllocHGlobal((capacity + 1) * 2);
-        try {
-            for (int i=0; i<=capacity; i++) Marshal.WriteInt16(memory, i*2, 0x5A5A);
-            long copied = Send(hwnd, 0x000D, (ulong)capacity, memory.ToInt64());
-            var units = new ushort[capacity + 1];
-            for (int i=0; i<=capacity; i++) units[i] = unchecked((ushort)Marshal.ReadInt16(memory, i*2));
-            var text = new StringBuilder();
-            int count = 0;
-            while (count < capacity && units[count] != 0) { text.Append((char)units[count]); count++; }
-            return new TextBufferResult { Copied = copied, Text = text.ToString(), Units = units,
-                TerminatorPresent = count < capacity && units[count] == 0, CanaryUnchanged = units[capacity] == 0x5A5A };
-        } finally { Marshal.FreeHGlobal(memory); }
-    }
     public static string Class(IntPtr hwnd) {
         var text = new StringBuilder(256); GetClassName(hwnd, text, text.Capacity); return text.ToString();
-    }
-    public static IntPtr FindRoot(int process) {
-        IntPtr found = IntPtr.Zero;
-        EnumWindows(delegate(IntPtr hwnd, IntPtr ignored) {
-            uint owner; GetWindowThreadProcessId(hwnd, out owner);
-            if (owner == process && IsWindowVisible(hwnd) && Class(hwnd) != "#32770" && Text(hwnd) == "Trans") {
-                found = hwnd; return false;
-            }
-            return true;
-        }, IntPtr.Zero);
-        return found;
     }
     public static IntPtr FindDialog(int process) {
         IntPtr found = IntPtr.Zero;
@@ -225,11 +202,7 @@ public static class TransSmokeNativeV1 {
 }
 '@
 }
-[void][TransSmokeNativeV1]::SetProcessDpiAwarenessContext([IntPtr]::new(-4))
-$previousDpiContext = [TransSmokeNativeV1]::SetThreadDpiAwarenessContext([IntPtr]::new(-4))
-if ($previousDpiContext -eq [IntPtr]::Zero) {
-    throw 'Could not set PER_MONITOR_AWARE_V2 on the smoke runner thread'
-}
+$previousDpiContext = [IntPtr]::Zero
 Add-Type -AssemblyName System.Drawing
 
 $checks = [Collections.Generic.List[object]]::new()
@@ -238,6 +211,7 @@ $dialogDiagnostics = [Collections.Generic.List[object]]::new()
 $testProcess = $null
 $root = [IntPtr]::Zero
 $failure = $null
+$cleanupErrors = [Collections.Generic.List[string]]::new()
 $backupPath = Join-Path $settingsDirectory 'settings.ini.smoke-backup'
 $faultDirectoryCreated = $false
 
@@ -302,19 +276,13 @@ function Select-Language([int] $Index, [switch] $Async) {
     }
 }
 
-function Assert-EmptyHotkey([string] $Expected, [bool] $Enabled, [string] $Name, [switch] $CheckBuffer) {
+function Assert-EmptyHotkey([bool] $Enabled, [string] $Name) {
     $hotkey = Get-Control 148
     $text = [TransSmokeNativeV1]::Text($hotkey)
     $length = [TransSmokeNativeV1]::Send($hotkey, 0x000E, 0, 0)
     $value = [TransSmokeNativeV1]::Send($hotkey, 0x0402, 0, 0)
     $controlEnabled = [TransSmokeNativeV1]::IsWindowEnabled($hotkey)
-    Assert-Smoke ($text -eq $Expected -and $length -eq $Expected.Length -and $value -eq 0 -and $controlEnabled -eq $Enabled) $Name @{ text = $text; expectedText = $Expected; length = $length; hotkeyValue = $value; enabled = $controlEnabled }
-    if (-not $CheckBuffer) { return }
-    $zero = [TransSmokeNativeV1]::ReadTextBuffer($hotkey, 0)
-    $one = [TransSmokeNativeV1]::ReadTextBuffer($hotkey, 1)
-    $short = [TransSmokeNativeV1]::ReadTextBuffer($hotkey, 2)
-    $expectedFirst = $Expected.Substring(0, 1)
-    Assert-Smoke ($zero.Copied -eq 0 -and $zero.CanaryUnchanged -and $one.Copied -eq 0 -and $one.TerminatorPresent -and $one.CanaryUnchanged -and $short.Copied -eq 1 -and $short.Text -eq $expectedFirst -and $short.TerminatorPresent -and $short.CanaryUnchanged) ($Name + '_bounded_text') @{ zero = $zero; one = $one; short = $short }
+    Assert-Smoke ($text -eq '' -and $length -eq 0 -and $value -eq 0 -and $controlEnabled -eq $Enabled) $Name @{ text = $text; length = $length; hotkeyValue = $value; enabled = $controlEnabled }
 }
 
 function Save-Screenshot([string] $Name) {
@@ -332,37 +300,44 @@ function Save-Screenshot([string] $Name) {
 }
 
 function Start-TestApplication {
+    $script:root = [IntPtr]::Zero
     $start = [Diagnostics.ProcessStartInfo]::new()
     $start.FileName = $exeFullPath
+    $start.Arguments = '--smoke-test'
     $start.WorkingDirectory = [IO.Path]::GetDirectoryName($exeFullPath)
     $start.UseShellExecute = $false
     $start.EnvironmentVariables['APPDATA'] = $profilePath
     $script:testProcess = [Diagnostics.Process]::Start($start)
-    Wait-Smoke { $script:root = [TransSmokeNativeV1]::FindRoot($testProcess.Id); $root -ne [IntPtr]::Zero } 'Trans main window'
+    Wait-Smoke {
+        if ($testProcess.HasExited) { throw "Trans exited before creating its window (exit code $($testProcess.ExitCode))" }
+        $script:root = [TransSmokeWindowV1]::Find($testProcess.Id, $true)
+        $root -ne [IntPtr]::Zero
+    } 'Trans main window'
     Assert-Smoke (-not $testProcess.HasExited) 'isolated_application_started' @{ processId = $testProcess.Id; profile = $profilePath }
 }
 
 function Stop-TestApplication {
-    if ($null -eq $testProcess -or $testProcess.HasExited) { return }
-    $dialog = [TransSmokeNativeV1]::FindDialog($testProcess.Id)
-    if ($dialog -ne [IntPtr]::Zero) {
-        [void][TransSmokeNativeV1]::PostMessage($dialog, 0x0010, [UIntPtr]::Zero, [IntPtr]::Zero)
-        Start-Sleep -Milliseconds 150
-    }
-    if ($root -ne [IntPtr]::Zero -and [TransSmokeNativeV1]::IsWindow($root)) {
-        $exit = [TransSmokeNativeV1]::Control($root, 146)
-        if ($exit -ne [IntPtr]::Zero) {
-            [void][TransSmokeNativeV1]::PostMessage($exit, 0x00F5, [UIntPtr]::Zero, [IntPtr]::Zero)
+    Stop-SmokeProcess $testProcess {
+        $dialog = [TransSmokeNativeV1]::FindDialog($testProcess.Id)
+        if ($dialog -ne [IntPtr]::Zero) {
+            [void][TransSmokeNativeV1]::PostMessage($dialog, 0x0010, [UIntPtr]::Zero, [IntPtr]::Zero)
+            Start-Sleep -Milliseconds 150
         }
-    }
-    if (-not $testProcess.WaitForExit(5000)) {
-        $testProcess.Kill()
-        $testProcess.WaitForExit()
-        throw 'The isolated test process required forced cleanup'
-    }
+        $root = [TransSmokeWindowV1]::Find($testProcess.Id, $false)
+        if ($root -ne [IntPtr]::Zero) {
+            $exit = [TransSmokeNativeV1]::Control($root, 146)
+            if ($exit -ne [IntPtr]::Zero) {
+                [void][TransSmokeNativeV1]::PostMessage($exit, 0x00F5, [UIntPtr]::Zero, [IntPtr]::Zero)
+            }
+        }
+    } -WaitMs 5000 -RequireNormalExit
 }
 
 try {
+    $previousDpiContext = [TransSmokeNativeV1]::SetThreadDpiAwarenessContext([IntPtr]::new(-4))
+    if ($previousDpiContext -eq [IntPtr]::Zero) {
+        throw 'Could not set PER_MONITOR_AWARE_V2 on the smoke runner thread'
+    }
     Start-TestApplication
     Assert-Smoke ((Get-Caption 103) -eq '未选择窗口') 'legacy_profile_starts_chinese'
     Assert-Smoke ((Get-Caption 121) -eq '恢复全部') 'main_restore_caption_chinese'
@@ -382,7 +357,7 @@ try {
     $trayBounds = [TransSmokeNativeV1]::Bounds((Get-Control 142))
     $expectedLanguageHeight = [int][Math]::Round(32 * [TransSmokeNativeV1]::GetDpiForWindow($languageCombo) / 96)
     Assert-Smoke ($languageBounds.Bottom -le $trayBounds.Top -and [Math]::Abs($languageBounds.Height - $expectedLanguageHeight) -le 1) 'language_dropdown_is_first_configuration_row' @{ languageTop = $languageBounds.Top; languageBottom = $languageBounds.Bottom; trayTop = $trayBounds.Top; actualHeight = $languageBounds.Height; expectedHeight = $expectedLanguageHeight }
-    Assert-EmptyHotkey '无' $false 'empty_shortcut_chinese_disabled' -CheckBuffer
+    Assert-EmptyHotkey $false 'empty_shortcut_chinese_disabled'
     [void][TransSmokeNativeV1]::Send($languageCombo, 0x014F, 1, 0)
     Assert-Smoke ([TransSmokeNativeV1]::Send($languageCombo, 0x0157, 0, 0) -eq 1) 'language_dropdown_opens'
     Save-Screenshot '01b-settings-language-dropdown'
@@ -392,7 +367,7 @@ try {
     Assert-Smoke ([TransSmokeNativeV1]::Send($languageCombo, 0x0147, 0, 0) -eq 1 -and [TransSmokeNativeV1]::Send($languageCombo, 0x0157, 0, 0) -eq 0) 'language_dropdown_keyboard_commits_english'
     Assert-Smoke ((Get-Caption 140) -eq 'Settings' -and (Get-Caption 151) -eq 'General' -and (Get-Caption 146) -eq 'Exit Trans') 'switch_english_immediately'
     Assert-Smoke (([IO.File]::ReadAllText($settingsPath)) -match '(?m)^language=en\r?$') 'english_language_saved'
-    Assert-EmptyHotkey 'None' $false 'empty_shortcut_english_disabled' -CheckBuffer
+    Assert-EmptyHotkey $false 'empty_shortcut_english_disabled'
     $emptyHotkeyBounds = [TransSmokeNativeV1]::Bounds((Get-Control 148))
     $emptyPanel = [TransSmokeNativeV1]::FindClass($root, 'Trans.SettingsPanel.v1')
     $emptyPanelBounds = [TransSmokeNativeV1]::Bounds($emptyPanel)
@@ -403,18 +378,18 @@ try {
     Assert-Smoke ([TransSmokeNativeV1]::Send($languageCombo, 0x0147, 0, 0) -eq 0) 'language_dropdown_keyboard_commits_chinese'
     Assert-Smoke ((Get-Caption 140) -eq '设置' -and (Get-Caption 151) -eq '基础配置') 'switch_chinese_immediately'
     Assert-Smoke (([IO.File]::ReadAllText($settingsPath)) -match '(?m)^language=zh-CN\r?$') 'chinese_language_saved'
-    Assert-EmptyHotkey '无' $false 'empty_shortcut_switches_back_chinese'
+    Assert-EmptyHotkey $false 'empty_shortcut_switches_back_chinese'
 
     [TransSmokeNativeV1]::SetText((Get-Control 180), '17')
     $initialEnabled = [TransSmokeNativeV1]::Send((Get-Control 150), 0x00F0, 0, 0)
     Assert-Smoke ($initialEnabled -eq 0) 'fixture_shortcut_disabled'
     Click-Control 150
-    Assert-EmptyHotkey '无' $true 'empty_shortcut_chinese_enabled'
+    Assert-EmptyHotkey $true 'empty_shortcut_chinese_enabled'
     Select-Language 1
-    Assert-EmptyHotkey 'None' $true 'empty_shortcut_english_enabled'
+    Assert-EmptyHotkey $true 'empty_shortcut_english_enabled'
     Save-Screenshot '01d-settings-english-empty-shortcut-enabled'
     Select-Language 0
-    Assert-EmptyHotkey '无' $true 'empty_shortcut_enabled_switches_back_chinese'
+    Assert-EmptyHotkey $true 'empty_shortcut_enabled_switches_back_chinese'
     [void][TransSmokeNativeV1]::Send((Get-Control 148), 0x0401, 0x0354, 0)
     $draftHotkey = [TransSmokeNativeV1]::Send((Get-Control 148), 0x0402, 0, 0)
     Assert-Smoke ($draftHotkey -eq 0x0354) 'native_hotkey_draft_set'
@@ -478,7 +453,7 @@ try {
     $dialog = [TransSmokeNativeV1]::FindDialog($testProcess.Id)
     Record-Dialog 'before-confirmation' $dialog
     $dialogText = [string]::Join("`n", [TransSmokeNativeV1]::ChildTexts($dialog))
-    Assert-Smoke ($dialogText -match 'Could not replace settings file') 'language_save_failure_reports_error' $dialogText
+    Assert-Smoke ($dialogText.Contains("Could not inspect the existing settings file $settingsPath; saving was cancelled")) 'language_save_failure_reports_error' $dialogText
     Assert-Smoke ((Get-Caption 140) -eq 'Settings' -and (Get-Caption 151) -eq 'General') 'failed_save_keeps_previous_language'
     Assert-Smoke ([TransSmokeNativeV1]::Send((Get-Control 153), 0x0147, 0, 0) -eq 1) 'failed_language_save_rolls_dropdown_back_to_english'
     [void][TransSmokeNativeV1]::Send($dialog, 0x0111, 1, [TransSmokeNativeV1]::Control($dialog, 1).ToInt64())
@@ -499,7 +474,7 @@ try {
         Record-Dialog 'close-timeout' $dialog
         throw
     }
-    Remove-Item -LiteralPath $settingsPath
+    [IO.Directory]::Delete($settingsPath, $false)
     $faultDirectoryCreated = $false
     Move-Item -LiteralPath $backupPath -Destination $settingsPath
     Assert-Smoke ((Get-Caption 180) -eq '17') 'failed_save_preserves_preset_draft'
@@ -522,24 +497,37 @@ try {
     Assert-Smoke ((Get-Caption 140) -eq 'Settings') 'settings_english_restored_after_restart'
     Assert-Smoke ([TransSmokeNativeV1]::Send((Get-Control 150), 0x00F0, 0, 0) -eq 0) 'unsaved_hotkey_draft_not_persisted'
     Assert-Smoke ([TransSmokeNativeV1]::Send((Get-Control 148), 0x0402, 0, 0) -eq 0) 'shortcut_remains_disabled_after_restart'
-    Assert-EmptyHotkey 'None' $false 'empty_shortcut_english_after_restart'
+    Assert-EmptyHotkey $false 'empty_shortcut_english_after_restart'
     Save-Screenshot '05-settings-english-restarted'
     Stop-TestApplication
 }
 catch {
     $failure = $_.Exception.ToString()
-    if ($root -ne [IntPtr]::Zero -and [TransSmokeNativeV1]::IsWindow($root)) {
-        try { Save-Screenshot 'failure' } catch { }
+    Invoke-SmokeCleanup {
+        if ($null -ne $testProcess -and -not $testProcess.HasExited -and
+            $root -ne [IntPtr]::Zero -and [TransSmokeWindowV1]::Find($testProcess.Id, $false) -eq $root) {
+            Save-Screenshot 'failure'
+        }
     }
 }
 finally {
-    if ($faultDirectoryCreated -and (Test-Path -LiteralPath $settingsPath -PathType Container)) {
-        Remove-Item -LiteralPath $settingsPath
+    Invoke-SmokeCleanup {
+        if ($faultDirectoryCreated -and (Test-Path -LiteralPath $settingsPath -PathType Container)) {
+            [IO.Directory]::Delete($settingsPath, $false)
+        }
     }
-    if ((Test-Path -LiteralPath $backupPath -PathType Leaf) -and -not (Test-Path -LiteralPath $settingsPath)) {
-        Move-Item -LiteralPath $backupPath -Destination $settingsPath
+    Invoke-SmokeCleanup {
+        if ((Test-Path -LiteralPath $backupPath -PathType Leaf) -and -not (Test-Path -LiteralPath $settingsPath)) {
+            Move-Item -LiteralPath $backupPath -Destination $settingsPath
+        }
     }
-    try { Stop-TestApplication } catch { if ($null -eq $failure) { $failure = $_.Exception.ToString() } }
+    Invoke-SmokeCleanup { Stop-TestApplication }
+    Invoke-SmokeCleanup {
+        if ($previousDpiContext -ne [IntPtr]::Zero -and
+            [TransSmokeNativeV1]::SetThreadDpiAwarenessContext($previousDpiContext) -eq [IntPtr]::Zero) {
+            throw 'Could not restore the smoke runner thread DPI context'
+        }
+    }
     $report = [pscustomobject]@{
         executable = $exeFullPath
         profile = $profilePath
@@ -549,11 +537,19 @@ finally {
         screenshots = $shots.ToArray()
         dialogDiagnostics = $dialogDiagnostics.ToArray()
         error = $failure
+        cleanupErrors = $cleanupErrors.ToArray()
         limits = @('Native message and PrintWindow smoke checks; no physical mouse or keyboard input', 'No test of other applications or real user settings', 'Target-window transparency is outside this script')
     }
     $jsonPath = Join-Path $artifactFullPath 'win32-smoke-results.json'
-    [IO.File]::WriteAllText($jsonPath, ($report | ConvertTo-Json -Depth 8), [Text.UTF8Encoding]::new($false))
+    Invoke-SmokeCleanup {
+        [IO.File]::WriteAllText($jsonPath, ($report | ConvertTo-Json -Depth 8), [Text.UTF8Encoding]::new($false))
+    }
+    $report.passed = ($null -eq $failure)
+    $report.error = $failure
+    $report.cleanupErrors = $cleanupErrors.ToArray()
     $report | ConvertTo-Json -Depth 8
-    [void][TransSmokeNativeV1]::SetThreadDpiAwarenessContext($previousDpiContext)
 }
 if ($null -ne $failure) { throw $failure }
+} finally {
+    $smokeSession.Dispose()
+}
